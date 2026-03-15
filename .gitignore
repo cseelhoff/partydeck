@@ -5,3 +5,5 @@
 res/gamescope
 gen_release.sh
 handler.json
+result
+flake.nix.bak
