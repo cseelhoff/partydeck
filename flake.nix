@@ -202,6 +202,9 @@
           ln -s ${goldberg-emu}/share/goldberg/linux64 $out/share/partydeck/goldberg/linux64
           ln -s ${goldberg-emu}/share/goldberg/win     $out/share/partydeck/goldberg/win
 
+            # Symlink so exe_dir/res/ resolves to share/partydeck/
+            ln -s $out/share/partydeck $out/bin/res
+
           wrapProgram $out/bin/partydeck \
             --prefix PATH : ${lib.makeBinPath [ gamescope-kbm pkgs.umu-launcher ]} \
             --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
