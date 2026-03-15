@@ -1,8 +1,9 @@
 > [!IMPORTANT]
-> ### Partydeck continuation 
-> Partydeck development has moved to a new github orginization located at https://github.com/partydeck for the project to continue thanks to [@wunnr's](https://github.com/wunnr) help.
-> [@Blahkaey](https://github.com/blahkaey) and [@davidawesome02-backup](https://github.com/davidawesome02-backup) are currently maintaining partydeck and the related handlers.
-> Development efforts will continue, hopefully adding some exciting new features soon. Stay tuned for more updates.
+> ### NixOS Fork
+> This is a NixOS-compatible fork of [PartyDeck](https://github.com/partydeck).
+> It includes a Nix flake that builds PartyDeck and all its dependencies (gamescope-kbm, Goldberg Steam Emu) from source — no manual setup required.
+>
+> For the upstream project, see: https://github.com/partydeck
 
 <img src=".github/assets/icon.png" align="left" width="100" height="100">
 
@@ -17,11 +18,73 @@ A split-screen game launcher for Linux/SteamOS
     <img src=".github/assets/gameplay1.png" width="49%" />
 </p>
 
-> [!NOTE]
-> There is currently no official forum for discussing PartyDeck other than the issues page. If you would like to see a Discord server, please make it known on [this issue page](https://github.com/wunnr/partydeck/issues/127).
+## NixOS Installation
 
-> [!NOTE]
-> PartyDeck is in early development, and may contain violations of software best practices and security flaws; use at your own discretion! If you are experienced in software any advice and contributions are greatly appreciated.
+### Flake-based NixOS config (recommended)
+
+Add this fork as a flake input and install the package:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
+    partydeck = {
+      url = "github:cseelhoff/partydeck";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { nixpkgs, partydeck, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [ ./configuration.nix ];
+      specialArgs = { inherit partydeck; };
+    };
+  };
+}
+```
+
+Then in your NixOS module:
+
+```nix
+# configuration.nix (or a gaming module)
+{ pkgs, partydeck, ... }:
+{
+  environment.systemPackages = [
+    partydeck.packages.x86_64-linux.default
+  ];
+
+  # Required dependencies
+  services.desktopManager.plasma6.enable = true;  # KWin tiling script
+  networking.firewall.allowedUDPPorts = [ 47584 ]; # Goldberg LAN multiplayer
+  networking.firewall.allowedTCPPorts = [ 47584 ];
+}
+```
+
+Run `sudo nixos-rebuild switch` and `partydeck` will be on your PATH.
+
+### Try without installing
+
+```sh
+nix run github:cseelhoff/partydeck
+```
+
+### What the flake provides
+
+| Package | Description |
+|---------|-------------|
+| `partydeck` (default) | The launcher, wrapped with all runtime deps |
+| `gamescope-kbm` | Gamescope fork with keyboard/mouse support |
+| `goldberg-emu` | Goldberg Steam Emu binaries for LAN multiplayer |
+
+All three are built automatically — `gamescope-kbm` and `goldberg-emu` are bundled into the `partydeck` package via `PATH` and symlinks.
+
+### Requirements
+
+- **NixOS 25.11** (or compatible nixpkgs)
+- **KDE Plasma 6** — required for the KWin splitscreen tiling script
+- **Steam** — with Proton-GE for Windows game support
+- **Game controllers** — most work without extra setup
 
 ## Features
 
@@ -36,66 +99,47 @@ A split-screen game launcher for Linux/SteamOS
 - Profile support allows each player to have their own persistent save data, settings, and stats for games
 - Works out of the box on SteamOS
 
-## Installing & Usage
+## Non-NixOS Installation
 
-Download the latest release [here](https://github.com/wunnr/partydeck-rs/releases) and extract it into a folder. Download game handlers [here](https://drive.proton.me/urls/D9HBKM18YR#zG8XC8yVy9WL).
+For SteamOS and other desktop Linux distros, see the [upstream project](https://github.com/partydeck) for installation instructions.
 
-### SteamOS
+## Building from source (dev shell)
 
-SteamOS includes all of PartyDeck's dependencies, but you will need to be on SteamOS 3.7.0 or above for the splitscreen script to work.
-
-If you're in desktop mode, simply run the `partydeck` executable. To use PartyDeck in Gaming Mode, add `GamingModeLauncher.sh` as a shortcut to Steam, and in the settings for that shortcut disable Steam Input.
-
-### Desktop Linux
-
-PartyDeck's splitscreen tiling script requires KDE Plasma 6.0 and up; if you're on an older version of Plasma or not running Plasma at all, you can run PartyDeck without the script, but then it's up to you to resize and reposition the game windows yourself. You'll also need to install, Gamescope, Bubblewrap, and Fuse-overlayfs using your distro's package manager. Then, simply run the `partydeck` executable to get started. 
-
-### Getting Started
-Once in the main menu, click the + button to add a game, or click the button with the down arrow icon to import a PartyDeck Handler package (.pd2). Create profiles if you want to store save data, and have a look through the settings menu.
-
-## Building
-
-To build PartyDeck, You'll need a Rust toolchain installed with the 2024 Edition. For the mouse/keyboard gamescope build, you'll need ninja and meson installed.
-Clone the repo with submodules by running `git clone --recurse-submodules https://github.com/wunnr/partydeck-rs.git`. Navigate to the gamescope submodule at `deps/gamescope` and run these commands to build the mouse/keyboard gamescope:
-
+```sh
+git clone --recurse-submodules https://github.com/cseelhoff/partydeck.git
+cd partydeck
+nix develop   # enters a shell with all build deps
+sh build.sh   # cargo build + assemble
+cd build && ./partydeck
 ```
-git submodule update --init
-meson setup build/
-ninja -C build/
-```
-
-Then, run `get_deps_releases.sh` to get the latest releases of Umu Launcher and Goldberg Steam Emu. 
-
-Finally, in the main partydeck folder, run `build.sh`. This will build the executable, and place it in the `build` folder, along with the relevant dependencies and resources.
-
 
 ## How it Works
 
 PartyDeck uses a few software layers to provide a console-like split-screen gaming experience:
 
-- **KWin Session:** This KWin Session displays all running game instances and runs a script to automatically resize and reposition each Gamescope window.
-- **Gamescope:** Contains each instance of the game to its own window. Also has the neat side effect of receiving controller input even when the window is not currently active, meaning multiple Gamescope instances can all receive input simultaneously
-- **Bubblewrap:** Uses bindings to mask out evdev input files from the instances, so each instance only receives input from one specific controller. Also uses directory binding to give each player their own save data and settings within the games.
-- **Runtime (Steam Runtime/Proton):** If needed, the app can run native Linux games through a Steam Runtime (currently, 1.0 (scout) and 2.0 (soldier) are supported) for better compatibility. Windows games are launched through UMU Launcher.
-- **Goldberg Steam Emu:** On games that use the Steam API for multiplayer, Goldberg is used to allow the game instances to connect to each other, as well as other devices running on the same LAN.
-- **And finally, the game itself.**
+- **KWin Session:** Displays all running game instances and runs a script to automatically resize and reposition each Gamescope window.
+- **Gamescope:** Contains each instance of the game in its own window. Also receives controller input even when the window is not currently active, meaning multiple instances can all receive input simultaneously.
+- **Bubblewrap:** Uses bindings to mask out evdev input files from the instances, so each instance only receives input from one specific controller. Also uses directory binding to give each player their own save data and settings.
+- **Runtime (Steam Runtime/Proton):** Runs native Linux games through a Steam Runtime for better compatibility. Windows games are launched through UMU Launcher.
+- **Goldberg Steam Emu:** On games that use the Steam API for multiplayer, Goldberg allows game instances to connect to each other and other devices on the same LAN.
 
-## Known Issues, Limitations and To-dos
+## Known Issues
 
-- AppImages and Flatpaks are not supported yet for native Linux games. Handlers can only run regular executables inside folders.
-- Controller navigation support in the launcher is super primitive; I'd love to try making a more controller-friendly, Big-Picture-style UI in the future, but have no immediate plans for it.
-- Games using Goldberg might have trouble discovering LAN games from other devices. If this happens, you can try adding a firewall rule for port 47584. If connecting two Steam Decks through LAN, their hostnames should be changed from the default "steamdeck".
+- AppImages and Flatpaks are not supported yet for native Linux games
+- Controller navigation in the launcher is basic
+- Games using Goldberg might have trouble discovering LAN games from other devices — try adding a firewall rule for port 47584
 
-## Credits/Thanks
+## Credits
 
-- [@wunnr](https://github.com/wunnr) for starting partydeck
-- [@Blahkaey](https://github.com/blahkaey) for helping to maintain partydeck and the comunity
+- [@wunnr](https://github.com/wunnr) for starting PartyDeck
+- [@Blahkaey](https://github.com/blahkaey) for helping maintain PartyDeck and the community
 - [@davidawesome02-backup](https://github.com/davidawesome02-backup) for the [Gamescope keyboard/mouse fork](https://github.com/davidawesome02-backup/gamescope), and Valve for Gamescope
 - [@blckink](https://github.com/blckink) for contributions
 - MrGoldberg & Detanup01 for [Goldberg Steam Emu](https://github.com/Detanup01/gbe_fork/)
 - GloriousEggroll and the rest of the contributors for [UMU Launcher](https://github.com/Open-Wine-Components/umu-launcher)
 - Inspired by [Tau5's Coop-on-Linux](https://github.com/Tau5/Co-op-on-Linux) and [Syntrait's Splinux](https://github.com/Syntrait/splinux)
-- Talos91 and the rest of the Splitscreen.me team for [Nucleus Coop](https://github.com/SplitScreen-Me/splitscreenme-nucleus), and for helping with handler creation
+- Talos91 and the rest of the Splitscreen.me team for [Nucleus Coop](https://github.com/SplitScreen-Me/splitscreenme-nucleus)
 
 ## Disclaimer
+
 This software has been created purely for the purposes of academic research. It is not intended to be used to attack other systems. Project maintainers are not responsible or liable for misuse of the software. Use responsibly.
