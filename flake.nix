@@ -231,9 +231,7 @@
         hardeningDisable = [ "fortify" ];
         nativeBuildInputs = with pkgs; [
           rustc cargo pkg-config cmake
-          meson ninja glslang
-          curl p7zip python3
-          umu-launcher
+          meson ninja glslang python3
         ];
         buildInputs = gamescope-kbm.buildInputs ++ (with pkgs; [
           libxkbcommon libGL
@@ -245,31 +243,14 @@
           pkgs.xorg.libX11 pkgs.xorg.libXcursor pkgs.xorg.libXrandr pkgs.xorg.libXi
         ];
         shellHook = ''
-          if [ ! -f deps/gamescope/meson.build ]; then
-            echo "Initializing git submodules..."
-            git submodule update --init
-            (cd deps/gamescope \
-              && git rm --cached subprojects/glm 2>/dev/null || true \
-              && rm -rf subprojects/glm \
-              && git submodule update --init --recursive)
-          fi
-          if [ ! -d deps/releases/gbe-linux-release ]; then
-            echo "Downloading Goldberg + UMU releases..."
-            sh ./get_deps_releases.sh
-          fi
-          if [ ! -f deps/gamescope/build/src/gamescope ]; then
-            echo "Building gamescope-kbm..."
-            (cd deps/gamescope && meson setup build/ && ninja -C build/)
-          fi
-          if [ -f build/bin/umu-run ] && [ ! -L build/bin/umu-run ]; then
-            echo "Replacing bundled umu-run with NixOS umu-launcher..."
-            rm build/bin/umu-run
-            ln -s "$(command -v umu-run)" build/bin/umu-run
-          fi
           echo ""
-          echo "PartyDeck dev shell ready"
-          echo "  Run: sh build.sh             (cargo build + assemble)"
-          echo "  Launch: cd build && ./partydeck"
+          echo "PartyDeck dev shell (for hacking on the source)"
+          echo ""
+          echo "  nix build   — build the full package (recommended)"
+          echo "  nix run     — build and launch PartyDeck"
+          echo ""
+          echo "  cargo build — compile just the Rust code (iterative dev)"
+          echo "  cargo run   — compile and run (needs gamescope-kbm in PATH)"
         '';
       };
     };
