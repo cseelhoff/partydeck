@@ -184,7 +184,7 @@
         version = "0.8.5";
         src = lib.cleanSource self;
 
-        cargoHash = "sha256-wqpGq7glWFxizMdM725DzCEnmoE8NjYaTWWIpuWkUJo=";
+        cargoHash = "sha256-Lcfe4PJ157dOtW0X7h2zNfJEv1hot0O69VeYESpAQiU=";
 
         nativeBuildInputs = with pkgs; [ pkg-config makeBinaryWrapper ];
         buildInputs = with pkgs; [
