@@ -1,5 +1,12 @@
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
+use nix::libc;
 
 use crate::app::{PartyConfig, PadFilterType};
 use crate::handler::*;
@@ -53,10 +60,24 @@ pub fn launch_game(
         None => 0.5,
     };
 
+    // Register SIGTERM handler so we can cleanly kill children on shutdown
+    let term_flag = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term_flag))
+        .map_err(|e| format!("Failed to register SIGTERM handler: {}", e))?;
+
     let mut handles = Vec::new();
 
     let mut i = 0;
     for mut cmd in new_cmds {
+        // Spawn each child in its own process group (setsid) so we can
+        // kill the entire group (gamescope + wine + winedevice etc.) later.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+
         let handle = cmd.spawn()?;
         handles.push(handle);
 
@@ -66,11 +87,59 @@ pub fn launch_game(
         i += 1;
     }
 
-    for mut handle in handles {
-        handle.wait()?;
+    // Wait for children, checking for SIGTERM between polls
+    loop {
+        if term_flag.load(Ordering::Relaxed) {
+            println!("[partydeck] SIGTERM received, killing child process groups...");
+            kill_children(&mut handles);
+            break;
+        }
+
+        // Check if all children have exited
+        let mut all_done = true;
+        for handle in &mut handles {
+            match handle.try_wait() {
+                Ok(Some(_)) => {} // already exited
+                Ok(None) => all_done = false, // still running
+                Err(_) => {} // treat errors as exited
+            }
+        }
+        if all_done {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     Ok(())
+}
+
+/// Send SIGTERM to each child's process group, wait a grace period,
+/// then SIGKILL any survivors.
+fn kill_children(handles: &mut Vec<std::process::Child>) {
+    // Phase 1: SIGTERM to each process group
+    for handle in handles.iter() {
+        let pid = handle.id() as i32;
+        // kill(-pid, SIGTERM) sends to the entire process group
+        let _ = signal::kill(Pid::from_raw(-pid), Signal::SIGTERM);
+        println!("[partydeck] Sent SIGTERM to process group {}", pid);
+    }
+
+    // Grace period: 3 seconds for clean shutdown
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Phase 2: SIGKILL any still-alive process groups
+    for handle in handles.iter_mut() {
+        match handle.try_wait() {
+            Ok(Some(_)) => {} // already exited
+            _ => {
+                let pid = handle.id() as i32;
+                let _ = signal::kill(Pid::from_raw(-pid), Signal::SIGKILL);
+                println!("[partydeck] Sent SIGKILL to process group {}", pid);
+                let _ = handle.wait(); // reap zombie
+            }
+        }
+    }
 }
 
 pub fn launch_cmds(
