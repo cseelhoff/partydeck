@@ -205,6 +205,14 @@
             # Symlink so exe_dir/res/ resolves to share/partydeck/
             ln -s $out/share/partydeck $out/bin/res
 
+          # Desktop entry for KDE/GNOME app launchers
+          mkdir -p $out/share/applications
+          cp res/partydeck.desktop $out/share/applications/
+
+          # App icon
+          mkdir -p $out/share/icons/hicolor/64x64/apps
+          cp res/icon.png $out/share/icons/hicolor/64x64/apps/partydeck.png
+
           wrapProgram $out/bin/partydeck \
             --prefix PATH : ${lib.makeBinPath [ gamescope-kbm pkgs.umu-launcher ]} \
             --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
