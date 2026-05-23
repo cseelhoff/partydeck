@@ -1,12 +1,6 @@
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
-use nix::libc;
 
 use crate::app::{PartyConfig, PadFilterType};
 use crate::handler::*;
@@ -60,20 +54,17 @@ pub fn launch_game(
         None => 0.5,
     };
 
-    // Register SIGTERM handler so we can cleanly kill children on shutdown
-    let term_flag = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term_flag))
-        .map_err(|e| format!("Failed to register SIGTERM handler: {}", e))?;
-
     let mut handles = Vec::new();
 
     let mut i = 0;
     for mut cmd in new_cmds {
-        // Spawn each child in its own process group (setsid) so we can
-        // kill the entire group (gamescope + wine + winedevice etc.) later.
+        // Ask the kernel to deliver SIGTERM to this child when partydeck
+        // exits, so gamescope (and its bwrap/wine subtree) shuts down
+        // promptly. Without this, children survive partydeck's exit
+        // until something else (systemd cgroup, user) reaps them.
         unsafe {
             cmd.pre_exec(|| {
-                libc::setsid();
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
                 Ok(())
             });
         }
@@ -87,59 +78,11 @@ pub fn launch_game(
         i += 1;
     }
 
-    // Wait for children, checking for SIGTERM between polls
-    loop {
-        if term_flag.load(Ordering::Relaxed) {
-            println!("[partydeck] SIGTERM received, killing child process groups...");
-            kill_children(&mut handles);
-            break;
-        }
-
-        // Check if all children have exited
-        let mut all_done = true;
-        for handle in &mut handles {
-            match handle.try_wait() {
-                Ok(Some(_)) => {} // already exited
-                Ok(None) => all_done = false, // still running
-                Err(_) => {} // treat errors as exited
-            }
-        }
-        if all_done {
-            break;
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    for mut handle in handles {
+        handle.wait()?;
     }
 
     Ok(())
-}
-
-/// Send SIGTERM to each child's process group, wait a grace period,
-/// then SIGKILL any survivors.
-fn kill_children(handles: &mut Vec<std::process::Child>) {
-    // Phase 1: SIGTERM to each process group
-    for handle in handles.iter() {
-        let pid = handle.id() as i32;
-        // kill(-pid, SIGTERM) sends to the entire process group
-        let _ = signal::kill(Pid::from_raw(-pid), Signal::SIGTERM);
-        println!("[partydeck] Sent SIGTERM to process group {}", pid);
-    }
-
-    // Grace period: 3 seconds for clean shutdown
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // Phase 2: SIGKILL any still-alive process groups
-    for handle in handles.iter_mut() {
-        match handle.try_wait() {
-            Ok(Some(_)) => {} // already exited
-            _ => {
-                let pid = handle.id() as i32;
-                let _ = signal::kill(Pid::from_raw(-pid), Signal::SIGKILL);
-                println!("[partydeck] Sent SIGKILL to process group {}", pid);
-                let _ = handle.wait(); // reap zombie
-            }
-        }
-    }
 }
 
 pub fn launch_cmds(
@@ -200,7 +143,9 @@ pub fn launch_cmds(
 
         cmd.current_dir(cwd);
 
-        cmd.env("SDL_JOYSTICK_HIDAPI", "0");
+        if !h.enable_hidraw_ps {
+            cmd.env("SDL_JOYSTICK_HIDAPI", "0");
+        }
         cmd.env("ENABLE_GAMESCOPE_WSI", "0");
         if h.sdl2_override != SDL2Override::No {
             let path_sdl = match h.sdl2_override {
@@ -221,7 +166,9 @@ pub fn launch_cmds(
             cmd.env("WINEPREFIX", &path_pfx);
             cmd.env("PROTON_VERB", "run");
             cmd.env("PROTONPATH", protonpath);
-            cmd.env("PROTON_DISABLE_HIDRAW", "1");
+            if !h.enable_hidraw_ps {
+                cmd.env("PROTON_DISABLE_HIDRAW", "1");
+            }
             if cfg.proton_wow64 {
                 cmd.env("PROTON_USE_WOW64", "1");
             }

@@ -257,6 +257,10 @@ impl PartyApp {
             });
         }
 
+        if h.win() {
+            ui.checkbox(&mut h.enable_hidraw_ps, "Enable hidraw for PS controllers (needed for Unity new Input System games; may cause double input in some games)");
+        }
+
         if !h.win() {
             ui.horizontal(|ui| {
                 ui.label("Linux Runtime:");
