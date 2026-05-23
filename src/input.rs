@@ -33,6 +33,10 @@ pub enum PadButton {
 #[derive(Clone)]
 pub struct DeviceInfo {
     pub path: String,
+    /// Sibling /dev/hidraw* nodes for this evdev device, if any. Resolved
+    /// once at scan time so launch.rs can mask them alongside the evdev node
+    /// when hidraw is exposed to wine (otherwise input leaks across instances).
+    pub hidraw_paths: Vec<String>,
     pub enabled: bool,
     pub device_type: DeviceType,
 }
@@ -80,6 +84,7 @@ impl InputDevice {
     pub fn info(&self) -> DeviceInfo {
         DeviceInfo {
             path: self.path().to_string(),
+            hidraw_paths: hidraw_siblings(self.path()),
             enabled: self.enabled(),
             device_type: self.device_type(),
         }
@@ -184,4 +189,21 @@ pub fn scan_input_devices(filter: &PadFilterType) -> Vec<InputDevice> {
     }
     pads.sort_by_key(|pad| pad.path().to_string());
     pads
+}
+
+// Resolve /dev/hidraw* nodes that share an HID parent with the given evdev path.
+// /sys/class/input/eventN -> .../HID/input/inputN/eventN, so two `device` hops
+// land on the HID dir which contains a `hidraw/` subdir for any hidraw siblings.
+fn hidraw_siblings(evdev_path: &str) -> Vec<String> {
+    let name = std::path::Path::new(evdev_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let dir = format!("/sys/class/input/{}/device/device/hidraw", name);
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(|s| format!("/dev/{}", s)))
+        .collect()
 }

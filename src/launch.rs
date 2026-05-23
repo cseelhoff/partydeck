@@ -245,6 +245,14 @@ pub fn launch_cmds(
                 || (!instance.devices.contains(&d) && dev.device_type == DeviceType::Gamepad)
             {
                 cmd.args(["--bind", "/dev/null", &dev.path]);
+                // Wine's winebus reads controllers via /dev/hidraw* when
+                // hidraw is exposed, so masking only the evdev node leaks
+                // input to every instance.
+                if h.enable_hidraw_ps {
+                    for hp in &dev.hidraw_paths {
+                        cmd.args(["--bind", "/dev/null", hp]);
+                    }
+                }
             }
         }
 
