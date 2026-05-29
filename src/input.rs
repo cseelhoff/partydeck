@@ -69,13 +69,30 @@ impl InputDevice {
             _ => self.name(),
         }
     }
-    /// A reasonably stable identifier for this physical device, independent of
-    /// the /dev/input/eventN path (which changes across replug/reboot). Used to
-    /// remember the last profile a given controller selected. Identical models
-    /// intentionally share an identity so they share a remembered default.
-    pub fn identity(&self) -> String {
+    /// The model identity of this device: vendor:product. Shared by every unit
+    /// of the same model; used as the wildcard profile key that matches the
+    /// device regardless of which port it's plugged into.
+    pub fn model_id(&self) -> String {
         let id = self.dev.input_id();
-        format!("{:04x}:{:04x}:{}", id.vendor(), id.product(), self.name())
+        format!("{:04x}:{:04x}", id.vendor(), id.product())
+    }
+    /// Per-unit profile key based on the kernel `uniq` (serial number / Bluetooth
+    /// MAC). Stable across replug and across ports, but absent for many wired
+    /// pads (notably stock Xbox controllers). None when no uniq is reported.
+    pub fn uniq_key(&self) -> Option<String> {
+        match self.dev.unique_name() {
+            Some(u) if !u.is_empty() => Some(format!("{}|uniq={}", self.model_id(), u)),
+            _ => None,
+        }
+    }
+    /// Per-port profile key based on the kernel `phys` topology path. Tells two
+    /// identical units apart, but is tied to the port: moving the device to a
+    /// different port changes it. None when no phys is reported.
+    pub fn phys_key(&self) -> Option<String> {
+        match self.dev.physical_path() {
+            Some(p) if !p.is_empty() => Some(format!("{}|phys={}", self.model_id(), p)),
+            _ => None,
+        }
     }
     pub fn path(&self) -> &str {
         &self.path

@@ -49,9 +49,13 @@ pub struct PartyConfig {
     pub disable_mount_gamedirs: bool,
     #[serde(default)]
     pub check_for_updates: bool,
-    /// Last profile selected by each controller, keyed by device identity
-    /// (see InputDevice::identity). Used to preselect a player's profile when
-    /// they join an instance.
+    /// Last profile selected by each controller. Keys prefer the device serial
+    /// (uniq), which is globally unique on its own: "vendor:product|uniq=...".
+    /// Controllers that report no serial use the bare "vendor:product" wildcard,
+    /// adding "vendor:product|phys=..." only when more than one serial-less unit
+    /// of the same model is connected and must be told apart (see InputDevice
+    /// and PartyApp::profile_save_key). Used to preselect a player's profile
+    /// when they join an instance.
     #[serde(default)]
     pub controller_profiles: HashMap<String, String>,
 }

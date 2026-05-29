@@ -371,28 +371,72 @@ impl PartyApp {
         self.instances[inst].profselection = (cur + dir).rem_euclid(count) as usize;
     }
 
+    // Candidate profile keys for a device, ordered most specific (per-unit) to
+    // least specific (model wildcard). Matching tries each in turn, so a saved
+    // wildcard entry still applies when no serial/port-specific entry exists.
+    fn profile_lookup_keys(&self, dev: usize) -> Vec<String> {
+        let device = &self.input_devices[dev];
+        let mut keys = Vec::new();
+        if let Some(k) = device.uniq_key() {
+            keys.push(k);
+        }
+        if let Some(k) = device.phys_key() {
+            keys.push(k);
+        }
+        keys.push(device.model_id());
+        keys
+    }
+
+    // The key under which to remember this device's profile. The serial
+    // (uniq) is globally unique on its own, so it is always preferred when
+    // present. Without a serial we use the bare vendor:product wildcard, only
+    // falling back to the port (phys) when more than one connected unit of the
+    // same model also lacks a serial and must be told apart.
+    fn profile_save_key(&self, dev: usize) -> String {
+        let device = &self.input_devices[dev];
+        if let Some(k) = device.uniq_key() {
+            return k;
+        }
+        let model = device.model_id();
+        let ambiguous = self
+            .input_devices
+            .iter()
+            .filter(|d| d.model_id() == model && d.uniq_key().is_none())
+            .count()
+            > 1;
+        if ambiguous && let Some(k) = device.phys_key() {
+            return k;
+        }
+        model
+    }
+
     // The index into self.profiles of the profile this device last used, or 0
     // (Guest) if none is remembered or it no longer exists.
     fn saved_profile_index(&self, dev: usize) -> usize {
-        let id = self.input_devices[dev].identity();
-        self.options
-            .controller_profiles
-            .get(&id)
-            .and_then(|name| self.profiles.iter().position(|p| p == name))
-            .unwrap_or(0)
+        for key in self.profile_lookup_keys(dev) {
+            if let Some(name) = self.options.controller_profiles.get(&key)
+                && let Some(idx) = self.profiles.iter().position(|p| p == name)
+            {
+                return idx;
+            }
+        }
+        0
     }
 
     // Remember the profile each device is currently assigned so it can be
     // preselected next time that controller joins an instance.
     fn remember_instance_profiles(&mut self) {
+        let mut updates: Vec<(String, String)> = Vec::new();
         for instance in &self.instances {
             let Some(name) = self.profiles.get(instance.profselection) else {
                 continue;
             };
             for &dev in &instance.devices {
-                let id = self.input_devices[dev].identity();
-                self.options.controller_profiles.insert(id, name.clone());
+                updates.push((self.profile_save_key(dev), name.clone()));
             }
+        }
+        for (key, name) in updates {
+            self.options.controller_profiles.insert(key, name);
         }
     }
 
