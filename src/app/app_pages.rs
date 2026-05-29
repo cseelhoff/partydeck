@@ -2,6 +2,7 @@ use super::app::{MenuPage, PartyApp, SettingsPage};
 use super::config::*;
 use crate::handler::*;
 use crate::input::*;
+use crate::instance::normalized_layout;
 use crate::paths::*;
 use crate::profiles::*;
 use crate::util::*;
@@ -12,6 +13,17 @@ use eframe::egui::RichText;
 use eframe::egui::{self, Ui};
 use rfd::FileDialog;
 use std::path::PathBuf;
+
+/// Accent colors used to distinguish players in the layout preview, indexed by
+/// instance position.
+const PLAYER_COLORS: [(u8, u8, u8); 6] = [
+    (235, 110, 90),  // red
+    (90, 160, 235),  // blue
+    (130, 200, 110), // green
+    (230, 200, 90),  // yellow
+    (180, 120, 220), // purple
+    (90, 210, 210),  // cyan
+];
 
 macro_rules! cur_handler {
     ($self:expr) => {
@@ -408,6 +420,11 @@ impl PartyApp {
             ui.label(remove_text);
 
             ui.add(egui::Separator::default().vertical());
+
+            ui.label("▲ ▼");
+            ui.label("Reorder");
+
+            ui.add(egui::Separator::default().vertical());
         });
 
         ui.separator();
@@ -474,6 +491,12 @@ impl PartyApp {
             self.remove_device_instance(i, d);
         }
 
+        if !self.instances.is_empty() {
+            ui.separator();
+            ui.label("Layout preview");
+            self.display_instances_preview(ui);
+        }
+
         if self.instances.len() > 0 {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.horizontal(|ui| {
@@ -487,6 +510,136 @@ impl PartyApp {
                 });
                 ui.separator();
             });
+        }
+    }
+
+    /// Draws a scaled preview of how the instances will be partitioned across
+    /// the monitor(s) once the KWin scripts reposition them, labeling each cell
+    /// with its player number, selected profile, and assigned controllers. The
+    /// cell ordering follows `self.instances`, so reordering instances (via a
+    /// controller's Up/Down) updates this preview live.
+    fn display_instances_preview(&self, ui: &mut Ui) {
+        if self.instances.is_empty() || self.monitors.is_empty() {
+            return;
+        }
+
+        let multimon = self.options.gamescope_sdl_backend && self.monitors.len() > 1;
+        let mon_count = if multimon { self.monitors.len() } else { 1 };
+
+        // Group instance indices by the monitor they will launch on, preserving
+        // launch order (which is what determines each player's screen cell).
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); mon_count];
+        for (idx, inst) in self.instances.iter().enumerate() {
+            let m = if multimon {
+                inst.monitor.min(mon_count - 1)
+            } else {
+                0
+            };
+            groups[m].push(idx);
+        }
+
+        let used: Vec<usize> = (0..mon_count).filter(|&m| !groups[m].is_empty()).collect();
+        if used.is_empty() {
+            return;
+        }
+
+        let gap = 8.0;
+        let max_native_h = used
+            .iter()
+            .map(|&m| self.monitors[m].height().max(1))
+            .max()
+            .unwrap_or(1) as f32;
+        let total_native_w: f32 = used
+            .iter()
+            .map(|&m| self.monitors[m].width().max(1) as f32)
+            .sum();
+        let avail_w = (ui.available_width() - gap * (used.len() as f32 - 1.0) - 4.0).max(1.0);
+        let target_h = 220.0_f32;
+        let scale = (target_h / max_native_h)
+            .min(avail_w / total_native_w)
+            .max(0.01);
+        let preview_h = max_native_h * scale;
+        let preview_w = total_native_w * scale + gap * (used.len() as f32 - 1.0);
+
+        let (area, _resp) =
+            ui.allocate_exact_size(egui::vec2(preview_w, preview_h), egui::Sense::hover());
+        let painter = ui.painter_at(area);
+
+        let mut cursor_x = area.left();
+        for &m in &used {
+            let mw = self.monitors[m].width().max(1) as f32 * scale;
+            let mh = self.monitors[m].height().max(1) as f32 * scale;
+            let mon_rect =
+                egui::Rect::from_min_size(egui::pos2(cursor_x, area.top()), egui::vec2(mw, mh));
+
+            painter.rect_filled(
+                mon_rect,
+                egui::CornerRadius::same(2),
+                egui::Color32::from_gray(24),
+            );
+            painter.rect_stroke(
+                mon_rect,
+                egui::CornerRadius::same(2),
+                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                egui::StrokeKind::Inside,
+            );
+
+            let layout = normalized_layout(groups[m].len(), self.options.vertical_two_player);
+            for (pi, &inst_idx) in groups[m].iter().enumerate() {
+                let (nx, ny, nw, nh) = layout[pi];
+                let cell = egui::Rect::from_min_size(
+                    egui::pos2(mon_rect.left() + nx * mw, mon_rect.top() + ny * mh),
+                    egui::vec2(nw * mw, nh * mh),
+                )
+                .shrink(2.0);
+
+                let (r, g, b) = PLAYER_COLORS[inst_idx % PLAYER_COLORS.len()];
+                let accent = egui::Color32::from_rgb(r, g, b);
+                painter.rect_filled(
+                    cell,
+                    egui::CornerRadius::same(2),
+                    egui::Color32::from_rgba_unmultiplied(r, g, b, 60),
+                );
+                painter.rect_stroke(
+                    cell,
+                    egui::CornerRadius::same(2),
+                    egui::Stroke::new(1.5, accent),
+                    egui::StrokeKind::Inside,
+                );
+
+                let inst = &self.instances[inst_idx];
+                let profile = self
+                    .profiles
+                    .get(inst.profselection)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let emojis: String = inst
+                    .devices
+                    .iter()
+                    .map(|&d| self.input_devices[d].emoji())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let label = format!("Player {}\n{}\n{}", inst_idx + 1, profile, emojis);
+                painter.text(
+                    cell.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
+            }
+
+            if used.len() > 1 {
+                painter.text(
+                    mon_rect.left_top() + egui::vec2(4.0, 2.0),
+                    egui::Align2::LEFT_TOP,
+                    self.monitors[m].name(),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_gray(150),
+                );
+            }
+
+            cursor_x += mw + gap;
         }
     }
 
