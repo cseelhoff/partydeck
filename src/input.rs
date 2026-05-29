@@ -69,6 +69,14 @@ impl InputDevice {
             _ => self.name(),
         }
     }
+    /// A reasonably stable identifier for this physical device, independent of
+    /// the /dev/input/eventN path (which changes across replug/reboot). Used to
+    /// remember the last profile a given controller selected. Identical models
+    /// intentionally share an identity so they share a remembered default.
+    pub fn identity(&self) -> String {
+        let id = self.dev.input_id();
+        format!("{:04x}:{:04x}:{}", id.vendor(), id.product(), self.name())
+    }
     pub fn path(&self) -> &str {
         &self.path
     }

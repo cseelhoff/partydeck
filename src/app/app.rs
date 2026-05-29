@@ -307,10 +307,11 @@ impl PartyApp {
                             }
                         }
                         None => {
+                            let profselection = self.saved_profile_index(i);
                             self.instances.push(Instance {
                                 devices: vec![i],
                                 profname: String::new(),
-                                profselection: 0,
+                                profselection,
                                 monitor: 0,
                                 width: 0,
                                 height: 0,
@@ -339,9 +340,59 @@ impl PartyApp {
                         self.prepare_game_launch();
                     }
                 }
+                Some(PadButton::Left) => {
+                    self.cycle_instance_profile(i, -1);
+                }
+                Some(PadButton::Right) => {
+                    self.cycle_instance_profile(i, 1);
+                }
                 _ => {}
             }
             i += 1;
+        }
+    }
+
+    // Cycle the profile selection of the instance owning `dev` by `dir`
+    // (-1 left, +1 right), wrapping around the available profiles. No-op while
+    // inviting a device or if the device isn't in an instance.
+    fn cycle_instance_profile(&mut self, dev: usize, dir: i32) {
+        if self.instance_add_dev.is_some() || self.profiles.is_empty() {
+            return;
+        }
+        let Some(inst) = self
+            .instances
+            .iter()
+            .position(|ins| ins.devices.contains(&dev))
+        else {
+            return;
+        };
+        let count = self.profiles.len() as i32;
+        let cur = self.instances[inst].profselection as i32;
+        self.instances[inst].profselection = (cur + dir).rem_euclid(count) as usize;
+    }
+
+    // The index into self.profiles of the profile this device last used, or 0
+    // (Guest) if none is remembered or it no longer exists.
+    fn saved_profile_index(&self, dev: usize) -> usize {
+        let id = self.input_devices[dev].identity();
+        self.options
+            .controller_profiles
+            .get(&id)
+            .and_then(|name| self.profiles.iter().position(|p| p == name))
+            .unwrap_or(0)
+    }
+
+    // Remember the profile each device is currently assigned so it can be
+    // preselected next time that controller joins an instance.
+    fn remember_instance_profiles(&mut self) {
+        for instance in &self.instances {
+            let Some(name) = self.profiles.get(instance.profselection) else {
+                continue;
+            };
+            for &dev in &instance.devices {
+                let id = self.input_devices[dev].identity();
+                self.options.controller_profiles.insert(id, name.clone());
+            }
         }
     }
 
@@ -418,6 +469,8 @@ impl PartyApp {
             set_instance_resolutions(&mut self.instances, &self.monitors[0], &self.options);
         }
         set_instance_names(&mut self.instances, &self.profiles);
+
+        self.remember_instance_profiles();
 
         let handler = if let Some(h) = self.handler_lite.clone() {
             h

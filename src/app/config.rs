@@ -1,5 +1,6 @@
 use crate::paths::*;
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
@@ -48,6 +49,11 @@ pub struct PartyConfig {
     pub disable_mount_gamedirs: bool,
     #[serde(default)]
     pub check_for_updates: bool,
+    /// Last profile selected by each controller, keyed by device identity
+    /// (see InputDevice::identity). Used to preselect a player's profile when
+    /// they join an instance.
+    #[serde(default)]
+    pub controller_profiles: HashMap<String, String>,
 }
 
 impl Default for PartyConfig {
@@ -67,6 +73,7 @@ impl Default for PartyConfig {
             profile_unique_dirs: true,
             disable_mount_gamedirs: false,
             check_for_updates: true,
+            controller_profiles: HashMap::new(),
         }
     }
 }

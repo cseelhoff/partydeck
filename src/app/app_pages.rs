@@ -408,6 +408,11 @@ impl PartyApp {
             ui.label(remove_text);
 
             ui.add(egui::Separator::default().vertical());
+
+            ui.label("◄ ►");
+            ui.label("Select Profile");
+
+            ui.add(egui::Separator::default().vertical());
         });
 
         ui.separator();
