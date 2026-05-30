@@ -392,7 +392,7 @@ impl PartyApp {
         ui.heading("Instances");
         ui.separator();
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::Image::new(egui::include_image!("../../res/BTN_SOUTH.png")).max_height(12.0),
             );
@@ -421,12 +421,12 @@ impl PartyApp {
 
             ui.add(egui::Separator::default().vertical());
 
-            ui.label("◄ ►");
+            ui.label("⬅ ➡");
             ui.label("Select Profile");
 
             ui.add(egui::Separator::default().vertical());
 
-            ui.label("▲ ▼");
+            ui.label("⬆ ⬇");
             ui.label("Reorder");
 
             ui.add(egui::Separator::default().vertical());
@@ -559,9 +559,12 @@ impl PartyApp {
             .map(|&m| self.monitors[m].width().max(1) as f32)
             .sum();
         let avail_w = (ui.available_width() - gap * (used.len() as f32 - 1.0) - 4.0).max(1.0);
-        let target_h = 220.0_f32;
-        let scale = (target_h / max_native_h)
-            .min(avail_w / total_native_w)
+        // Scale the preview so it fills the available width while never growing
+        // taller than the remaining vertical space (less room reserved for the
+        // Start bar below), so it tracks the window as it is dynamically resized.
+        let avail_h = (ui.available_height() - 48.0).max(60.0);
+        let scale = (avail_w / total_native_w)
+            .min(avail_h / max_native_h)
             .max(0.01);
         let preview_h = max_native_h * scale;
         let preview_w = total_native_w * scale + gap * (used.len() as f32 - 1.0);
@@ -624,7 +627,11 @@ impl PartyApp {
                     .map(|&d| self.input_devices[d].emoji())
                     .collect::<Vec<_>>()
                     .join(" ");
-                let label = format!("Player {}\n{}\n{}", inst_idx + 1, profile, emojis);
+                let label = if emojis.is_empty() {
+                    format!("{} - {}", inst_idx + 1, profile)
+                } else {
+                    format!("{} {} - {}", emojis, inst_idx + 1, profile)
+                };
                 painter.text(
                     cell.center(),
                     egui::Align2::CENTER_CENTER,
