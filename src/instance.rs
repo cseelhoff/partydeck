@@ -81,6 +81,50 @@ pub fn set_instance_resolutions_multimonitor(
     }
 }
 
+/// Normalized `(x, y, width, height)` cells (each in `0.0..=1.0`) describing how
+/// `player_count` instances are partitioned within a single monitor. This
+/// mirrors the partitioning the KWin scripts apply at launch (see
+/// `res/splitscreen_kwin.js` and `res/splitscreen_kwin_vertical.js`) so the
+/// instance menu can render a faithful preview. `vertical` selects the
+/// two-player split orientation.
+pub fn normalized_layout(player_count: usize, vertical: bool) -> Vec<(f32, f32, f32, f32)> {
+    match player_count {
+        0 => Vec::new(),
+        1 => vec![(0.0, 0.0, 1.0, 1.0)],
+        2 => {
+            if vertical {
+                vec![(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)]
+            } else {
+                vec![(0.0, 0.0, 1.0, 0.5), (0.0, 0.5, 1.0, 0.5)]
+            }
+        }
+        3 => vec![
+            (0.0, 0.0, 1.0, 0.5),
+            (0.0, 0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5, 0.5),
+        ],
+        4 => vec![
+            (0.0, 0.0, 0.5, 0.5),
+            (0.5, 0.0, 0.5, 0.5),
+            (0.0, 0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5, 0.5),
+        ],
+        n => {
+            // Beyond what the KWin scripts handle; fall back to an even grid so
+            // the preview still communicates relative placement.
+            let cols = (n as f32).sqrt().ceil() as usize;
+            let rows = n.div_ceil(cols);
+            let (cw, ch) = (1.0 / cols as f32, 1.0 / rows as f32);
+            (0..n)
+                .map(|i| {
+                    let (c, r) = (i % cols, i / cols);
+                    (c as f32 * cw, r as f32 * ch, cw, ch)
+                })
+                .collect()
+        }
+    }
+}
+
 pub fn set_instance_names(instances: &mut Vec<Instance>, profiles: &[String]) {
     let mut guests = GUEST_NAMES.to_vec();
 

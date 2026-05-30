@@ -346,6 +346,8 @@ impl PartyApp {
                 Some(PadButton::Right) => {
                     self.cycle_instance_profile(i, 1);
                 }
+                Some(PadButton::Up) => self.move_device_instance(i, -1),
+                Some(PadButton::Down) => self.move_device_instance(i, 1),
                 _ => {}
             }
             i += 1;
@@ -438,6 +440,22 @@ impl PartyApp {
         for (key, name) in updates {
             self.options.controller_profiles.insert(key, name);
         }
+    }
+
+    // Move the instance that owns this device up (-1) or down (1) in the launch
+    // order. Launch order is what the KWin scripts use to assign each player a
+    // screen cell, so this lets a player change where they land in the preview.
+    // No-op if the device isn't assigned to an instance or it's already at the
+    // edge of the list.
+    fn move_device_instance(&mut self, dev: usize, dir: i32) {
+        let Some((inst, _)) = self.find_device_in_instance(dev) else {
+            return;
+        };
+        let target = inst as i32 + dir;
+        if target < 0 || target as usize >= self.instances.len() {
+            return;
+        }
+        self.instances.swap(inst, target as usize);
     }
 
     fn is_device_in_any_instance(&self, dev: usize) -> bool {
