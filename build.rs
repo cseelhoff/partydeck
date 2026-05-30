@@ -1,5 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::fs;
 use std::path::Path;
+#[cfg(feature = "build_gamescope")]
+use std::path::PathBuf;
 
 #[cfg(all(not(feature = "download_deps_latest"), feature = "download_deps"))]
 use sha2::{Sha256, Digest};
