@@ -400,6 +400,16 @@ pub fn launch_cmds(
                 &hosts_path.to_string_lossy(),
                 &hosts_target,
             ]);
+            // On systems running a name-service cache daemon (NixOS enables
+            // nscd/nsncd by default), glibc proxies hostname lookups to that
+            // daemon over /run/nscd/socket. The daemon runs on the host, OUTSIDE
+            // this namespace, so it reads the host's real /etc/hosts and our
+            // bind above is silently ignored. Mask the socket with a tmpfs so
+            // glibc's `files` module falls back to reading /etc/hosts directly
+            // and our host_aliases actually take effect.
+            if std::path::Path::new("/run/nscd").exists() {
+                cmd.args(["--tmpfs", "/run/nscd"]);
+            }
         }
 
         // Force IPv4 for backends with a dead AAAA record by pointing the
@@ -668,7 +678,7 @@ fn stage_drm_loader(
          IgnoreInjectionError=1\n\
          IgnoreLoaderArchDifference=0\n\
          [Persistence]\n\
-         Mode=1\n\
+         Mode=0\n\
          [Debug]\n\
          ResumeByDebugger=0\n",
         exe = path_exec.to_path_buf().os_fmt(true),
