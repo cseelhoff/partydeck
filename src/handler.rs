@@ -48,10 +48,29 @@ pub struct Handler {
     pub use_mangohud: bool,
     pub use_goldberg: bool,
     #[serde(default)]
+    pub use_drm_loader: bool,
+    #[serde(default)]
     pub enable_hidraw: bool,
     pub steam_appid: Option<u32>,
 
     pub game_null_paths: Vec<String>,
+
+    // Pin hostnames to specific IPs inside the sandbox by binding a custom
+    // /etc/hosts. Each entry is a standard hosts line, e.g. "162.19.84.58
+    // dt-live.passtechgames.com". Useful when a game's backend has a dead
+    // IPv6 (AAAA) record and Wine's winhttp won't fall back to IPv4.
+    #[serde(default)]
+    pub host_aliases: Vec<String>,
+
+    // Domains for which to suppress AAAA (IPv6) DNS answers inside the sandbox
+    // by running a local AAAA-stripping forwarder and pointing the sandbox's
+    // resolv.conf at it. Unlike host_aliases (which Wine's winhttp ignores
+    // because it resolves via res_query, not /etc/hosts), this works for both
+    // winhttp and RakNet: the dead AAAA never reaches the client, forcing the
+    // live A (IPv4) record. Each entry is a domain suffix, e.g.
+    // "passtechgames.com".
+    #[serde(default)]
+    pub dns_filter_aaaa: Vec<String>,
 }
 
 impl Default for Handler {
@@ -77,10 +96,13 @@ impl Default for Handler {
 
             use_mangohud: false,
             use_goldberg: false,
+            use_drm_loader: false,
             enable_hidraw: false,
             steam_appid: None,
 
             game_null_paths: Vec::new(),
+            host_aliases: Vec::new(),
+            dns_filter_aaaa: Vec::new(),
         }
     }
 }

@@ -67,11 +67,15 @@ const BUNDLE: &[(&str, &str)] = &[
     ("deps/releases/gbe-win/steamclient_experimental/steamclient64.dll", "res/goldberg/win/steamclient64.dll"),
     ("deps/releases/gbe-win/steamclient_experimental/GameOverlayRenderer.dll", "res/goldberg/win/GameOverlayRenderer.dll"),
     ("deps/releases/gbe-win/steamclient_experimental/GameOverlayRenderer64.dll", "res/goldberg/win/GameOverlayRenderer64.dll"),
+    // goldberg cold client loader + Stub DRM v3.1 patcher (for SteamStub games)
+    ("deps/releases/gbe-win/steamclient_experimental/steamclient_loader_x64.exe", "res/goldberg/win/steamclient_loader_x64.exe"),
+    ("deps/releases/gbe-win/steamclient_experimental/extra_dlls/steamclient_extra_x64.dll", "res/goldberg/win/extra_dlls/steamclient_extra_x64.dll"),
     // umu
     ("deps/releases/umu/umu-run", "bin/umu-run"),
     // resources
     ("res/splitscreen_kwin.js", "res/splitscreen_kwin.js"),
     ("res/splitscreen_kwin_vertical.js", "res/splitscreen_kwin_vertical.js"),
+    ("res/dns_aaaa_filter.py", "res/dns_aaaa_filter.py"),
 ];
 
 

@@ -53,6 +53,42 @@ pub fn launch_game(
         None => 0.5,
     };
 
+    // If the handler requests AAAA filtering and no DNS shim is already
+    // listening on 127.0.0.1:53, start our own forwarder. The preferred setup
+    // is the privileged guard (res/dns_shim_guard.sh) which owns both the shim
+    // and the egress UDP:53 redirect and auto-reverts on exit; if it's already
+    // running we must NOT spawn a second shim (port conflict). A shim alone is
+    // ineffective without the redirect because Wine's winhttp queries the real
+    // nameserver directly, ignoring the sandbox resolv.conf — so if nothing is
+    // listening we just warn rather than rely on the bound resolv.conf.
+    let mut dns_shim = if h.dns_filter_aaaa.is_empty() {
+        None
+    } else if dns_shim_already_listening() {
+        println!("[partydeck] DNS shim already listening on :53 (guard); not starting another.");
+        None
+    } else {
+        match spawn_dns_filter(&h.dns_filter_aaaa) {
+            Ok(child) => Some(child),
+            Err(e) => {
+                eprintln!("[partydeck] WARNING: could not start AAAA DNS filter: {e}");
+                eprintln!("[partydeck] Games needing IPv4 fallback may fail to connect.");
+                None
+            }
+        }
+    };
+    if h.dns_filter_aaaa.is_empty() == false && dns_shim.is_none() && !dns_shim_already_listening() {
+        eprintln!(
+            "[partydeck] NOTE: a DNS shim alone won't help unless egress UDP:53 is redirected to it."
+        );
+        eprintln!(
+            "[partydeck] For backends with a dead IPv6 record, run (in a separate terminal):"
+        );
+        eprintln!(
+            "[partydeck]   sudo {}",
+            PATH_RES.join("dns_shim_guard.sh").to_string_lossy()
+        );
+    }
+
     let mut handles = Vec::new();
 
     let mut i = 0;
@@ -72,8 +108,64 @@ pub fn launch_game(
         handle.wait()?;
     }
 
+    if let Some(mut child) = dns_shim.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     Ok(())
 }
+
+/// Start the bundled AAAA-stripping DNS forwarder on 127.0.0.1:53, forwarding to
+/// the host's real upstream nameserver and suppressing AAAA only for `domains`.
+/// Uses a TCP upstream so it is safe behind an egress UDP:53 redirect (the
+/// redirect would otherwise loop our own upstream UDP query back to us).
+fn spawn_dns_filter(domains: &[String]) -> std::io::Result<std::process::Child> {
+    let upstream = host_upstream_nameserver().unwrap_or_else(|| "1.1.1.1".to_string());
+    let script = PATH_RES.join("dns_aaaa_filter.py");
+    let mut cmd = Command::new("python3");
+    cmd.arg(&script)
+        .args(["--listen", "127.0.0.1:53"])
+        .args(["--upstream", &format!("{upstream}:53")])
+        .arg("--tcp-upstream");
+    for d in domains {
+        cmd.args(["--domain", d]);
+    }
+    println!(
+        "[partydeck] Starting AAAA DNS filter on 127.0.0.1:53 (upstream {upstream}) for {domains:?}"
+    );
+    cmd.spawn()
+}
+
+/// True if something is already bound to UDP 127.0.0.1:53 (e.g. the privileged
+/// guard's shim), in which case partydeck must not start a second one.
+fn dns_shim_already_listening() -> bool {
+    std::fs::read_to_string("/proc/net/udp")
+        .map(|s| {
+            // /proc/net/udp local_address column is hex "IP:PORT"; loopback
+            // 127.0.0.1:53 == "0100007F:0035". Also match wildcard 0.0.0.0:53.
+            s.lines()
+                .any(|l| l.contains(" 0100007F:0035 ") || l.contains(" 00000000:0035 "))
+        })
+        .unwrap_or(false)
+}
+
+/// Read the first `nameserver` entry from the host's /etc/resolv.conf so the
+/// forwarder relays real queries upstream. Skips our own 127.0.0.1 entry.
+fn host_upstream_nameserver() -> Option<String> {
+    let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("nameserver ") {
+            let addr = rest.trim();
+            if addr != "127.0.0.1" && !addr.is_empty() {
+                return Some(addr.to_string());
+            }
+        }
+    }
+    None
+}
+
 
 pub fn launch_cmds(
     h: &Handler,
@@ -129,6 +221,35 @@ pub fn launch_cmds(
         let path_exec = gamedir.join(exec);
         let cwd = path_exec.parent().ok_or_else(|| "couldn't get parent")?;
 
+        // Resolve the handler's per-instance game arguments up front so they can
+        // be appended to the command directly or, for the cold client loader,
+        // written into ColdClientLoader.ini's ExeCommandLine (the loader does not
+        // forward CLI args to the game and would treat them as its target exe).
+        let game_args: Vec<String> = h
+            .args
+            .split_whitespace()
+            .map(|arg| match arg {
+                "$PROFILE" => instance.profname.clone(),
+                "$WIDTH" => instance.width.to_string(),
+                "$HEIGHT" => instance.height.to_string(),
+                "$RESOLUTION" => format!("{}x{}", instance.width, instance.height),
+                "$INSTANCECOUNT" => instances.len().to_string(),
+                "$INSTANCENUM" => i.to_string(),
+                "$GAMEDIR" => gamedir.os_fmt(win),
+                "$HANDLERDIR" => h.path_handler.os_fmt(win),
+                _ => String::from(arg).sanitize_path(),
+            })
+            .collect();
+
+        // SteamStub-DRM games are launched via the gbe_fork cold client loader
+        // (injects the Stub DRM patcher + force-injects steamclient) instead of
+        // running the exe directly.
+        let drm_loader = if win && h.use_goldberg && h.use_drm_loader {
+            Some(stage_drm_loader(i, &gamedir, &path_exec, &game_args, h)?)
+        } else {
+            None
+        };
+
         let path_prof = PATH_PARTY.join("profiles").join(&instance.profname);
         let path_pfx = PATH_PARTY
             .join("prefixes")
@@ -139,7 +260,10 @@ pub fn launch_cmds(
 
         let cmd = &mut cmds[i];
 
-        cmd.current_dir(cwd);
+        cmd.current_dir(match &drm_loader {
+            Some(l) => l.dir.as_path(),
+            None => cwd,
+        });
 
         if !win || !h.enable_hidraw {
             cmd.env("SDL_JOYSTICK_HIDAPI", "0");
@@ -236,9 +360,70 @@ pub fn launch_cmds(
 
         // Bwrap args
         cmd.arg("bwrap");
-        cmd.arg("--die-with-parent");
+        // The cold client loader (Mode=1) keeps running after umu-run/Proton
+        // returns once the game process has settled. With --die-with-parent the
+        // container would be torn down the moment umu-run returns, killing the
+        // still-starting game ("Primary child shut down"), so omit it here.
+        if drm_loader.is_none() {
+            cmd.arg("--die-with-parent");
+        }
         cmd.args(["--dev-bind", "/", "/"]);
         cmd.args(["--tmpfs", "/tmp"]);
+
+        // Pin hostnames to specific IPs inside the sandbox by binding a custom
+        // /etc/hosts. Needed for games whose backend has a dead IPv6 (AAAA)
+        // record: Wine's winhttp resolves the AAAA, tries IPv6, and won't fall
+        // back to the working IPv4, failing with WinHttp 12029. Writing the
+        // host's /etc/hosts plus the handler's aliases (IPv4-only) forces IPv4.
+        if !h.host_aliases.is_empty() {
+            let hosts_path = PATH_PARTY.join(format!("tmp/hosts-{i}"));
+            let mut hosts_content =
+                std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+            if !hosts_content.ends_with('\n') {
+                hosts_content.push('\n');
+            }
+            hosts_content.push_str("# partydeck host_aliases\n");
+            for alias in &h.host_aliases {
+                hosts_content.push_str(alias);
+                hosts_content.push('\n');
+            }
+            std::fs::write(&hosts_path, hosts_content)?;
+            // /etc/hosts is often a symlink (e.g. NixOS: /etc/hosts ->
+            // /etc/static/hosts -> /nix/store/...). bwrap can't bind-mount over
+            // a symlink target, so resolve to the canonical real path. The bind
+            // is namespaced and does not affect the host's (read-only) file.
+            let hosts_target = std::fs::canonicalize("/etc/hosts")
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/etc/hosts".to_string());
+            cmd.args([
+                "--bind",
+                &hosts_path.to_string_lossy(),
+                &hosts_target,
+            ]);
+        }
+
+        // Force IPv4 for backends with a dead AAAA record by pointing the
+        // sandbox's resolv.conf at our local AAAA-stripping forwarder (spawned
+        // in launch_game on 127.0.0.1:53). Wine's winhttp resolves via
+        // res_query reading resolv.conf, so this reaches it where /etc/hosts
+        // (host_aliases) cannot. The forwarder strips AAAA only for the
+        // handler's dns_filter_aaaa domains and passes everything else through.
+        if !h.dns_filter_aaaa.is_empty() {
+            let resolv_path = PATH_PARTY.join(format!("tmp/resolv-{i}.conf"));
+            std::fs::write(
+                &resolv_path,
+                "# partydeck dns_filter_aaaa\nnameserver 127.0.0.1\noptions edns0\n",
+            )?;
+            let resolv_target = std::fs::canonicalize("/etc/resolv.conf")
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/etc/resolv.conf".to_string());
+            cmd.args([
+                "--bind",
+                &resolv_path.to_string_lossy(),
+                &resolv_target,
+            ]);
+        }
+
         // Mask out any gamepads that aren't this player's
         for (d, dev) in input_devices.iter().enumerate() {
             if !dev.enabled
@@ -307,6 +492,14 @@ pub fn launch_cmds(
                 cmd.env("SteamGameId", &appid.to_string());
             }
 
+            // The cold client loader provides its own steamclient + emu config,
+            // so point GseAppPath at it and let UMU's Proton hand off steamclient
+            // loading to the injected dll instead of lsteamclient.
+            if let Some(l) = &drm_loader {
+                cmd.env("GseAppPath", &l.dir);
+                cmd.env("PROTON_DISABLE_LSTEAMCLIENT", "1");
+            }
+
             let sdk32_link = std::fs::read_link(PATH_STEAM.join("sdk32")).map_err(|e| format!("Failed to read sdk32 link: {}", e))?;
             let sdk64_link = std::fs::read_link(PATH_STEAM.join("sdk64")).map_err(|e| format!("Failed to read sdk64 link: {}", e))?;
 
@@ -320,7 +513,10 @@ pub fn launch_cmds(
                 sdk64_link,
             ]);
 
-            if win {
+            // When using the cold client loader, it force-injects steamclient
+            // from its own directory, so we don't bind goldberg/win over the
+            // prefix's Steam dir.
+            if win && drm_loader.is_none() {
                 cmd.arg("--bind").args([
                     PATH_RES.join("goldberg/win"),
                     path_pfx.join("drive_c/Program Files (x86)/Steam"),
@@ -372,25 +568,120 @@ pub fn launch_cmds(
         }
 
 
-        cmd.arg(&path_exec);
+        cmd.arg(match &drm_loader {
+            Some(l) => l.exe.as_path(),
+            None => path_exec.as_path(),
+        });
 
-        for arg in h.args.split_whitespace() {
-            let processed_arg = match arg {
-                "$PROFILE" => &instance.profname,
-                "$WIDTH" => &instance.width.to_string(),
-                "$HEIGHT" => &instance.height.to_string(),
-                "$RESOLUTION" => &format!("{}x{}", instance.width, instance.height),
-                "$INSTANCECOUNT" => &instances.len().to_string(),
-                "$INSTANCENUM" => &i.to_string(),
-                "$GAMEDIR" => &gamedir.os_fmt(win),
-                "$HANDLERDIR" => &h.path_handler.os_fmt(win),
-                _ => &String::from(arg).sanitize_path(),
-            };
-            cmd.arg(processed_arg);
+        // The cold client loader takes no game args (they live in
+        // ColdClientLoader.ini's ExeCommandLine); only append args when running
+        // the game executable directly.
+        if drm_loader.is_none() {
+            for arg in &game_args {
+                cmd.arg(arg);
+            }
         }
     }
 
     Ok(cmds)
+}
+
+/// Staged cold-client-loader directory used to launch SteamStub-DRM games.
+struct DrmLoader {
+    dir: PathBuf,
+    exe: PathBuf,
+}
+
+/// Stage a gbe_fork "cold client loader" directory that injects the Stub DRM
+/// v3.1 patcher and force-injects steamclient before spawning the game. This is
+/// required for newer SteamStub-wrapped executables (e.g. Ravenswatch) which
+/// otherwise fail with "Application load error 3:0000065432".
+fn stage_drm_loader(
+    index: usize,
+    gamedir: &Path,
+    path_exec: &Path,
+    game_args: &[String],
+    h: &Handler,
+) -> Result<DrmLoader, Box<dyn std::error::Error>> {
+    let dir = PATH_PARTY.join("tmp").join(format!("ccloader-{index}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("extra_dlls"))?;
+
+    let win_res = PATH_RES.join("goldberg/win");
+    let loader_exe = win_res.join("steamclient_loader_x64.exe");
+    let patcher = win_res.join("extra_dlls/steamclient_extra_x64.dll");
+    if !loader_exe.exists() || !patcher.exists() {
+        return Err(format!(
+            "DRM loader files missing under {}. Rebuild partydeck to deploy them.",
+            win_res.display()
+        )
+        .into());
+    }
+
+    for f in [
+        "steamclient_loader_x64.exe",
+        "steamclient.dll",
+        "steamclient64.dll",
+        "GameOverlayRenderer.dll",
+        "GameOverlayRenderer64.dll",
+    ] {
+        let from = win_res.join(f);
+        if from.exists() {
+            std::fs::copy(&from, dir.join(f))?;
+        }
+    }
+    std::fs::copy(&patcher, dir.join("extra_dlls/steamclient_extra_x64.dll"))?;
+    std::fs::write(
+        dir.join("extra_dlls/load_order.txt"),
+        "steamclient_extra_x64.dll\n",
+    )?;
+
+    // gbe_fork reads emu config from steam_settings beside steamclient64.dll
+    let steam_settings = dir.join("steam_settings");
+    std::fs::create_dir_all(&steam_settings)?;
+    let steam_settings_src = PATH_PARTY.join("goldberg_data/steam_settings");
+    if steam_settings_src.is_dir() {
+        for entry in std::fs::read_dir(&steam_settings_src)?.flatten() {
+            if entry.path().is_file() {
+                std::fs::copy(entry.path(), steam_settings.join(entry.file_name()))?;
+            }
+        }
+    }
+    if let Some(appid) = h.steam_appid {
+        std::fs::write(steam_settings.join("steam_appid.txt"), appid.to_string())?;
+    }
+
+    let appid = h.steam_appid.map(|a| a.to_string()).unwrap_or_default();
+    let cmdline = game_args.join(" ");
+    let ini = format!(
+        "[SteamClient]\n\
+         Exe={exe}\n\
+         ExeRunDir={rundir}\n\
+         ExeCommandLine={cmdline}\n\
+         AppId={appid}\n\
+         SteamClientDll=steamclient.dll\n\
+         SteamClient64Dll=steamclient64.dll\n\
+         [Injection]\n\
+         ForceInjectSteamClient=1\n\
+         ForceInjectGameOverlayRenderer=0\n\
+         DllsToInjectFolder=extra_dlls\n\
+         IgnoreInjectionError=1\n\
+         IgnoreLoaderArchDifference=0\n\
+         [Persistence]\n\
+         Mode=1\n\
+         [Debug]\n\
+         ResumeByDebugger=0\n",
+        exe = path_exec.to_path_buf().os_fmt(true),
+        rundir = gamedir.to_path_buf().os_fmt(true),
+        cmdline = cmdline,
+        appid = appid,
+    );
+    std::fs::write(dir.join("ColdClientLoader.ini"), ini)?;
+
+    Ok(DrmLoader {
+        exe: dir.join("steamclient_loader_x64.exe"),
+        dir,
+    })
 }
 
 fn print_launch_cmds(cmds: &Vec<Command>) {

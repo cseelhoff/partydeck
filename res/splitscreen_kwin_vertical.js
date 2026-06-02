@@ -38,15 +38,16 @@ const height = [
   [1/3, 1/3, 1/3, 1/3, 1/3, 1/3]
 ]
 
+function isGamescopeClass(cls) {
+  return typeof cls == "string" && cls.indexOf("gamescope") != -1;
+}
+
 function getGamescopeClients() {
   var allClients = workspace.windowList();
   var gamescopeClients = [];
 
   for (var i = 0; i < allClients.length; i++) {
-    if (
-      allClients[i].resourceClass == "gamescope" ||
-      allClients[i].resourceClass == "gamescope-kbm"
-    ) {
+    if (isGamescopeClass(allClients[i].resourceClass)) {
       gamescopeClients.push(allClients[i]);
     }
   }
@@ -67,10 +68,7 @@ function numGamescopeClientsInOutput(output) {
 function gamescopeAboveBelow() {
   var gamescopeClients = getGamescopeClients();
   for (var i = 0; i < gamescopeClients.length; i++) {
-    if (
-      workspace.activeWindow.resourceClass == "gamescope" ||
-      workspace.activeWindow.resourceClass == "gamescope-kbm"
-    ) {
+    if (isGamescopeClass(workspace.activeWindow.resourceClass)) {
       gamescopeClients[i].keepAbove = true;
     } else {
       gamescopeClients[i].keepAbove = false;
