@@ -11,7 +11,8 @@ import json, struct, sys, os, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import raknet, scenes
 
-RELAY = "/home/caleb/pd_capture_backup/relay.B-joinflow.jsonl"
+RELAY = os.environ.get("JOIN_DIFF_CAPTURE",
+                       "/home/caleb/pd_capture_backup/relay.B-joinflow.jsonl")
 
 def mp(b, i=0):
     c = b[i]; i += 1
@@ -161,6 +162,9 @@ def flatten(dgrams):
 
 def main():
     recs=[json.loads(l) for l in open(RELAY) if l.strip()]
+    peer=os.environ.get("JOIN_DIFF_PEER")
+    if peer:
+        recs=[r for r in recs if r.get("peer")==peer]
     addr=("10.9.9.9",55555); fake=FakeSock()
     groups=[]; cur=None
     for r in recs:

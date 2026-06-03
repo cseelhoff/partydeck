@@ -20,6 +20,7 @@ import datetime
 import base64
 import json
 import uuid
+import select
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blobs  # captured static SceneInfosDto / ConnectionResult msgpack blobs
@@ -204,7 +205,8 @@ class Conn:
         # Unique Stormancer user id per connection (32-hex, matches real format),
         # finalized/echoed at login so this client's party-member id is stable.
         self.user_id = uuid.uuid4().hex
-        self.username = "Player"
+        self.username = ""           # real authenticator returns empty Username
+        self.steam_id = None         # SteamID64, parsed from the login ticket
         self.party_userdata = None  # member userdata JSON bytes from createsession
         self.srv_rpc_id = 1000      # server-initiated RPC request-id counter
         self.party_session_id = None  # stable 16-byte session id for our member
@@ -359,6 +361,50 @@ def parse_messages(data: bytes, off: int):
         payload = data[off:off + nbytes]; off += nbytes
         msgs.append((reliability, reliable_num, payload))
     return msgs
+
+
+def parse_messages_ex(data: bytes, off: int):
+    """Like parse_messages but also surfaces split-packet metadata so callers can
+    reassemble fragmented messages. Yields dicts with keys:
+    reliability, reliable_num, payload, split (None or (count, id, index))."""
+    out = []
+    n = len(data)
+    while off + 3 <= n:
+        m = data[off]; off += 1
+        reliability = (m >> 5) & 0x7
+        has_split = (m >> 4) & 0x1
+        if reliability >= 8 or off + 2 > n:
+            break
+        data_bits = (data[off] << 8) | data[off + 1]; off += 2
+        if data_bits == 0:
+            break
+        reliable_num = None
+        if reliability in (RELIABLE, RELIABLE_ORDERED, RELIABLE_SEQUENCED):
+            if off + 3 > n:
+                break
+            reliable_num = rd_u24le(data, off); off += 3
+        if reliability in (UNRELIABLE_SEQUENCED, RELIABLE_SEQUENCED):
+            off += 3                                         # sequencingIndex
+        if reliability in (UNRELIABLE_SEQUENCED, RELIABLE_SEQUENCED,
+                           RELIABLE_ORDERED):
+            off += 3                                         # orderingIndex
+            off += 1                                         # orderingChannel
+        split = None
+        if has_split:
+            if off + 10 > n:
+                break
+            count = struct.unpack(">I", data[off:off + 4])[0]
+            sid = struct.unpack(">H", data[off + 4:off + 6])[0]
+            index = struct.unpack(">I", data[off + 6:off + 10])[0]
+            split = (count, sid, index)
+            off += 10
+        nbytes = (data_bits + 7) // 8
+        if off + nbytes > n:
+            break
+        payload = data[off:off + nbytes]; off += nbytes
+        out.append({"reliability": reliability, "reliable_num": reliable_num,
+                    "payload": payload, "split": split})
+    return out
 
 
 def send_connection_accepted(sock, conn, payload):
@@ -989,6 +1035,7 @@ def handle_scene_message(sock, conn, payload):
     if rname == "Authentication.Login":
         log(f"  ** LOGIN RPC scene={sr.suffix} rpcReqId={rpc_req} "
             f"({len(rest)-2}B args): {hexdump(rest[2:], 48)}")
+        _parse_login_steam_id(conn, rest[2:])
         send_login_success(sock, conn, sr, rpc_req)
     elif rname == "Locator.GetSceneConnectionToken":
         svc, i = mp_read_str(rest, 2)
@@ -1221,29 +1268,65 @@ def broadcast_player_update(sock, gs, about_conn, status):
 
 
 
+def _parse_login_steam_id(conn, args):
+    """Extract the player's SteamID64 from the Authentication.Login arguments and
+    store it on the connection. The login args carry a Steam auth-session ticket
+    as a hex ASCII string; that ticket begins with a 4-byte gcTokenSize (=0x14,
+    i.e. the ASCII "14000000") followed by an 8-byte GC token and then the 8-byte
+    SteamID64 (little-endian). We locate the ticket's ASCII hex in the raw args
+    and parse the SteamID64 from it. Verified byte-exact against a live relay
+    capture (yields steam:<SteamID64> identical to the real authenticator)."""
+    try:
+        pos = args.find(b"14000000")           # ASCII start of the ticket hex
+        if pos < 0:
+            return
+        # read forward while characters are hex digits -> the full ticket hex
+        end = pos
+        n = len(args)
+        while end < n and args[end:end + 1] in b"0123456789ABCDEFabcdef":
+            end += 1
+        tic_hex = args[pos:end]
+        if len(tic_hex) < 40:                   # need at least 20 ticket bytes
+            return
+        b = bytes.fromhex(tic_hex.decode("ascii", "ignore")[:len(tic_hex) // 2 * 2])
+        if len(b) < 20 or b[0:4] != b"\x14\x00\x00\x00":
+            return
+        conn.steam_id = struct.unpack("<Q", b[12:20])[0]
+    except Exception as e:
+        log(f"  !! login steam-id parse failed: {e}")
+
+
 def send_login_success(sock, conn, sr, rpc_req):
     """Reply to the authenticator login RPC with a successful LoginResult.
 
     LoginResult is a msgpack array(6): [ErrorMsg, Success, UserId, Username,
-    {}, {}]; for success we send [nil, true, userId, username, {}, {}], framed as
-    rpc.next (this scene's next handle) then rpc.completed.
+    PlatformIds, Authentications]. The REAL authenticator returns an EMPTY
+    Username and a PlatformIds map {"steam": "steam:<SteamID64>"} (verified
+    against a live relay capture); the SteamID64 is parsed from the login
+    ticket at login time. We send [nil, true, userId, "", {steam:...}, {}],
+    framed as rpc.next (this scene's next handle) then rpc.completed.
 
     UserId MUST be unique per connection (assigned in Conn.__init__ as a fresh
     uuid). Hardcoding it made every local instance share one identity, so a
     joiner's invite code resolved to its own party and join-by-code self-collided.
     """
     user_id = conn.user_id          # unique per-connection Stormancer id
-    username = conn.username
+    username = conn.username        # real authenticator returns ""
+    if conn.steam_id is not None:
+        platform_ids = mp_map([(mp_str("steam"),
+                                mp_str(f"steam:{conn.steam_id}"))])
+    else:
+        platform_ids = MP_EMPTY_MAP
     result = (bytes([0x96])           # fixarray(6)
               + b"\xc0"               # [0] ErrorMsg = nil
               + b"\xc3"               # [1] Success  = true
               + mp_str(user_id)       # [2] UserId
-              + mp_str(username)      # [3] Username
-              + b"\x80"               # [4] {} (metadata)
+              + mp_str(username)      # [3] Username (empty, as real)
+              + platform_ids          # [4] PlatformIds {"steam": "steam:<id>"}
               + b"\x80")              # [5] {} (authentications)
     rpc_respond(sock, conn, sr, rpc_req, result)
-    log(f"  <- LOGIN SUCCESS rpcReqId={rpc_req} userId={user_id} user={username} "
-        f"(rpc.next + rpc.completed)")
+    log(f"  <- LOGIN SUCCESS rpcReqId={rpc_req} userId={user_id} "
+        f"steam={conn.steam_id} (rpc.next + rpc.completed)")
 
 
 def send_response_msg(sock, conn, req_id, payload):
@@ -1341,6 +1424,15 @@ def handle_system_request(sock, conn, payload):
         send_response_complete(sock, conn, req_id, has_values=True)
         log(f"  <- RESPONSE ConnectionResult reqId={req_id} kind={kind} key='{key}' "
             f"handle={handle} ({len(blob)}B)")
+        if kind == "static" and key == "authenticator":
+            # The real authenticator pushes gameVersion.update right after its
+            # scene connects (an unsolicited server->client message carrying the
+            # accepted client-version pattern). Verified value from live capture.
+            gv_route = sr.client_recv.get("gameVersion.update")
+            if gv_route is not None:
+                send_scene_msg(sock, conn, handle, gv_route,
+                               mp_str("bot,1.05.*"))
+                log(f"  <- gameVersion.update 'bot,1.05.*' (authenticator push)")
     elif msg_id == SR_PING:                                  # 2
         # request data = client tStart (uint64 LE); reply [serverClock LE][echo LE].
         echo = data[:8] if len(data) >= 8 else b"\x00" * 8
@@ -1536,9 +1628,461 @@ def main():
             handle_connected(sock, data, addr)
 
 
+# =========================================================================
+# RELAY MODE (env RAKNET_RELAY=1)
+# -------------------------------------------------------------------------
+# Instead of emulating the Stormancer backend, transparently proxy every UDP
+# datagram to the REAL dt-live RakNet cluster and forward its replies back to
+# the client. This makes join-by-code actually work through us (the real
+# backend does all the work), which is the decisive datapoint: if join
+# completes through the relay, the ONLY difference vs the emulator is the
+# emulator's own responses. Every datagram (both directions) is captured to a
+# JSONL file (dir + full hex) so join_diff.py can do a field-level diff of the
+# real wire against what raknet.py would have generated.
+#
+# The real RakNet endpoint is learned from dtlive_server (relay mode), which
+# writes it to RELAY_STATE_FILE when it forwards the bootstrap /token. We fall
+# back to RAKNET_RELAY_UPSTREAM (host:port) or dt-live.passtechgames.com:30100.
+# =========================================================================
+
+RELAY_STATE_FILE = os.environ.get(
+    "RELAY_STATE_FILE", "/tmp/pdlog/probe/relay_upstream.json")
+RELAY_CAPTURE_FILE = os.environ.get(
+    "RELAY_CAPTURE", "/tmp/pdlog/probe/relay_capture.jsonl")
+_DEFAULT_UPSTREAM = os.environ.get(
+    "RAKNET_RELAY_UPSTREAM", "dt-live.passtechgames.com:30100")
+
+
+def _relay_resolve_upstream():
+    """Resolve the real RakNet cluster endpoint to an (ip, port) tuple, forcing
+    IPv4 (the dt-live AAAA records are dead; only A records route)."""
+    ep = os.environ.get("RAKNET_RELAY_UPSTREAM")
+    if not ep:
+        try:
+            with open(RELAY_STATE_FILE) as f:
+                ep = (json.load(f) or {}).get("raknet")
+        except Exception:
+            ep = None
+    if not ep:
+        ep = _DEFAULT_UPSTREAM
+    host, _, port = ep.rpartition(":")
+    port = int(port)
+    ai = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+    return (ai[0][4][0], port), f"{host}:{port}"
+
+
+_relay_cap_fh = None
+def _relay_capture(direction, peer_label, data):
+    """Append one datagram (full hex + direction) to the capture JSONL."""
+    global _relay_cap_fh
+    if _relay_cap_fh is None:
+        os.makedirs(os.path.dirname(RELAY_CAPTURE_FILE), exist_ok=True)
+        _relay_cap_fh = open(RELAY_CAPTURE_FILE, "a", buffering=1)
+    rec = {"t": datetime.datetime.now().isoformat(),
+           "dir": direction, "peer": peer_label, "hex": data.hex()}
+    _relay_cap_fh.write(json.dumps(rec) + "\n")
+
+
+def _relay_rotate(path):
+    """Move an existing per-run output file aside so each relay run starts with a
+    clean file. Without this the capture/assert JSONL would APPEND across runs,
+    mixing sessions -- which silently pollutes the diff (e.g. a stale pre-fix
+    prediction lingering next to the current run's). The previous file is kept as
+    '<path>.<mtime>.bak' so nothing is lost."""
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            mt = datetime.datetime.fromtimestamp(
+                os.path.getmtime(path)).strftime("%Y%m%d-%H%M%S")
+            bak = f"{path}.{mt}.bak"
+            os.replace(path, bak)
+            log(f"  rotated previous {os.path.basename(path)} -> "
+                f"{os.path.basename(bak)}")
+    except Exception as e:
+        log(f"  !! rotate {path} failed: {e}")
+
+
+# First-byte -> short tag for the live snoop log (best-effort; the rigorous
+# decode is done offline by join_diff.py against the JSONL capture).
+_RELAY_MSG_TAGS = {
+    0x00: "PING", 0x03: "PONG", 0x09: "CONN_REQ",
+    0x10: "CONN_REQ_ACCEPTED", 0x13: "NEW_INCOMING", 0x15: "DISCONNECT",
+    0x86: "SYSTEM_REQUEST", 0x89: "RESP_MSG", 0x8a: "RESP_COMPLETE",
+    0x8b: "RESP_ERROR", 0x8c: "CONNECTION_RESULT",
+}
+
+
+def _relay_snoop(direction, data):
+    """Best-effort human-readable one-liners for a relayed datagram so the join
+    flow can be watched live. Decodes the RakNet data-datagram envelope and the
+    first byte of each encapsulated message; scene handles (>=0x8d) are reported
+    raw since their meaning needs the per-session scene map."""
+    if not data:
+        return
+    flags = data[0]
+    if (flags & 0xC0) == 0xC0:      # ACK/NAK
+        return
+    if not (flags & 0x80):          # offline (handshake) datagram
+        log(f"  [{direction}] offline id=0x{flags:02x} len={len(data)}")
+        return
+    try:
+        msgs = parse_messages(data, 4)
+    except Exception:
+        return
+    for rel, rnum, payload in msgs:
+        if not payload:
+            continue
+        b0 = payload[0]
+        tag = _RELAY_MSG_TAGS.get(b0)
+        if tag is None:
+            if b0 >= 0x8d:
+                tag = f"scene h=0x{b0:02x}"
+            else:
+                tag = f"id=0x{b0:02x}"
+        log(f"  [{direction}] {tag} ({len(payload)}B)")
+
+
+# =========================================================================
+# INLINE PREDICTION + ASSERT (the "shadow emulator")
+# -------------------------------------------------------------------------
+# For every client->server datagram, we ALSO feed it to the real emulator
+# handlers (handle_ocr1/ocr2/handle_connected) through a capturing fake socket.
+# Whatever the emulator WOULD have replied is the PREDICTION. When the real
+# server's reply comes back, we compare the two per Stormancer message, keyed by
+# system reqId (RESP_MSG/COMPLETE/ERROR) or by resolved (scene-kind, route,
+# rpcReqId) so the comparison aligns across the two sides even though the
+# emulator allocates different numeric scene handles than the real cluster.
+# Each comparison is appended to RELAY_ASSERT_FILE as one JSON line
+# {match, key, real, pred}; mismatches are also printed live. Nothing halts.
+#
+# Caveat (inherent, not a bug): the shadow emulator never ingests the real
+# server's replies, so after the first divergence its later predictions are
+# based on its own earlier output, not reality. That is exactly what we are
+# measuring -- where the emulator would have diverged from the live server.
+# =========================================================================
+
+RELAY_ASSERT_FILE = os.environ.get(
+    "RELAY_ASSERT", "/tmp/pdlog/probe/relay_assert.jsonl")
+
+_RPC_STREAM_ROUTES = ("stormancer.rpc.next", "stormancer.rpc.completed",
+                      "stormancer.rpc.error", "stormancer.rpc.cancel")
+_MP_MAP_MARKERS = set(range(0x80, 0x90)) | {0xde, 0xdf}
+
+
+def _rd_u16le(b, i):
+    return b[i] | (b[i + 1] << 8)
+
+
+def _kind_of_routes(names):
+    """Classify a scene by the route names it exposes (handle numbers differ
+    between emulator and real server, so we key scenes by kind instead)."""
+    s = set(names)
+    if "users.renewCredentials" in s:
+        return "authenticator"
+    if "Steam.GetFriends" in s or "friends.notification" in s:
+        return "friends"
+    if any(n.startswith("party.") for n in s) or "memberConnected" in s:
+        return "party"
+    if any("amefinder" in n or "atchmak" in n or "Merger" in n
+           or n.startswith("gf.") for n in s):
+        return "matchmaking"
+    if any("amesession" in n or "GameSession" in n for n in s):
+        return "gamesession"
+    return "scene?"
+
+
+class _ShadowSock:
+    """Captures every datagram the emulator would have transmitted."""
+    def __init__(self):
+        self.out = []
+
+    def sendto(self, b, addr):
+        self.out.append(bytes(b))
+
+
+class _RelayAssert:
+    """Per-client prediction-vs-reality comparison engine."""
+
+    def __init__(self, label, jd):
+        self.label = label
+        self.jd = jd                       # join_diff module (msgpack + skel)
+        self.h2r = {"pred": {}, "real": {}}   # side -> handle -> {routeH: name}
+        self.h2k = {"pred": {}, "real": {}}   # side -> handle -> kind
+        self.skels = {"pred": {}, "real": {}}  # side -> key -> skeleton
+        self.split = {"pred": {}, "real": {}}  # side -> splitId -> {idx: frag}
+        self.done = set()                  # keys already emitted as matched
+        self.n_ok = 0
+        self.n_diff = 0
+
+    @staticmethod
+    def _is_mp(raw):
+        return bool(raw) and raw[0] in _MP_MAP_MARKERS
+
+    def _learn_routes(self, side, vals):
+        """A scene-connect response carries {SceneHandle, RouteMappings}; record
+        the side's handle->route table so later scene messages resolve."""
+        for v in vals:
+            if (isinstance(v, tuple) and v[0] == "map"
+                    and "RouteMappings" in v[1] and "SceneHandle" in v[1]):
+                sh = v[1]["SceneHandle"]
+                rm = v[1]["RouteMappings"]
+                if isinstance(sh, int) and isinstance(rm, tuple) and rm[0] == "map":
+                    routes = {int(rh): name for name, rh in rm[1].items()
+                              if isinstance(rh, int)}
+                    self.h2r[side][sh] = routes
+                    self.h2k[side][sh] = _kind_of_routes(routes.values())
+
+    def _classify(self, side, payload):
+        """Return (alignment_key, skeleton) for one encapsulated message."""
+        jd = self.jd
+        mid = payload[0]
+        if mid == ID_REQUEST_RESPONSE_MSG:
+            req = _rd_u16le(payload, 1)
+            raw = payload[3:]
+            vals = self._decode_for_routes(side, raw)
+            return ("SYS", "RESP_MSG", req), self._skel_or_binary(raw, vals)
+        if mid == ID_REQUEST_RESPONSE_COMPLETE:
+            req = _rd_u16le(payload, 1)
+            return ("SYS", "RESP_COMPLETE", req), \
+                {"hasVals": payload[3] if len(payload) > 3 else None}
+        if mid == ID_REQUEST_RESPONSE_ERROR:
+            req = _rd_u16le(payload, 1)
+            raw = payload[3:]
+            return ("SYS", "RESP_ERROR", req), self._skel_or_binary(raw)
+        if len(payload) >= 3:
+            h = mid
+            rh = _rd_u16le(payload, 1)
+            body = payload[3:]
+            kind = self.h2k[side].get(h, "scene?")
+            rname = self.h2r[side].get(h, {}).get(rh, "r#%d" % rh)
+            if rname in _RPC_STREAM_ROUTES and len(body) >= 2:
+                rid = _rd_u16le(body, 0)
+                return ("SCN", kind, rname, rid), self._skel_or_binary(body[2:])
+            return ("SCN", kind, rname), self._skel_or_binary(body)
+        return None, None
+
+    def _decode_for_routes(self, side, raw):
+        """Decode raw msgpack and, if it carries scene RouteMappings, learn them.
+        Returns the decoded value list (possibly containing an ERR sentinel)."""
+        if not self._is_mp(raw):
+            return None
+        vals = self.jd.mp_all(raw)
+        self._learn_routes(side, vals)
+        return vals
+
+    def _skel_or_binary(self, raw, vals=None):
+        """Identity-masked skeleton of a msgpack payload, or "<binary:N>" when the
+        bytes are not cleanly decodable msgpack. Many RakNet system payloads
+        (ping/clock = 16 bytes) are raw binary whose first byte can land in the
+        msgpack fixmap range (0x80..0x8f); decoding those yields a spurious ERR
+        sentinel that differs per side. Treating any payload whose decode hits an
+        ERR (or which lacks a msgpack marker) as binary keeps the two sides
+        aligned and avoids false DIFFs."""
+        if not self._is_mp(raw):
+            return "<binary:%d>" % len(raw)
+        if vals is None:
+            vals = self.jd.mp_all(raw)
+        if any(isinstance(v, (tuple, list)) and v and v[0] == "ERR" for v in vals):
+            return "<binary:%d>" % len(raw)
+        return [self.jd.skel(v) for v in vals]
+
+    def feed(self, side, datagram):
+        """Decode one s2c datagram (real or predicted) and compare as keys land
+        on both sides. Split (fragmented) messages are reassembled per side by
+        splitPacketId before classification, so large blobs (SceneInfos, party
+        state) are not falsely flagged at fragment boundaries that differ between
+        the emulator's MTU and the real server's."""
+        if not datagram:
+            return
+        flags = datagram[0]
+        if not (flags & 0x80) or (flags & 0xC0) == 0xC0:   # offline / ACK / NAK
+            return
+        try:
+            msgs = parse_messages_ex(datagram, 4)
+        except Exception:
+            return
+        for m in msgs:
+            pl = m["payload"]
+            if not pl:
+                continue
+            sp = m["split"]
+            if sp is not None:
+                count, sid, index = sp
+                buf = self.split[side].setdefault(sid, {})
+                buf[index] = pl
+                if len(buf) < count:
+                    continue                       # await remaining fragments
+                pl = b"".join(buf[i] for i in range(count))
+                del self.split[side][sid]
+            try:
+                key, sk = self._classify(side, pl)
+            except Exception as e:
+                log(f"  [assert {self.label}] classify EXC: {e}")
+                continue
+            if key is None:
+                continue
+            self.skels[side][key] = sk
+            self._maybe_emit(key)
+
+    def _maybe_emit(self, key):
+        if key in self.done:
+            return
+        pred = self.skels["pred"].get(key)
+        real = self.skels["real"].get(key)
+        if pred is None or real is None:
+            return
+        self.done.add(key)
+        match = pred == real
+        if match:
+            self.n_ok += 1
+        else:
+            self.n_diff += 1
+        _relay_assert_write({
+            "t": datetime.datetime.now().isoformat(),
+            "peer": self.label, "match": match, "key": list(key),
+            "real": real, "pred": pred,
+        })
+        if not match:
+            log(f"  [assert {self.label}] DIFF {key}")
+
+    def flush_unmatched(self):
+        """At teardown, report keys that only one side ever produced."""
+        only_real = only_pred = 0
+        for key in set(self.skels["real"]) | set(self.skels["pred"]):
+            if key in self.done:
+                continue
+            pred = self.skels["pred"].get(key)
+            real = self.skels["real"].get(key)
+            side = "real" if pred is None else "pred"
+            if side == "real":
+                only_real += 1
+            else:
+                only_pred += 1
+            _relay_assert_write({
+                "t": datetime.datetime.now().isoformat(),
+                "peer": self.label, "match": False, "only": side,
+                "key": list(key), "real": real, "pred": pred,
+            })
+        log(f"  [assert {self.label}] summary: ok={self.n_ok} diff={self.n_diff} "
+            f"only_real={only_real} only_pred={only_pred}")
+
+
+_relay_assert_fh = None
+def _relay_assert_write(rec):
+    global _relay_assert_fh
+    if _relay_assert_fh is None:
+        os.makedirs(os.path.dirname(RELAY_ASSERT_FILE), exist_ok=True)
+        _relay_assert_fh = open(RELAY_ASSERT_FILE, "a", buffering=1)
+    _relay_assert_fh.write(json.dumps(rec, default=str) + "\n")
+
+
+def _relay_shadow_predict(eng, data, caddr):
+    """Run the emulator against one real c2s datagram and feed its would-be
+    replies into the assert engine as the PREDICTION."""
+    shadow = _ShadowSock()
+    try:
+        mid = data[0]
+        is_off = len(data) >= 17 and data[1:17] == MAGIC
+        if mid == ID_OPEN_CONNECTION_REQUEST_1 and is_off:
+            handle_ocr1(shadow, data, caddr)
+        elif mid == ID_OPEN_CONNECTION_REQUEST_2 and is_off:
+            handle_ocr2(shadow, data, caddr)
+        elif mid in (ID_UNCONNECTED_PING, ID_UNCONNECTED_PING_OPEN_CONN) and is_off:
+            pass
+        else:
+            handle_connected(shadow, data, caddr)
+    except Exception as e:
+        log(f"  [shadow {eng.label}] EXC {type(e).__name__}: {e}")
+    for dg in shadow.out:
+        eng.feed("pred", dg)
+
+
+def relay_main():
+    """Transparent UDP proxy to the real dt-live RakNet cluster."""
+    import join_diff as _jd                # msgpack decoder + skeleton masker
+    # Start each run with fresh per-run outputs (previous ones backed up), so the
+    # capture and assert JSONL reflect ONLY this session.
+    os.makedirs(os.path.dirname(RELAY_CAPTURE_FILE), exist_ok=True)
+    _relay_rotate(RELAY_CAPTURE_FILE)
+    _relay_rotate(RELAY_ASSERT_FILE)
+    upstream, upstream_label = None, None
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cli.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    cli.bind((HOST, PORT))
+    log(f"RakNet RELAY listening on {HOST}:{PORT} -> (upstream resolved on "
+        f"first client packet); capture -> {RELAY_CAPTURE_FILE}; "
+        f"asserts -> {RELAY_ASSERT_FILE}")
+
+    # Per client_addr: dedicated upstream socket (so replies route back).
+    up_by_client = {}      # client_addr -> upstream socket
+    client_by_fd = {}      # upstream socket fileno -> client_addr
+    asserts = {}           # peer label -> _RelayAssert (shadow comparison)
+
+    try:
+        while True:
+            rlist = [cli] + list(up_by_client.values())
+            ready, _, _ = select.select(rlist, [], [], 30.0)
+            for s in ready:
+                if s is cli:
+                    data, caddr = cli.recvfrom(65535)
+                    if not data:
+                        continue
+                    label = set_peer(caddr)
+                    if upstream is None:
+                        upstream, upstream_label = _relay_resolve_upstream()
+                        log(f"RELAY upstream = {upstream_label} {upstream}")
+                    us = up_by_client.get(caddr)
+                    if us is None:
+                        us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        us.connect(upstream)
+                        up_by_client[caddr] = us
+                        client_by_fd[us.fileno()] = caddr
+                        log(f"-> new client {caddr[0]}:{caddr[1]} bound to "
+                            f"upstream {upstream_label}")
+                    _relay_capture("c2s", label, data)
+                    _relay_snoop("c2s", data)
+                    # PREDICT: run the emulator against this request.
+                    eng = asserts.get(label)
+                    if eng is None:
+                        eng = asserts[label] = _RelayAssert(label, _jd)
+                    _relay_shadow_predict(eng, data, caddr)
+                    try:
+                        us.send(data)
+                    except OSError as e:
+                        log(f"  !! upstream send failed: {e}")
+                else:
+                    caddr = client_by_fd.get(s.fileno())
+                    if caddr is None:
+                        continue
+                    try:
+                        data = s.recv(65535)
+                    except OSError:
+                        continue
+                    if not data:
+                        continue
+                    set_peer(caddr)
+                    label = _PEER_LABELS.get(caddr, "?")
+                    _relay_capture("s2c", label, data)
+                    _relay_snoop("s2c", data)
+                    # COMPARE: real reply vs the emulator's prediction.
+                    eng = asserts.get(label)
+                    if eng is not None:
+                        eng.feed("real", data)
+                    cli.sendto(data, caddr)
+    finally:
+        for eng in asserts.values():
+            try:
+                eng.flush_unmatched()
+            except Exception:
+                pass
+        log(f"RELAY asserts written -> {RELAY_ASSERT_FILE}")
+
+
+_RELAY_ON = os.environ.get("RAKNET_RELAY", "0") not in ("0", "", "false", "no")
+
+
 if __name__ == "__main__":
     try:
-        main()
+        relay_main() if _RELAY_ON else main()
     except KeyboardInterrupt:
         log("RakNet server stopped")
         sys.exit(0)

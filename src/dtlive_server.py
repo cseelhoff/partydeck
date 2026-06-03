@@ -92,6 +92,100 @@ def dump_request(handler, body):
     except Exception as e:
         log("  (dump_request skipped:", repr(e), ")")
 
+# =========================================================================
+# RELAY MODE (env RELAY=1)
+# -------------------------------------------------------------------------
+# Forward /_federation, /, and the bootstrap /token to the REAL dt-live backend
+# instead of self-minting. For /token we keep the real (signed) token blob and
+# the real AES key verbatim, but rewrite endpoints.raknet[0] to our local RakNet
+# proxy (raknet.py in RAKNET_RELAY mode) so the client's UDP traffic flows
+# through us to the real cluster. The real raknet endpoint + key are written to
+# RELAY_STATE_FILE for raknet.py to learn its upstream. Every relayed token is
+# also diffed against what stoken.make_token_envelope() would have produced and
+# the comparison is appended to RELAY_DIFF_FILE (non-halting).
+# =========================================================================
+RELAY = os.environ.get("RELAY", "0") not in ("0", "", "false", "no")
+# Where the client should send RakNet UDP (our proxy). Defaults to the same
+# RAKNET_ENDPOINT the offline emulator uses.
+RELAY_LOCAL_RAKNET = os.environ.get("RAKNET_ENDPOINT", "127.0.0.1:30100")
+RELAY_STATE_FILE = os.environ.get("RELAY_STATE_FILE", D + "/relay_upstream.json")
+RELAY_DIFF_FILE = os.environ.get("RELAY_DIFF_FILE", D + "/relay_token_diff.jsonl")
+# Real backend host to relay HTTPS to (the cluster the client's Host header names).
+RELAY_REAL_HOST = os.environ.get("RELAY_REAL_HOST", "dt-live.passtechgames.com")
+
+
+def _real_fetch(method, host, path, body, headers):
+    """IPv4 HTTPS request to the real backend (dt-live AAAA is dead; force A).
+    Returns (status, resp_headers_dict, resp_body_bytes)."""
+    import http.client, socket
+    ai = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+    ip = ai[0][4][0]
+    ctx = ssl.create_default_context()
+    raw = socket.create_connection((ip, 443), timeout=10)
+    sock = ctx.wrap_socket(raw, server_hostname=host)
+    conn = http.client.HTTPConnection(host)
+    conn.sock = sock
+    fwd = {k: v for k, v in (headers or {}).items()
+           if k.lower() not in ("content-length", "host", "connection",
+                                "accept-encoding")}
+    fwd["Host"] = host
+    fwd["Accept-Encoding"] = "identity"
+    conn.request(method, path, body=body or b"", headers=fwd)
+    r = conn.getresponse()
+    rb = r.read()
+    rh = {k: v for k, v in r.getheaders()}
+    conn.close()
+    return r.status, rh, rb
+
+
+def _relay_token(real_body):
+    """Rewrite the real token envelope's raknet endpoint to our proxy; stash the
+    real endpoint + AES key; diff against the emulator's envelope. Returns the
+    (possibly rewritten) body bytes to send back to the client."""
+    try:
+        env = json.loads(real_body)
+    except Exception as e:
+        log("  RELAY /token: real body not JSON (", repr(e), ") - passthrough")
+        return real_body
+    real_raknet = (env.get("endpoints", {}) or {}).get("raknet") or []
+    real_ep = real_raknet[0] if real_raknet else None
+    real_key = (env.get("encryption", {}) or {}).get("key")
+    # Persist upstream so raknet.py relay knows where to forward.
+    try:
+        with open(RELAY_STATE_FILE, "w") as f:
+            json.dump({"raknet": real_ep, "key": real_key,
+                       "ts": datetime.datetime.now().isoformat()}, f)
+    except Exception as e:
+        log("  RELAY state write failed:", repr(e))
+    # Diff real vs emulated (non-halting).
+    try:
+        emu = stoken.make_token_envelope()
+        diff = {
+            "t": datetime.datetime.now().isoformat(),
+            "real_raknet": real_ep,
+            "emu_raknet": (emu.get("endpoints", {}) or {}).get("raknet"),
+            "real_has_enc": "encryption" in env,
+            "emu_has_enc": "encryption" in emu,
+            "real_token_len": len(env.get("token", "")),
+            "emu_token_len": len(emu.get("token", "")),
+            "real_keys": sorted(env.keys()),
+            "emu_keys": sorted(emu.keys()),
+            "real_enc_keys": sorted((env.get("encryption") or {}).keys()),
+            "emu_enc_keys": sorted((emu.get("encryption") or {}).keys()),
+        }
+        with open(RELAY_DIFF_FILE, "a") as f:
+            f.write(json.dumps(diff) + "\n")
+        log("  RELAY token diff: real_raknet", real_ep,
+            "-> rewrite", RELAY_LOCAL_RAKNET,
+            "| real_enc_keys", diff["real_enc_keys"])
+    except Exception as e:
+        log("  RELAY token diff failed:", repr(e))
+    # Rewrite the raknet endpoint to our proxy; keep everything else verbatim.
+    if real_ep is not None:
+        env.setdefault("endpoints", {})["raknet"] = [RELAY_LOCAL_RAKNET]
+    return json.dumps(env).encode()
+
+
 class H(http.server.BaseHTTPRequestHandler):
     def _read_body(self):
         ln = self.headers.get("Content-Length")
@@ -117,6 +211,32 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _relay(self, p, body):
+        """Forward the request to the real dt-live backend; for /token rewrite
+        the raknet endpoint to our proxy. Falls back to the local emulator
+        response if the real fetch fails (so a transient network error doesn't
+        wedge the client)."""
+        try:
+            status, rh, rb = _real_fetch(
+                self.command, RELAY_REAL_HOST, self.path, body, dict(self.headers))
+            log("  RELAY <-", status, self.command, p, "real", len(rb), "B")
+            if p.endswith("/token"):
+                rb = _relay_token(rb)
+            ctype = rh.get("Content-Type", "application/json")
+            return self._send(status, rb, ctype=ctype,
+                              extra_headers={"x-version": rh.get("x-version", "3")})
+        except Exception as e:
+            log("  RELAY fetch FAILED for", p, ":", repr(e), "- local fallback")
+            if p == "/_federation":
+                return self._send(200, json.dumps(FED))
+            if p.endswith("/token"):
+                return self._send(200, json.dumps(stoken.make_token_envelope()),
+                                  ctype="application/json; charset=utf-8",
+                                  extra_headers={"x-version": "3"})
+            if p == "/":
+                return self._send(200, json.dumps(ROOT))
+            return self._send(200, "{}")
+
     def _route(self):
         body = self._read_body()
         log("REQUEST", self.command, self.path, "from", self.client_address, "clen", len(body))
@@ -127,6 +247,9 @@ class H(http.server.BaseHTTPRequestHandler):
         # Strip the scheme://authority so origin-form path matching below works.
         if "://" in p:
             p = "/" + p.split("://", 1)[1].split("/", 1)[1] if "/" in p.split("://", 1)[1] else "/"
+
+        if RELAY:
+            return self._relay(p, body)
 
         if p == "/_federation":
             return self._send(200, json.dumps(FED))
