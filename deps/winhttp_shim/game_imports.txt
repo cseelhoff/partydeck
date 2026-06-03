@@ -1,4 +1,7 @@
 DllCanUnloadNow
+DllGetClassObject
+DllRegisterServer
+DllUnregisterServer
 WinHttpAddRequestHeaders
 WinHttpCheckPlatform
 WinHttpCloseHandle

@@ -9,7 +9,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-IMPORTS="game_imports.txt"     # the 17 names the game's IAT binds from winhttp
+# The COMPLETE export surface of the builtin winhttp.dll (the forward target),
+# not just what the game exe's IAT binds. Other DLLs loaded into the prefix --
+# notably EOSSDK-Win64-Shipping.dll -- also import from winhttp, so the shim must
+# re-export EVERY builtin symbol or those imports fail to resolve at load. This
+# list is the full export table of Proton's builtin winhttp.dll
+# (files/lib/wine/x86_64-windows/winhttp.dll); refresh it with:
+#   winedump -j export <builtin winhttp.dll> | awk '/Ordn  Name/{p=1;next} p&&/^  [0-9A-F]/{print $3}' | sort
+IMPORTS="game_imports.txt"     # full builtin winhttp export surface (one name/line)
 REAL_DLL="winhttp_real"        # forward target module (NO .dll suffix, DOT-FREE)
 # NOTE: must be DOT-FREE. The PE loader splits a forwarder string on the LAST '.'
 # to separate module from function; a name with a '.' looks like it already has

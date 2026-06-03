@@ -1227,19 +1227,28 @@ def handle_scene_message(sock, conn, payload):
         rpc_respond(sock, conn, sr, rpc_req, mp_str(code))
         log(f"  <- COMPLETE (CreateInvitationCode '{code}') rpcReqId={rpc_req}")
     elif rname == "party.updategamefinderplayerstatus":
-        # The "ready to play" signal. args = [gameFinderName, statusJson, want:bool,
-        # ...]. When `want` is true the member wants to enter the game finder; once
-        # every member of the party is ready we spin up the shared GameSession.
+        # The "ready to play" signal. The args are NOT [name, json, bool] as an
+        # earlier assumption had it; the real wire (decoded byte-exact from a
+        # 2-peer relay capture) is a 2-element msgpack array of ints, e.g.
+        # `92 01 05` = [1, 5]. The first int is the gamefinder player status
+        # (0 = leaving/not-ready, non-zero = entering the game finder / ready);
+        # the second is a sub-status the server echoes in memberStatusUpdated.
+        # The OLD mp_read_str parse always failed here -> want stayed False ->
+        # in_gamefinder never went True -> maybe_start_game never fired -> the
+        # client sat at "starting" forever. (statusVal is kept for the echo.)
+        status_val = 0
         try:
-            _, i = mp_read_str(rest, 2)            # gameFinderName
-            _, i = mp_read_str(rest, i)            # status JSON
-            want = (i < len(rest) and rest[i] == 0xC3)
+            if rest[2] in (0x92, 0x91) and len(rest) >= 4:
+                status_val = mp_read_uint(rest[3:]) or 0
+            else:
+                status_val = mp_read_uint(rest[2:]) or 0
         except Exception:
-            want = False
+            status_val = 0
+        want = status_val != 0
         conn.in_gamefinder = want
         party = PARTIES.get(binding.ref) if binding else None
-        log(f"  ** UPDATEGAMEFINDERSTATUS rpcReqId={rpc_req} want={want} "
-            f"party={party.guid if party else '?'}")
+        log(f"  ** UPDATEGAMEFINDERSTATUS rpcReqId={rpc_req} status={status_val} "
+            f"want={want} party={party.guid if party else '?'}")
         rpc_respond(sock, conn, sr, rpc_req, result=None)
         if party is not None:
             # The party reducer expects a memberStatusUpdated event when a member
