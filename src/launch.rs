@@ -104,13 +104,57 @@ pub fn launch_game(
         i += 1;
     }
 
+    // The cold client loader path can leave gamescope-kbm hung after the game
+    // closes: gamescope logs "Primary child shut down!" but does not exit (it
+    // even ignores SIGTERM), so handle.wait() below blocks forever, the
+    // after-close prefix scrub never runs, and the compositor leaks. Start a
+    // guarded watchdog that SIGKILLs a gamescope only once its game process
+    // tree has been seen at least once and then absent for a sustained grace
+    // period. Restricted to the drm_loader path (where the hang occurs) so it
+    // can never misfire on the normal goldberg path.
+    let watchdog = if h.win() && h.use_goldberg && h.use_drm_loader {
+        let gs_pids: Vec<u32> = handles.iter().map(|hd| hd.id()).collect();
+        Some(spawn_gamescope_watchdog(gs_pids))
+    } else {
+        None
+    };
+
     for mut handle in handles {
         handle.wait()?;
+    }
+
+    if let Some(w) = watchdog {
+        let _ = w.join();
     }
 
     if let Some(mut child) = dns_shim.take() {
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // The gbe cold client loader rewrites this prefix's Steam registry keys to
+    // point at its throwaway tmp/ccloader-{i} staging dir (wiped next launch).
+    // Once the game exits, scrub those keys back to the canonical
+    // C:\Program Files (x86)\Steam locations so a later non-loader goldberg game
+    // sharing the prefix (e.g. V Rising) doesn't read a dead steamclient path
+    // and fail with "Steam not running". Run after handle.wait() (game/proton
+    // torn down) and re-run once after a short settle to win the wineserver
+    // registry-flush race.
+    if h.win() && h.use_goldberg && h.use_drm_loader {
+        let pfx_ids: Vec<String> = if cfg.proton_separate_pfxs {
+            (0..instances.len()).map(|i| (i + 1).to_string()).collect()
+        } else {
+            vec!["1".to_string()]
+        };
+        for id in &pfx_ids {
+            let pfx = PATH_PARTY.join("prefixes").join(id);
+            cleanup_drm_loader_prefix(&pfx);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        for id in &pfx_ids {
+            let pfx = PATH_PARTY.join("prefixes").join(id);
+            cleanup_drm_loader_prefix(&pfx);
+        }
     }
 
     Ok(())
@@ -258,6 +302,17 @@ pub fn launch_cmds(
                 false => "1".to_string(),
             });
 
+        // Self-heal the prefix BEFORE launch: a previous cold-loader run may have
+        // left this prefix's Steam registry pointing at a now-deleted
+        // tmp/ccloader dir (the after-close scrub can be skipped if gamescope's
+        // teardown hangs and is force-killed). Scrubbing here guarantees any
+        // goldberg game starts from a clean steamclient path regardless of how
+        // the previous session ended. Idempotent: only rewrites stale ccloader
+        // lines, no-op on an already-clean prefix.
+        if win && h.use_goldberg {
+            cleanup_drm_loader_prefix(&path_pfx);
+        }
+
         let cmd = &mut cmds[i];
 
         cmd.current_dir(match &drm_loader {
@@ -360,10 +415,13 @@ pub fn launch_cmds(
 
         // Bwrap args
         cmd.arg("bwrap");
-        // The cold client loader (Mode=1) keeps running after umu-run/Proton
-        // returns once the game process has settled. With --die-with-parent the
-        // container would be torn down the moment umu-run returns, killing the
-        // still-starting game ("Primary child shut down"), so omit it here.
+        // Cold-loader path: omit --die-with-parent. The ColdClientLoader runs
+        // with [Persistence] Mode=0, so steamclient_loader exits immediately
+        // after spawning the game; Proton then keeps the container alive and
+        // waits on the game's wineserver. Empirically, keeping --die-with-parent
+        // here tears the container down too early and the game dies with
+        // "Primary child shut down" during startup, so it is omitted only for
+        // the cold loader.
         if drm_loader.is_none() {
             cmd.arg("--die-with-parent");
         }
@@ -691,6 +749,201 @@ fn stage_drm_loader(
     Ok(DrmLoader {
         exe: dir.join("steamclient_loader_x64.exe"),
         dir,
+    })
+}
+
+/// Undo the wine-prefix registry pollution left by the gbe cold client loader.
+///
+/// `steamclient_loader_x64.exe` rewrites several Steam keys to point at its
+/// throwaway `tmp/ccloader-{i}` staging dir, which is deleted on the next
+/// launch. Any other goldberg game that later shares the same prefix and runs
+/// via the normal experimental-steamclient path (V Rising, Palworld) then reads
+/// a dead `steamclient64.dll` path and fails with "Steam not running". This
+/// rewrites those keys back to the canonical `C:\Program Files (x86)\Steam`
+/// locations where the bound goldberg steamclient lives.
+///
+/// Only lines that are a known Steam key AND still point at a `ccloader` path
+/// are touched, so it is idempotent and safe to run on an already-clean prefix.
+fn cleanup_drm_loader_prefix(pfx: &Path) {
+    // Canonical Steam install root as written in .reg files (escaped backslashes).
+    const STEAM: &str = r"C:\\Program Files (x86)\\Steam";
+
+    let canonical_line = |line: &str| -> Option<String> {
+        if !line.contains("ccloader") {
+            return None;
+        }
+        let t = line.trim_start();
+        if t.starts_with("\"SteamExe\"=") {
+            Some(format!(r#""SteamExe"="{STEAM}\\Steam.exe""#))
+        } else if t.starts_with("\"SteamPath\"=") {
+            Some(format!(r#""SteamPath"="{STEAM}""#))
+        } else if t.starts_with("\"SourceModInstallPath\"=") {
+            Some(format!(r#""SourceModInstallPath"="{STEAM}\\steamapps\\sourcemods""#))
+        } else if t.starts_with("\"SteamClientDll\"=") {
+            Some(format!(r#""SteamClientDll"="{STEAM}\\steamclient.dll""#))
+        } else if t.starts_with("\"SteamClientDll64\"=") {
+            Some(format!(r#""SteamClientDll64"="{STEAM}\\steamclient64.dll""#))
+        } else if t.starts_with("\"InstallPath\"=") {
+            Some(format!(r#""InstallPath"="{STEAM}""#))
+        } else if t.starts_with("@=") {
+            // [Software\Classes\steam\shell\open\command] default value.
+            Some(format!(r#"@="\"{STEAM}\\Steam.exe\" -- \"%1\"""#))
+        } else {
+            None
+        }
+    };
+
+    for fname in ["user.reg", "system.reg"] {
+        let path = pfx.join(fname);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if !content.contains("ccloader") {
+            continue;
+        }
+
+        let mut changed = false;
+        // split('\n') preserves the trailing newline as a final empty element,
+        // which join('\n') restores, so the file's line endings are unchanged.
+        let rebuilt = content
+            .split('\n')
+            .map(|line| match canonical_line(line) {
+                Some(fixed) => {
+                    changed = true;
+                    fixed
+                }
+                None => line.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if changed {
+            match std::fs::write(&path, rebuilt) {
+                Ok(()) => println!(
+                    "[partydeck] Scrubbed cold-loader registry pollution in {}",
+                    path.display()
+                ),
+                Err(e) => eprintln!(
+                    "[partydeck] WARNING: failed to scrub {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+    }
+}
+
+/// Count processes that are descendants of `root` (excluding `root` itself) by
+/// walking /proc PPid links. Cheap enough to poll every couple of seconds.
+fn count_proc_descendants(root: u32) -> usize {
+    use std::collections::HashMap;
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let pid: u32 = match name.to_string_lossy().parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Some(ppid) = status
+                .lines()
+                .find_map(|l| l.strip_prefix("PPid:"))
+                .and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+    let mut count = 0usize;
+    let mut stack = vec![root];
+    while let Some(p) = stack.pop() {
+        if let Some(kids) = children.get(&p) {
+            for &k in kids {
+                count += 1;
+                stack.push(k);
+            }
+        }
+    }
+    count
+}
+
+/// True if `pid` no longer exists or is a reaped-pending zombie (state 'Z').
+fn proc_gone_or_zombie(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => {
+            // /proc/<pid>/stat: "pid (comm) STATE ...". comm may contain spaces
+            // and ')', so locate the last ')' and read the state char after it.
+            match stat.rfind(')') {
+                Some(idx) => stat[idx + 1..].trim_start().starts_with('Z'),
+                None => false,
+            }
+        }
+    }
+}
+
+/// Watchdog for the cold-loader gamescope teardown hang. For each gamescope pid,
+/// once its game process tree has been observed at least once and then stays
+/// absent for `GRACE`, SIGKILL the compositor so the launcher's handle.wait()
+/// returns (and the after-close prefix scrub can run). The "seen at least once"
+/// guard means a gamescope that is still bringing the game up is never killed,
+/// and the sustained-absence grace avoids killing on a transient gap.
+fn spawn_gamescope_watchdog(pids: Vec<u32>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+        const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+        struct Watch {
+            pid: u32,
+            saw_children: bool,
+            last_had_children: std::time::Instant,
+            done: bool,
+        }
+        let mut watches: Vec<Watch> = pids
+            .into_iter()
+            .map(|pid| Watch {
+                pid,
+                saw_children: false,
+                last_had_children: std::time::Instant::now(),
+                done: false,
+            })
+            .collect();
+
+        loop {
+            for w in watches.iter_mut() {
+                if w.done {
+                    continue;
+                }
+                if proc_gone_or_zombie(w.pid) {
+                    // Exited normally (or already killed and now reaping).
+                    w.done = true;
+                    continue;
+                }
+                if count_proc_descendants(w.pid) > 0 {
+                    w.saw_children = true;
+                    w.last_had_children = std::time::Instant::now();
+                } else if w.saw_children && w.last_had_children.elapsed() >= GRACE {
+                    eprintln!(
+                        "[partydeck] gamescope {} has had no game process for {}s after close; \
+                         terminating hung compositor.",
+                        w.pid,
+                        GRACE.as_secs()
+                    );
+                    let _ = Command::new("kill")
+                        .args(["-9", &w.pid.to_string()])
+                        .status();
+                    w.done = true;
+                }
+            }
+            if watches.iter().all(|w| w.done) {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
     })
 }
 
