@@ -109,6 +109,15 @@ PARTIES = {}        # party_guid -> Party
 INVITE_CODES = {}   # invite code (str) -> party_guid
 GAMESESSIONS = {}   # gamesession_guid -> GameSession
 
+# Connections that have polled PartyMerging.GetMergerStatus (i.e. are sitting in
+# the game finder waiting to be matched), tracked for visibility/logging. The
+# offline merge "completes" -- the server reports partiesCount:0, which is what
+# makes the deterministic client leave the matchmaking scene and proceed to the
+# gamefinder find-by-code -- once a poller is present AND there are >=2
+# established broker connections (host + joiner), the pair a single-machine join
+# is meant to match (see the GetMergerStatus handler).
+MERGER_POLLERS = set()   # set[id(Conn)]
+
 # Base scene-id prefix (matches the real deployment); per-scene suffix appended.
 SCENE_ID_BASE = "scene:/passtech-live/darktales/live-1-05-00/"
 
@@ -692,37 +701,36 @@ def build_party_state(party):
     return mp_array([settings, mp_str(party.leader_user_id), members, mp_uint(3)])
 
 
-def build_merger_status(conn):
+def build_merger_status(conn, parties=1):
     """Build the PartyMerging.GetMergerStatus result.
 
     Shape decoded BYTE-EXACT from the real joiner capture (relay.joiner_bycode
     .jsonl, s2c reqId=7 answering the `0x90 :: default` poll):
         [statusInt, {
-            "partiesCount": 2,
+            "partiesCount": N,
             "algorithm":    "DtPartyMergerAlgorithm",
-            "playersCount": 5,
+            "playersCount": M,
             "details": {
                 "nbPartiesByDifficulty": {"0": 1, "1": 1},
                 "nbPlayersByDifficulty": {"0": 3, "1": 2},
             },
         }]
-    i.e. a 2-element array of [statusInt, detailMap]. The real server sent
-    statusInt=1 (the steady "searching / merging in progress" state) with the
-    LIVE matchmaking-pool counts (2 parties / 5 players, because OTHER real
-    players were queueing at capture time).
+    i.e. a 2-element array of [statusInt, detailMap]. statusInt stays 1 (the
+    steady "searching / merging in progress" state) throughout; the merge
+    COMPLETION is signalled by `partiesCount` reaching 0 inside that map.
 
-    Our PREVIOUS offline reply was the WRONG shape: `[0, {}]` (empty detail map).
-    The client's merger-status handler reads named fields out of the detail map
-    (algorithm / partiesCount / details...), so an empty map starved it of the
-    fields it expects. We now reproduce the real shape but with our own honest
-    offline counts (we are the only party). This is purely informational for the
-    "X players searching" UI: a real match is delivered out-of-band via the
-    gamefinder.update push (see maybe_start_game), never inferred from these
-    numbers, so advertising a single waiting party does NOT spawn a phantom
-    game-session connect.
+    A raknet_diff of the WORKING online join (join_online_102258) vs the HANGING
+    offline join (join_fwd_*) proved this: online the merger pushed
+    partiesCount 2 -> 1 -> 2 -> 0, and the instant the client saw partiesCount:0
+    it issued DISCONNECT_FROM_SCENE ("leave scene") and advanced to the gamefinder
+    find-by-code. Offline we had been pinning partiesCount:1 forever, so the
+    deterministic client never saw the completion and parked in the matchmaking
+    scene -- the exact hang. We now drive `parties` to 0 once the match is ready
+    (see the GetMergerStatus handler). The earlier belief that the match is
+    delivered out-of-band via a gamefinder.update push is SUPERSEDED: the retail
+    client gates on partiesCount:0 here, not on that push.
     """
-    parties = 1
-    players = 1
+    players = parties
     by_parties = mp_map([(mp_str("0"), mp_uint(parties))])
     by_players = mp_map([(mp_str("0"), mp_uint(players))])
     details = mp_map([
@@ -976,6 +984,14 @@ def handle_scene_message(sock, conn, payload):
         # auto-matchmaking AND in the seconds right before a join-by-code click.
         # We answer with the real DtPartyMergerAlgorithm shape (see
         # build_merger_status) instead of the old wrong `[0, {}]` empty map.
+        #
+        # NOTE (2026-06-03): partiesCount is the OPEN-MATCHMAKING merger pool size,
+        # NOT the join-by-code gate. A retest that forced partiesCount:0 did NOT
+        # make the client leave the matchmaking scene, because join-by-code is
+        # driven by the client submitting an InvitationCode on the gamefinder
+        # scene (route 4: ['matchmaking', '{"InvitationCode":...}']), which the
+        # offline joiner never sends. So we report the honest steady "searching"
+        # state (partiesCount:1) and address the missing code-submit elsewhere.
         status = build_merger_status(conn)
         log(f"  ** PARTYMERGING.GETMERGERSTATUS rpcReqId={rpc_req} -> "
             f"DtPartyMergerAlgorithm (real shape)")
