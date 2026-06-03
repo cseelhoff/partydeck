@@ -41,9 +41,24 @@ void shim_log(const char* event, const std::string& fields);
 std::string shim_jstr(const char* s);
 // JSON-escape a wide string (UTF-16 -> UTF-8-ish, null -> "null").
 std::string shim_jwstr(const wchar_t* s);
+// JSON-escape an arbitrary byte buffer into a quoted JSON string. Printable
+// ASCII is kept verbatim; everything else becomes \uXXXX so the result is always
+// valid JSON (lossless for text bodies, safe for binary). Returns "null" if data
+// is null. Use for capture-mode request/response bodies.
+std::string shim_jbytes(const char* data, size_t len);
+
+// ---- mode -------------------------------------------------------------------
+// REDIRECT  = steer federation/loopback to the local plain-HTTP backend
+//             (offline emu). Default.
+// CAPTURE   = transparent tap: forward EVERYTHING to winhttp_real untouched,
+//             but log full request (headers+body) + response (status+headers+
+//             body). For diffing the working online "config C" vs the emu.
+//             Sits ABOVE TLS, so cert/SPKI pinning cannot affect it.
+enum class ShimMode { Redirect, Capture };
 
 // ---- config (read once from env) --------------------------------------------
 struct ShimConfig {
+    ShimMode     mode;                   // WINHTTP_SHIM_MODE (redirect|capture)
     std::wstring target_host;            // default L"127.0.0.1"
     int          target_port;           // default 8080 (plain HTTP)
     // lowercase host suffixes to redirect (default dt-live*.passtechgames.com)
@@ -53,6 +68,9 @@ struct ShimConfig {
     // Stormancer scene endpoint 127.1.33.7 the game connects to) to the target
     // backend. Default true; disable with WINHTTP_SHIM_REDIRECT_LOOPBACK=0.
     bool         redirect_loopback;
+    // Capture mode: max bytes logged per request/response body (default 65536).
+    // WINHTTP_SHIM_CAPTURE_BODY_MAX. Bodies larger than this are truncated.
+    size_t       capture_body_max;
 };
 const ShimConfig& shim_config();
 

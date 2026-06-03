@@ -121,6 +121,34 @@ std::string shim_jwstr(const wchar_t* s) {
     return shim_jstr(narrow.c_str());
 }
 
+std::string shim_jbytes(const char* data, size_t len) {
+    if (!data) return "null";
+    std::string out = "\"";
+    out.reserve(len + 2);
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char ch = static_cast<unsigned char>(data[i]);
+        switch (ch) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (ch < 0x20 || ch >= 0x7f) {
+                    // Escape control + all non-ASCII bytes as \uXXXX so the
+                    // result is always valid JSON regardless of encoding.
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", ch);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(ch);
+                }
+        }
+    }
+    out += "\"";
+    return out;
+}
+
 // ---- config -----------------------------------------------------------------
 static std::wstring env_w(const char* name, const std::wstring& dflt) {
     char buf[2048] = {0};
@@ -142,6 +170,8 @@ static std::wstring lower_w(std::wstring s) {
 const ShimConfig& shim_config() {
     static ShimConfig cfg = [] {
         ShimConfig c;
+        std::wstring mode = lower_w(env_w("WINHTTP_SHIM_MODE", L"redirect"));
+        c.mode = (mode == L"capture") ? ShimMode::Capture : ShimMode::Redirect;
         c.target_host = env_w("WINHTTP_SHIM_TARGET_HOST", L"127.0.0.1");
         std::wstring portw = env_w("WINHTTP_SHIM_TARGET_PORT", L"8080");
         c.target_port = _wtoi(portw.c_str());
@@ -165,6 +195,9 @@ const ShimConfig& shim_config() {
         std::wstring lb = env_w("WINHTTP_SHIM_REDIRECT_LOOPBACK", L"1");
         c.redirect_loopback =
             !(lb == L"0" || lb == L"" || lb == L"false" || lb == L"no");
+        std::wstring bmax = env_w("WINHTTP_SHIM_CAPTURE_BODY_MAX", L"65536");
+        long bm = _wtoi(bmax.c_str());
+        c.capture_body_max = (bm > 0) ? static_cast<size_t>(bm) : 65536;
         return c;
     }();
     return cfg;
@@ -225,7 +258,8 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
         shim_log("shim_attach", "\"pid\":" + std::to_string(GetCurrentProcessId()));
         const auto& c = shim_config();
         shim_log("shim_config",
-                 "\"target_host\":" + shim_jwstr(c.target_host.c_str()) +
+                 "\"mode\":\"" + std::string(c.mode == ShimMode::Capture ? "capture" : "redirect") + "\"" +
+                     ",\"target_host\":" + shim_jwstr(c.target_host.c_str()) +
                      ",\"target_port\":" + std::to_string(c.target_port) +
                      ",\"redirect_count\":" + std::to_string(c.redirect_hosts.size()));
     } else if (reason == DLL_PROCESS_DETACH) {

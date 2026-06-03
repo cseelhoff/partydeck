@@ -135,10 +135,25 @@ class Party:
         self.members = [leader]          # list[Conn] in join order (leader first)
         self.invite_code = None
         self.gs_guid = None              # set once a GameSession is spun up
+        # --- event-sourced party state (server-authoritative) ---
+        # The retail party client is a reducer over a versioned event stream: it
+        # only treats the party as "synchronized" (a precondition for the
+        # join-by-code coroutine) once it has applied the settingsUpdated /
+        # memberDataUpdated notifications the server pushes. `version` is the
+        # monotonic party-state version carried in every push (and getpartystate2);
+        # `custom_data` is the settings customData JSON the client last set.
+        self.version = 1                 # 1 = party created; ++ on each event
+        self.custom_data = ""            # settings customData JSON string
+        self.settings_broadcast = False  # initial settingsUpdated pushed yet?
+        self.status_seq = 0              # memberStatusUpdated sub-counter
 
     def add_member(self, conn):
         if conn not in self.members:
             self.members.append(conn)
+
+    def next_version(self):
+        self.version += 1
+        return self.version
 
 
 class GameSession:
@@ -611,6 +626,25 @@ def _extract_member_userdata(data):
     return None
 
 
+def _extract_settings_customdata(data):
+    """Pull the settings customData JSON string out of a party.updatepartysettings
+    request body. The client sends a settings array whose 2nd element is the
+    customData JSON object {"InvitationCode":...,"GameMode":...,...}."""
+    i = data.find(b'{"InvitationCode')
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(data)):
+        c = data[j]
+        if c == 0x7B:           # '{'
+            depth += 1
+        elif c == 0x7D:         # '}'
+            depth -= 1
+            if depth == 0:
+                return data[i:j + 1].decode("utf-8", "replace")
+    return None
+
+
 def party_data_token(party):
     """Build the partyDataToken (b64(json).b64(sig)) embedded in Steam.CreateLobby.
     Other clients decode this to resolve the party. JSON =
@@ -660,45 +694,84 @@ def build_party_member(conn):
       member    = [userId, status(0), userdataBin, sessionId16, platforms, 2]
       platforms = [['steam', userId, 'anonymous', steamId(str), nil, 0]]"""
     ud = conn.party_userdata or b"{}"
-    steam_id = ""
-    try:
-        steam_id = str(json.loads(ud.decode("utf-8", "replace")).get("m_sSteamUserId", ""))
-    except Exception:
-        pass
     if conn.party_session_id is None:
         conn.party_session_id = os.urandom(16)
-    platforms = mp_array([mp_array([
-        mp_str("steam"), mp_str(conn.user_id), mp_str("anonymous"),
-        mp_str(steam_id), MP_NIL, mp_uint(0),
-    ])])
     return mp_array([
         mp_str(conn.user_id),       # userId
         mp_uint(0),                 # status
         mp_bin(ud),                 # userData (member JSON)
         mp_bin(conn.party_session_id),  # sessionId (16 bytes, stable per conn)
-        platforms,                  # platform identities
+        build_member_platforms(conn),   # platform identities
         mp_uint(2),                 #
+    ])
+
+
+def _member_steam_id(conn):
+    """The steam id string embedded in this member's userdata (or "")."""
+    ud = conn.party_userdata or b"{}"
+    try:
+        return str(json.loads(ud.decode("utf-8", "replace")).get("m_sSteamUserId", ""))
+    except Exception:
+        return ""
+
+
+def build_member_platforms(conn, slot5=MP_NIL):
+    """platforms = [['steam', userId, 'anonymous', steamId(str), slot5, 0]]
+
+    The 5th platform slot is a nullable string. Captured BYTE-EXACT, it differs
+    by message: the FULL member (getpartystate2 + party.memberConnected) carries
+    `nil` there, but the SLIM member in party.memberDataUpdated carries an empty
+    string "". The retail client's memberDataUpdated DTO deserializer expects a
+    string in that slot; receiving `nil` makes it drop the event, so the member's
+    data update is never applied and MemberDataInitialized never advances to true
+    (which is what gates the join-by-code coroutine). Hence the per-caller slot5."""
+    return mp_array([mp_array([
+        mp_str("steam"), mp_str(conn.user_id), mp_str("anonymous"),
+        mp_str(_member_steam_id(conn)), slot5, mp_uint(0),
+    ])])
+
+
+def build_memberdata_member(conn):
+    """Slim member representation carried by party.memberDataUpdated (4 elements,
+    byte-exact from capture, distinct from the 6-element getpartystate member):
+      member = [userId, userdataBin, platforms, 2]
+    NOTE: the platform 5th slot here is an empty string "" (not nil as in the
+    full member) -- see build_member_platforms."""
+    ud = conn.party_userdata or b"{}"
+    return mp_array([
+        mp_str(conn.user_id),
+        mp_bin(ud),
+        build_member_platforms(conn, slot5=mp_str("")),
+        mp_uint(2),
+    ])
+
+
+def build_settings_array(party):
+    """The 8-element party-settings array used by BOTH getpartystate2 and the
+    party.settingsUpdated push. Shape byte-exact from capture:
+      [gameFinderName, customData, settingsRev, onlyLeaderCanInvite(False),
+       isJoinable(True), serverData{}, '', partyId(bare guid)]
+    `settingsRev` tracked the party version minus 2 in every captured sample
+    (settingsUpdated v3->1, v5->3, v7->5, v9->7)."""
+    return mp_array([
+        mp_str("matchmaking"),               # gameFinderName
+        mp_str(party.custom_data),           # customData JSON (client-set)
+        mp_uint(max(1, party.version - 2)),  # settings revision
+        MP_FALSE,                            # onlyLeaderCanInvite
+        MP_TRUE,                             # isJoinable
+        MP_EMPTY_MAP,                        # public server data
+        mp_str(""),                          #
+        mp_str(party.guid),                  # partyId (bare guid)
     ])
 
 
 def build_party_state(party):
     """Build the getpartystate2 result (PartyState) listing ALL party members.
     Shape decoded byte-exact from a real capture:
-      PartyState = array4 [ settings(8), leaderUserId, members(N), version ]
-      settings   = [gameFinderName, customData, 1, onlyLeaderCanInvite(False),
-                    isJoinable(True), serverData{}, '', partyId(bare guid)]"""
-    settings = mp_array([
-        mp_str("matchmaking"),   # gameFinderName
-        mp_str(""),              # customData
-        mp_uint(1),              # (server/maxMembers flag observed as 1)
-        MP_FALSE,                # onlyLeaderCanInvite
-        MP_TRUE,                 # isJoinable
-        MP_EMPTY_MAP,            # public server data
-        mp_str(""),              #
-        mp_str(party.guid),      # partyId (bare guid)
-    ])
+      PartyState = array4 [ settings(8), leaderUserId, members(N), version ]"""
     members = mp_array([build_party_member(m) for m in party.members])
-    return mp_array([settings, mp_str(party.leader_user_id), members, mp_uint(3)])
+    return mp_array([build_settings_array(party), mp_str(party.leader_user_id),
+                     members, mp_uint(party.version)])
 
 
 def build_merger_status(conn, parties=1):
@@ -747,19 +820,82 @@ def build_merger_status(conn, parties=1):
     return mp_array([mp_uint(1), info])
 
 
-def send_member_connected(sock, target_conn, about_conn, binding):
+def send_member_connected(sock, target_conn, about_conn, binding, party):
     """Notify target_conn that about_conn is a member of the party (route
-    party.memberConnected). Body byte-exact from capture = [2,0,2] prefix +
-    PartyMember array. The client gates getpartystate2 on this notification after
-    it has created its platform lobby in response to Steam.CreateLobby."""
+    party.memberConnected). Body byte-exact from capture = [ver,0,ver] prefix +
+    PartyMember array, where `ver` is the party-state version this membership
+    event lands at (the first member connects at version 2, matching the captured
+    [2,0,2]). The client gates getpartystate2 on this notification after it has
+    created its platform lobby in response to Steam.CreateLobby."""
     route = binding.sr.client_recv.get("party.memberConnected")
     if route is None:
         log("  !! party.memberConnected route not found in party scene")
         return
-    body = b"\x02\x00\x02" + build_party_member(about_conn)
+    ver = party.next_version()
+    body = mp_uint(ver) + b"\x00" + mp_uint(ver) + build_party_member(about_conn)
     send_scene_msg(sock, target_conn, binding.sr.handle, route, body)
-    log(f"  <- party.memberConnected to {target_conn.user_id[:8]} "
+    log(f"  <- party.memberConnected v{ver} to {target_conn.user_id[:8]} "
         f"about {about_conn.user_id[:8]} route={route} ({len(body)}B)")
+
+
+def broadcast_settings_updated(sock, party):
+    """Push party.settingsUpdated to every member. Body byte-exact from capture =
+    [ver,0,ver] prefix + the 8-element settings array. The retail client's party
+    reducer requires this versioned notification (and memberDataUpdated) to mark
+    the party synchronized; without it the join-by-code coroutine never arms."""
+    ver = party.next_version()
+    prefix = mp_uint(ver) + b"\x00" + mp_uint(ver)
+    body = prefix + build_settings_array(party)
+    for m in party.members:
+        b = m.binding_for("party", party.guid)
+        if b is None:
+            continue
+        route = b.sr.client_recv.get("party.settingsUpdated")
+        if route is None:
+            continue
+        send_scene_msg(sock, m, b.sr.handle, route, body)
+    log(f"  <- party.settingsUpdated v{ver} party={party.guid} "
+        f"customData={len(party.custom_data)}B -> {len(party.members)} member(s)")
+
+
+def broadcast_member_data(sock, party, about_conn):
+    """Push party.memberDataUpdated (about about_conn) to every member. Body
+    byte-exact from capture = [ver,0,ver] prefix + the 4-element slim member."""
+    ver = party.next_version()
+    prefix = mp_uint(ver) + b"\x00" + mp_uint(ver)
+    body = prefix + build_memberdata_member(about_conn)
+    for m in party.members:
+        b = m.binding_for("party", party.guid)
+        if b is None:
+            continue
+        route = b.sr.client_recv.get("party.memberDataUpdated")
+        if route is None:
+            continue
+        send_scene_msg(sock, m, b.sr.handle, route, body)
+    log(f"  <- party.memberDataUpdated v{ver} party={party.guid} "
+        f"about={about_conn.user_id[:8]} -> {len(party.members)} member(s)")
+
+
+def broadcast_member_status(sock, party, about_conn, status=1):
+    """Push party.memberStatusUpdated (about about_conn) to every member. Body
+    byte-exact from capture = [ver,0,statusSeq, [[[userId, status]]]]. Fires when
+    a member updates its gamefinder/ready status (party.updategamefinderplayerstatus)."""
+    ver = party.next_version()
+    party.status_seq += 1
+    prefix = mp_uint(ver) + b"\x00" + mp_uint(party.status_seq)
+    entry = mp_array([mp_array([mp_array([
+        mp_str(about_conn.user_id), mp_uint(status)])])])
+    body = prefix + entry
+    for m in party.members:
+        b = m.binding_for("party", party.guid)
+        if b is None:
+            continue
+        route = b.sr.client_recv.get("party.memberStatusUpdated")
+        if route is None:
+            continue
+        send_scene_msg(sock, m, b.sr.handle, route, body)
+    log(f"  <- party.memberStatusUpdated v{ver} party={party.guid} "
+        f"about={about_conn.user_id[:8]} status={status} -> {len(party.members)} member(s)")
 
 
 def on_member_lobby_ready(sock, conn, party):
@@ -767,17 +903,23 @@ def on_member_lobby_ready(sock, conn, party):
     our Steam.CreateLobby RPC). Announce this member to everyone in the party
     (including itself, which is what un-greys the leader's Multiplayer button) and
     tell this member about every other member already present, so both the leader
-    and a joiner converge on the same member list."""
+    and a joiner converge on the same member list. Then push the initial
+    settingsUpdated snapshot the client's party reducer waits for."""
     for m in party.members:
         b = m.binding_for("party", party.guid)
         if b is not None:
-            send_member_connected(sock, m, conn, b)      # announce conn to m
+            send_member_connected(sock, m, conn, b, party)  # announce conn to m
     mybind = conn.binding_for("party", party.guid)
     if mybind is not None:
         for m in party.members:
             if m is conn:
                 continue
-            send_member_connected(sock, conn, m, mybind)  # tell conn about m
+            send_member_connected(sock, conn, m, mybind, party)  # tell conn about m
+    # Initial settings snapshot (empty customData) -- server-initiated, exactly
+    # like the real backend pushes settingsUpdated v3 right after memberConnected.
+    if not party.settings_broadcast:
+        party.settings_broadcast = True
+        broadcast_settings_updated(sock, party)
 
 
 def mint_scene_token(scene_id):
@@ -967,11 +1109,41 @@ def handle_scene_message(sock, conn, payload):
         log(f"  ** UPDATEGAMEFINDERSTATUS rpcReqId={rpc_req} want={want} "
             f"party={party.guid if party else '?'}")
         rpc_respond(sock, conn, sr, rpc_req, result=None)
-        if party is not None and want:
-            maybe_start_game(sock, party)
-    elif rname in ("party.updatepartysettings", "party.updatepartyuserdata",
-                   "Party.UpdatePartyUserData2",
-                   "party.promoteleader", "Party.CancelInvitationCode",
+        if party is not None:
+            # The party reducer expects a memberStatusUpdated event when a member
+            # changes ready state (captured: route 8 carries [[[userId, status]]]).
+            broadcast_member_status(sock, party, conn, status=1 if want else 0)
+            if want:
+                maybe_start_game(sock, party)
+    elif rname in ("party.updatepartysettings",):
+        # The leader edits party settings (game mode / difficulty / invite code).
+        # The party state is EVENT-SOURCED: we must apply the new customData, bump
+        # the party version, and push party.settingsUpdated to every member -- the
+        # retail client's reducer waits on this versioned notification to mark the
+        # party synchronized (a precondition for the join-by-code coroutine).
+        cd = _extract_settings_customdata(rest)
+        party = PARTIES.get(binding.ref) if binding else None
+        if cd is not None and party is not None:
+            party.custom_data = cd
+        log(f"  ** UPDATEPARTYSETTINGS rpcReqId={rpc_req} party="
+            f"{party.guid if party else '?'} customData={len(cd or '')}B")
+        rpc_respond(sock, conn, sr, rpc_req, result=None)
+        if party is not None:
+            broadcast_settings_updated(sock, party)
+    elif rname in ("party.updatepartyuserdata", "Party.UpdatePartyUserData2"):
+        # A member updates its own userdata (PlayerName / hero / MemberDataInitialized).
+        # Apply it and push party.memberDataUpdated to every member, same versioned
+        # event-source contract as settingsUpdated above.
+        ud = _extract_member_userdata(rest)
+        if ud is not None:
+            conn.party_userdata = ud
+        party = PARTIES.get(binding.ref) if binding else None
+        log(f"  ** {rname} rpcReqId={rpc_req} party={party.guid if party else '?'} "
+            f"userdata={'yes' if ud else 'unchanged'}")
+        rpc_respond(sock, conn, sr, rpc_req, result=None)
+        if party is not None:
+            broadcast_member_data(sock, party, conn)
+    elif rname in ("party.promoteleader", "Party.CancelInvitationCode",
                    "party.sendinvitation"):
         # These mutate party state and return void; offline single party accepts.
         log(f"  ** {rname} rpcReqId={rpc_req} (void ack)")

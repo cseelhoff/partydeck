@@ -1086,6 +1086,135 @@ def _auto_gbe_dir(pcap_path):
     return None
 
 
+# ---- unified in-process DLL-tap merge (winhttp / steam_api / eos shims) ------
+# The in-process shim taps each emit a JSONL stream of
+#   {"t": "<ISO8601-UTC>Z", "tid": N, "ev": "<name>", ...event-specific fields}
+#   - deps/winhttp_shim (CAPTURE mode) -> federation HTTPS (decrypted req/resp)
+#   - deps/steam_api_shim              -> real Steam lobby/auth/identity calls
+#     (flat hooks + the ISteamMatchmaking009 vtable tap: SetLobbyData /
+#      partyDataToken / member data)
+#   - deps/eos_shim                    -> EOS lobby/connect/P2P control plane
+# Wine uses the host wall clock, so these timestamps share the pcap's UTC
+# timebase -> we place each record directly at t_off = epoch(t) - t0 (no
+# end-anchoring like the Goldberg logs need). This folds the three control
+# planes the pcap CANNOT see (TLS-encrypted federation, real-Steam lobby, EOS)
+# inline with the wire so the working-online "config C" can be diffed against the
+# offline emu on ONE timeline. The shim logs are opened append-mode and thus
+# accumulate across runs, so each record is time-windowed to the pcap span.
+TAP_FILES = {                      # default basename each shim writes
+    "winhttp": "winhttp_capture.jsonl",
+    "steam":   "steam_api_shim.jsonl",
+    "eos":     "eos_shim.jsonl",
+}
+# housekeeping events (every shim emits these) carry no analysis value.
+_TAP_SKIP_EV = {"shim_attach", "shim_detach", "shim_error", "shim_config",
+                "shim_loaded_real"}
+
+def _iso_epoch(s):
+    """Parse an ISO8601 'YYYY-MM-DDTHH:MM:SS(.fff)Z' timestamp -> epoch seconds."""
+    if not s: return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+def _tap_fields(d, skip=("t", "tid", "ev", "pid")):
+    """Render an event's payload fields as a compact 'k=v, k=v' string."""
+    parts = []
+    for k, v in d.items():
+        if k in skip: continue
+        sv = str(v)
+        if len(sv) > 600: sv = sv[:600] + f"...(+{len(str(v)) - 600}B)"
+        parts.append(f"{k}={sv}")
+    return ", ".join(parts)
+
+def _render_winhttp_tap(d):
+    """winhttp CAPTURE record -> a decoded-HTTPS row (like the mitm sidecar)."""
+    if d.get("ev") != "capture": return None
+    verb = d.get("verb", "?"); host = d.get("host", "?"); status = d.get("status", "")
+    url = d.get("url", "") or "/"
+    tail = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1] or url
+    dec = [f"HTTPS {verb} {url} -> {status}"]
+    rb = d.get("req_body"); sb = d.get("resp_body")
+    if rb: dec.append("req: " + (rb if len(rb) <= 1500 else rb[:1500] + "..."))
+    if sb: dec.append("resp: " + (sb if len(sb) <= 1500 else sb[:1500] + "..."))
+    return {"plane": "tls", "summary": f"HTTPS {status} {verb} {tail}",
+            "src": "WINHTTP", "dst": f"HTTPS:{host}",
+            "decoded": " :: ".join(dec), "raw_hex": ""}
+
+def _render_steam_tap(d):
+    """steam_api64 shim record -> a 'steam' plane row (real Steam API calls)."""
+    ev = d.get("ev", "")
+    if ev in _TAP_SKIP_EV: return None
+    short = (ev.replace("SteamAPI_", "").replace("ISteamMatchmaking_", "MM.")
+               .replace("ISteamUser_", "User.").replace("ISteamFriends_", "Friends.")
+               .replace("ISteamApps_", "Apps.").replace("SteamInternal_", "Internal."))
+    return {"plane": "steam", "summary": f"STEAM {short}",
+            "src": "STEAM-API", "dst": "(steam)",
+            "decoded": _tap_fields(d), "raw_hex": ""}
+
+def _render_eos_tap(d):
+    """eos_shim record -> an 'eosp2p' plane row (EOS lobby/connect/P2P calls)."""
+    ev = d.get("ev", "")
+    if ev in _TAP_SKIP_EV: return None
+    short = (ev.replace("call:EOS_", "call ").replace("cb:EOS_", "cb ")
+               .replace("EOS_", ""))
+    return {"plane": "eosp2p", "summary": f"EOS {short}",
+            "src": "EOS-API", "dst": "(eos)",
+            "decoded": _tap_fields(d), "raw_hex": ""}
+
+_TAP_RENDER = {"winhttp": _render_winhttp_tap,
+               "steam":   _render_steam_tap,
+               "eos":     _render_eos_tap}
+
+def _resolve_tap_paths(pcap_path, opts):
+    """Locate each tap log: explicit flag > sibling '<stem>.<kind>.jsonl' >
+    '<taps-dir>/<default>' > '<pcap-dir>/<default>'. Returns {kind: path}."""
+    d = os.path.dirname(os.path.abspath(pcap_path)) or "."
+    stem = os.path.splitext(os.path.basename(pcap_path))[0]
+    tapdir = opts.get("dir")
+    found = {}
+    for kind, base in TAP_FILES.items():
+        explicit = opts.get(kind)
+        if explicit:
+            found[kind] = explicit; continue
+        cands = [os.path.join(d, f"{stem}.{kind}.jsonl")]
+        if tapdir: cands.append(os.path.join(tapdir, base))
+        cands.append(os.path.join(d, base))
+        for c in cands:
+            if os.path.exists(c): found[kind] = c; break
+    return found
+
+def merge_taps(rows, t0, pcap_path, opts):
+    """Fold the winhttp/steam/eos shim JSONL taps into `rows` on the pcap timeline.
+    Records outside the pcap time span (+/- MARGIN) are dropped -- this both keeps
+    the CSV clean when the append-mode logs span multiple runs and flags a tap log
+    that doesn't overlap this capture (added=0, all out-of-range)."""
+    if opts.get("off"): return
+    paths = _resolve_tap_paths(pcap_path, opts)
+    if not paths: return
+    pcap_end = max((float(r["t_off"]) for r in rows), default=0.0)
+    MARGIN = 10.0
+    for kind, path in paths.items():
+        recs = load_mitm(path)              # generic JSONL loader (list of dicts)
+        render = _TAP_RENDER[kind]
+        added = outrange = 0
+        for rec in recs:
+            ep = _iso_epoch(rec.get("t"))
+            if ep is None: continue
+            off = ep - t0
+            row = render(rec)
+            if row is None: continue
+            if off < -MARGIN or off > pcap_end + MARGIN:
+                outrange += 1; continue
+            row = dict(row); row["id"] = 0; row["t_off"] = f"{off:.6f}"
+            rows.append(row); added += 1
+        note = f"  merged {added} {kind} tap rows from {path}"
+        if outrange: note += f" ({outrange} out of pcap time-range, dropped)"
+        print(note)
+
+
 # ---- plane classification + filtering (cut noise, focus on broker/steam) ----
 # Each row belongs to exactly one logical "plane" so captures can be filtered to
 # the planes we actually control/suspect. The deterministic game binary is fixed;
@@ -1121,9 +1250,13 @@ def _parse_plane_args(argv):
       --no-gbe                do not merge Goldberg logs
       --gbe-all               include every Goldberg log line (not just the control plane)
       --gbe-grep=RE           include Goldberg lines whose func/msg match regex RE
+      --taps=DIR              dir to find the winhttp/steam/eos shim JSONL taps
+      --winhttp=P/--steam=P/--eos=P   explicit path to a shim tap log
+      --no-taps               do not merge the in-process DLL taps
     """
     pos=[]; keep=set(PLANES); show_counts=False
     gbe={"dir":None,"off":False,"all":False,"grep":None}
+    taps={"winhttp":None,"steam":None,"eos":None,"dir":None,"off":False}
     for a in argv:
         if a=="--signal": keep={"raknet","steam"}
         elif a.startswith("--only="): keep={p.strip() for p in a.split("=",1)[1].split(",") if p.strip()}
@@ -1133,16 +1266,22 @@ def _parse_plane_args(argv):
         elif a=="--no-gbe": gbe["off"]=True
         elif a=="--gbe-all": gbe["all"]=True
         elif a.startswith("--gbe-grep="): gbe["grep"]=a.split("=",1)[1]
+        elif a.startswith("--winhttp="): taps["winhttp"]=a.split("=",1)[1]
+        elif a.startswith("--steam="): taps["steam"]=a.split("=",1)[1]
+        elif a.startswith("--eos="): taps["eos"]=a.split("=",1)[1]
+        elif a.startswith("--taps="): taps["dir"]=a.split("=",1)[1]
+        elif a=="--no-taps": taps["off"]=True
         else: pos.append(a)
-    return pos, keep, show_counts, gbe
+    return pos, keep, show_counts, gbe, taps
 
 def main():
-    argv,keep_planes,show_counts,gbe_opts=_parse_plane_args(sys.argv[1:])
+    argv,keep_planes,show_counts,gbe_opts,tap_opts=_parse_plane_args(sys.argv[1:])
     if len(argv)<1:
         raise SystemExit(
             f"usage: {sys.argv[0]} <input.pcap> [output.csv] [mitm.jsonl] "
             f"[--signal|--only=raknet,steam|--drop=tls,dns,rtc,eosp2p] [--planes]\n"
             f"  [--gbe=DIR|--no-gbe|--gbe-all|--gbe-grep=RE]\n"
+            f"  [--taps=DIR|--winhttp=P|--steam=P|--eos=P|--no-taps]\n"
             f"  planes: {', '.join(PLANES)}")
     inp=argv[0]
     out=argv[1] if len(argv)>1 else os.path.splitext(inp)[0]+".csv"
@@ -1360,9 +1499,12 @@ def main():
                 print(f"  gbe {role:8s}: {len(evs)} events, offset {off:+.3f}s (end-anchored)")
             if added: print(f"  merged {added} Goldberg log events from {gbe_dir}")
 
+    # ---- merge the in-process DLL taps (winhttp / steam_api / eos shims) ----
+    merge_taps(rows, t0, inp, tap_opts)
+
     rows.sort(key=lambda r:float(r["t_off"]))
     # ---- plane classification + filtering (drop noise planes) ----
-    for r in rows: r["plane"]=row_plane(r)
+    for r in rows: r["plane"]=r.get("plane") or row_plane(r)
     counts={}
     for r in rows: counts[r["plane"]]=counts.get(r["plane"],0)+1
     if show_counts:

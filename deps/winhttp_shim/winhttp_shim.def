@@ -2,20 +2,49 @@
 ; Shim proxy for winhttp.dll. Forwards to winhttp_real.dll
 LIBRARY winhttp
 EXPORTS
-    WinHttpAddRequestHeaders = winhttp_real.WinHttpAddRequestHeaders
+    DllCanUnloadNow = winhttp_real.DllCanUnloadNow
+    WinHttpAddRequestHeaders
+    WinHttpCheckPlatform = winhttp_real.WinHttpCheckPlatform
     WinHttpCloseHandle
     WinHttpConnect
+    WinHttpCrackUrl = winhttp_real.WinHttpCrackUrl
+    WinHttpCreateProxyResolver = winhttp_real.WinHttpCreateProxyResolver
+    WinHttpCreateUrl = winhttp_real.WinHttpCreateUrl
+    WinHttpDetectAutoProxyConfigUrl = winhttp_real.WinHttpDetectAutoProxyConfigUrl
+    WinHttpFreeProxyResult = winhttp_real.WinHttpFreeProxyResult
+    WinHttpFreeProxyResultEx = winhttp_real.WinHttpFreeProxyResultEx
+    WinHttpFreeProxySettings = winhttp_real.WinHttpFreeProxySettings
+    WinHttpGetDefaultProxyConfiguration = winhttp_real.WinHttpGetDefaultProxyConfiguration
+    WinHttpGetIEProxyConfigForCurrentUser = winhttp_real.WinHttpGetIEProxyConfigForCurrentUser
     WinHttpGetProxyForUrl = winhttp_real.WinHttpGetProxyForUrl
+    WinHttpGetProxyForUrlEx = winhttp_real.WinHttpGetProxyForUrlEx
+    WinHttpGetProxyForUrlEx2 = winhttp_real.WinHttpGetProxyForUrlEx2
+    WinHttpGetProxyResult = winhttp_real.WinHttpGetProxyResult
+    WinHttpGetProxyResultEx = winhttp_real.WinHttpGetProxyResultEx
+    WinHttpGetProxySettingsVersion = winhttp_real.WinHttpGetProxySettingsVersion
     WinHttpOpen = winhttp_real.WinHttpOpen
     WinHttpOpenRequest
     WinHttpQueryAuthSchemes = winhttp_real.WinHttpQueryAuthSchemes
     WinHttpQueryDataAvailable = winhttp_real.WinHttpQueryDataAvailable
     WinHttpQueryHeaders = winhttp_real.WinHttpQueryHeaders
-    WinHttpReadData = winhttp_real.WinHttpReadData
-    WinHttpReceiveResponse = winhttp_real.WinHttpReceiveResponse
+    WinHttpQueryOption = winhttp_real.WinHttpQueryOption
+    WinHttpReadData
+    WinHttpReadProxySettings = winhttp_real.WinHttpReadProxySettings
+    WinHttpReceiveResponse
+    WinHttpResetAutoProxy = winhttp_real.WinHttpResetAutoProxy
     WinHttpSendRequest
     WinHttpSetCredentials = winhttp_real.WinHttpSetCredentials
+    WinHttpSetDefaultProxyConfiguration = winhttp_real.WinHttpSetDefaultProxyConfiguration
     WinHttpSetOption = winhttp_real.WinHttpSetOption
-    WinHttpSetStatusCallback = winhttp_real.WinHttpSetStatusCallback
+    WinHttpSetStatusCallback
     WinHttpSetTimeouts = winhttp_real.WinHttpSetTimeouts
-    WinHttpWriteData = winhttp_real.WinHttpWriteData
+    WinHttpTimeFromSystemTime = winhttp_real.WinHttpTimeFromSystemTime
+    WinHttpTimeToSystemTime = winhttp_real.WinHttpTimeToSystemTime
+    WinHttpWebSocketClose = winhttp_real.WinHttpWebSocketClose
+    WinHttpWebSocketCompleteUpgrade = winhttp_real.WinHttpWebSocketCompleteUpgrade
+    WinHttpWebSocketQueryCloseStatus = winhttp_real.WinHttpWebSocketQueryCloseStatus
+    WinHttpWebSocketReceive = winhttp_real.WinHttpWebSocketReceive
+    WinHttpWebSocketSend = winhttp_real.WinHttpWebSocketSend
+    WinHttpWebSocketShutdown = winhttp_real.WinHttpWebSocketShutdown
+    WinHttpWriteData
+    WinHttpWriteProxySettings = winhttp_real.WinHttpWriteProxySettings

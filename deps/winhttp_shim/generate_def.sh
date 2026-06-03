@@ -16,13 +16,18 @@ REAL_DLL="winhttp_real"        # forward target module (NO .dll suffix, DOT-FREE
 # an extension and '.dll' is NOT appended -> forward fails -> crash at load.
 OUT="winhttp_shim.def"
 
-# Functions we implement ourselves (typed trampolines w/ redirect + logging).
-# Keep this list in sync with src/trampolines.cpp.
+# Functions we implement ourselves (typed trampolines w/ redirect + logging +
+# capture-mode tap). Keep this list in sync with src/trampolines.cpp.
 HOOKED=$(cat <<'EOF'
 WinHttpConnect
 WinHttpOpenRequest
-WinHttpCloseHandle
+WinHttpAddRequestHeaders
 WinHttpSendRequest
+WinHttpWriteData
+WinHttpReceiveResponse
+WinHttpReadData
+WinHttpSetStatusCallback
+WinHttpCloseHandle
 EOF
 )
 

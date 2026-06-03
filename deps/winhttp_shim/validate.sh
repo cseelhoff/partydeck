@@ -15,6 +15,8 @@
 #
 # Usage:
 #   ./validate.sh setup     [gamedir]   build+deploy shim, print runbook
+#   ./validate.sh capture   [gamedir]   build+deploy shim in CAPTURE (tap) mode,
+#                                        print the online "config C" capture runbook
 #   ./validate.sh teardown  [gamedir]   remove shim from the game dir
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -27,6 +29,7 @@ PROBE_DIR="${PROBE_DIR:-/tmp/pdlog/probe}"
 PLAIN_PORT="${WINHTTP_SHIM_TARGET_PORT:-8080}"
 REDIRECT_HOSTS="${WINHTTP_SHIM_REDIRECT_HOSTS:-dt-live.passtechgames.com,dt-live-2.passtechgames.com,dt-live-3.passtechgames.com}"
 SHIM_LOG="${WINHTTP_SHIM_LOG:-$PROBE_DIR/winhttp_shim.jsonl}"
+CAPTURE_LOG="${WINHTTP_SHIM_CAPTURE_LOG:-$HOME/.local/share/partydeck/winhttp_capture.jsonl}"
 
 [[ -d "$GAMEDIR" ]] || { echo "game dir not found: $GAMEDIR" >&2; exit 1; }
 
@@ -80,12 +83,60 @@ Shim deployed to: $GAMEDIR
 ============================================================================
 RUNBOOK
     ;;
+capture)
+    # CAPTURE / TAP mode: deploy the SAME shim but tell it to forward EVERYTHING
+    # to winhttp_real untouched and just LOG full requests+responses. Used to
+    # record the working ONLINE "config C" traffic so we can diff it against the
+    # offline emu. Sits ABOVE TLS, so cert/SPKI pinning cannot break it.
+    [[ -f "$HERE/winhttp.dll" ]] || { echo "[validate] building shim..."; ./build.sh; }
+    echo "[validate] deploying shim into game dir (capture mode)..."
+    ./deploy.sh install "$GAMEDIR"
+    cat <<RUNBOOK
+
+================= winhttp_shim CAPTURE (config C tap) runbook =================
+Shim deployed to: $GAMEDIR
+  winhttp.dll       (our proxy, capture mode)
+  winhttp_real.dll  (renamed Proton builtin -> does the REAL TLS to the REAL server)
+
+GOAL: record the FULL online "config C" HTTPS exchange (federation/auth) exactly
+as the working build sees it, to diff vs the offline emu. The shim does NOT
+redirect or alter anything -- it taps plaintext above TLS and forwards through.
+
+1) Use your WORKING ONLINE "config C" handler/setup -- real Steam auth, real
+   network to dt-live*.passtechgames.com. DO NOT run the offline backend
+   (dtlive_server.py / raknet.py). DO NOT set host_aliases / DNS filtering /
+   redirect hosts. Let the game reach the real internet normally.
+
+2) Add ONLY these to that handler.json "env" (capture mode, nothing redirected):
+     WINEDLLOVERRIDES=winhttp=n,b
+     WINHTTP_SHIM_MODE=capture
+     WINHTTP_SHIM_LOG=$CAPTURE_LOG
+   (optional) WINHTTP_SHIM_CAPTURE_BODY_MAX=131072   # raise per-body cap
+
+3) Clear any old capture log, then launch + reproduce the online flow end to end
+   (host a lobby, have the second player join) so the federation/token/cluster
+   calls happen:
+     rm -f "$CAPTURE_LOG"
+
+4) Inspect the capture. Each finished request is ONE {"ev":"capture"} line with
+   url/verb/status/req_headers/req_body/resp_headers/resp_body:
+     grep '"ev":"capture"' "$CAPTURE_LOG" | while read -r l; do echo "$l" | python3 -m json.tool; done
+   or pretty just the URLs+status:
+     grep '"ev":"capture"' "$CAPTURE_LOG" | python3 -c 'import sys,json; [print(json.loads(l)["verb"], json.loads(l)["url"], "->", json.loads(l)["status"]) for l in sys.stdin]'
+
+   This is the reference to diff our offline emu (dtlive_server.py responses)
+   against the real backend.
+
+5) When done:  ./validate.sh teardown
+==============================================================================
+RUNBOOK
+    ;;
 teardown)
     ./deploy.sh uninstall "$GAMEDIR"
     echo "[validate] shim removed. (restore handler.json env / host_aliases manually if you changed them.)"
     ;;
 *)
-    echo "usage: $0 setup|teardown [gamedir]" >&2
+    echo "usage: $0 setup|capture|teardown [gamedir]" >&2
     exit 1
     ;;
 esac
