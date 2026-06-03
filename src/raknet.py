@@ -147,6 +147,13 @@ class Party:
         self.custom_data = ""            # settings customData JSON string
         self.settings_broadcast = False  # initial settingsUpdated pushed yet?
         self.status_seq = 0              # memberStatusUpdated sub-counter
+        # --- DtPartyMergerAlgorithm (local 2-party merge) state ---
+        # steam_lobby_id: the platform lobby id this party's leader returned when
+        # it completed our Steam.CreateLobby RPC (rpc.next [true,'','',lobbyId]).
+        # A joiner is told to Steam.JoinLobby the SURVIVOR party's lobby id.
+        self.steam_lobby_id = None       # int | None
+        self.in_merger = False           # a member has polled GetMergerStatus
+        self.join_lobby_sent = False     # Steam.JoinLobby already pushed (joiner)
 
     def add_member(self, conn):
         if conn not in self.members:
@@ -177,6 +184,8 @@ class SceneBinding:
         self.ref = ref                   # party_guid / gamesession_guid
         self.createlobby_req = None      # outstanding Steam.CreateLobby reqId
         self.member_connected_sent = False
+        self.srv_rpc_id = 1              # server-initiated RPC request-id counter
+                                         # (per-scene, per-direction; real starts 1)
 
 
 def gen_invite_code():
@@ -208,8 +217,8 @@ class Conn:
         self.username = ""           # real authenticator returns empty Username
         self.steam_id = None         # SteamID64, parsed from the login ticket
         self.party_userdata = None  # member userdata JSON bytes from createsession
-        self.srv_rpc_id = 1000      # server-initiated RPC request-id counter
         self.party_session_id = None  # stable 16-byte session id for our member
+        self.steam_lobby_id = None  # platform lobby id from Steam.CreateLobby reply
         # --- Milestone 2 per-conn scene + matchmaking state ---
         self.scene_bindings = {}    # SceneHandle -> SceneBinding
         self.next_handle = DYN_HANDLE_BASE
@@ -240,6 +249,10 @@ _lf = open("/tmp/pdlog/probe/raknet.log", "a", buffering=1)
 # C1, C2, ... so a single scene exchange can be traced with `grep '[C2:'`.
 CURRENT_PEER = ""
 _PEER_LABELS = {}
+# Relay-harness only: addr -> _RelayAssert engine, so _relay_shadow_predict can
+# route a shadow datagram (incl. cross-peer broadcasts) to the engine for its
+# DESTINATION peer. Empty/irrelevant in pure-emulator mode.
+_RELAY_ENGINES = {}
 def set_peer(addr):
     """Assign a stable short label per source addr and make it the current peer."""
     global CURRENT_PEER
@@ -645,12 +658,18 @@ def send_scene_msg(sock, conn, scene_handle, route, payload):
 def rpc_respond(sock, conn, sr, rpc_req, result=None):
     """Reply to a scene RPC using this scene's own rpc.next / rpc.completed
     handles (they differ per scene). optional rpc.next(result) then rpc.completed.
-    result=None means a void return (rpc.completed only)."""
-    if result is not None and sr.rpc_next is not None:
+    result=None means a void return (rpc.completed only).
+
+    The rpc.completed message is [messageSent:bool][requestId:u16le]: the leading
+    byte is 1 ONLY if an rpc.next data message was sent before completion, else 0.
+    The real server obeys this (byte=0 for void RPCs); hardcoding 1 was a
+    byte-faithfulness bug verified against a live relay capture."""
+    sent = result is not None and sr.rpc_next is not None
+    if sent:
         send_scene_msg(sock, conn, sr.handle, sr.rpc_next,
                        struct.pack("<H", rpc_req) + result)
     send_scene_msg(sock, conn, sr.handle, sr.rpc_completed,
-                   b"\x01" + struct.pack("<H", rpc_req))
+                   (b"\x01" if sent else b"\x00") + struct.pack("<H", rpc_req))
 
 
 def _extract_member_userdata(data):
@@ -722,8 +741,8 @@ def send_steam_createlobby(sock, conn, binding):
     party = PARTIES.get(binding.ref)
     if party is None:
         return
-    req = conn.srv_rpc_id
-    conn.srv_rpc_id += 1
+    req = binding.srv_rpc_id
+    binding.srv_rpc_id += 1
     binding.createlobby_req = req
     args = mp_array([
         mp_uint(1), mp_uint(4), MP_TRUE,
@@ -942,6 +961,72 @@ def broadcast_member_status(sock, party, about_conn, status=1):
         send_scene_msg(sock, m, b.sr.handle, route, body)
     log(f"  <- party.memberStatusUpdated v{ver} party={party.guid} "
         f"about={about_conn.user_id[:8]} status={status} -> {len(party.members)} member(s)")
+
+
+def broadcast_member_disconnected(sock, party, about_conn):
+    """Push party.memberDisconnected (about about_conn) to every REMAINING member.
+
+    Body byte-exact from a 2-peer relay capture (route 10):
+        [ver, 0, ver] prefix + [userId, 0]
+    i.e. a SLIM 2-element [userId, status0] member ref (NOT the full PartyMember
+    array memberConnected carries). Fired when a member leaves the party scene
+    (SR_DISCONNECT_FROM_SCENE) -- e.g. the joiner departing the survivor party at
+    the tail of a DtPartyMergerAlgorithm merge."""
+    ver = party.next_version()
+    prefix = mp_uint(ver) + b"\x00" + mp_uint(ver)
+    body = prefix + mp_array([mp_str(about_conn.user_id), mp_uint(0)])
+    for m in party.members:
+        b = m.binding_for("party", party.guid)
+        if b is None:
+            continue
+        route = b.sr.client_recv.get("party.memberDisconnected")
+        if route is None:
+            continue
+        send_scene_msg(sock, m, b.sr.handle, route, body)
+    log(f"  <- party.memberDisconnected v{ver} party={party.guid} "
+        f"about={about_conn.user_id[:8]} -> {len(party.members)} member(s)")
+
+
+def send_steam_joinlobby(sock, conn, binding, lobby_id):
+    """Server-initiated RPC telling a JOINER client to join the SURVIVOR party's
+    platform lobby (DtPartyMergerAlgorithm merge step). Route Steam.JoinLobby,
+    args byte-exact from a 2-peer relay capture: [lobbyId(uint64)] (a 1-element
+    array). reqId from the scene's server-RPC counter, like Steam.CreateLobby."""
+    sr = binding.sr
+    route = sr.client_recv.get("Steam.JoinLobby")
+    if route is None:
+        log("  !! Steam.JoinLobby route not found in party scene")
+        return
+    req = binding.srv_rpc_id
+    binding.srv_rpc_id += 1
+    args = mp_array([mp_uint(lobby_id or 0)])
+    send_scene_msg(sock, conn, sr.handle, route, struct.pack("<H", req) + args)
+    log(f"  <- Steam.JoinLobby (server RPC) reqId={req} route={route} "
+        f"lobby={lobby_id} -> {conn.user_id[:8]} (merge)")
+
+
+def _try_party_merge(sock, conn):
+    """DtPartyMergerAlgorithm local 2-party merge. Mark conn's party as pooled in
+    the merger and, once >=2 distinct parties are pooled, merge: survivor =
+    min-guid party; every other (joiner) party gets told (once) to Steam.JoinLobby
+    the survivor's platform lobby. Only the joiner is notified, matching the real
+    2-peer capture where exactly the lower-guid party survived and the other
+    received Steam.JoinLobby."""
+    party = PARTIES.get(conn.own_party_guid)
+    if party is None:
+        return
+    party.in_merger = True
+    pool = [p for p in PARTIES.values() if p.in_merger and p.members]
+    if len({p.guid for p in pool}) < 2:
+        return
+    survivor = min(pool, key=lambda p: p.guid)
+    if party is survivor or party.join_lobby_sent:
+        return
+    binding = conn.binding_for("party", party.guid)
+    if binding is None:
+        return
+    party.join_lobby_sent = True
+    send_steam_joinlobby(sock, conn, binding, survivor.steam_lobby_id)
 
 
 def on_member_lobby_ready(sock, conn, party):
@@ -1216,6 +1301,14 @@ def handle_scene_message(sock, conn, payload):
             f"DtPartyMergerAlgorithm (real shape)")
         rpc_respond(sock, conn, sr, rpc_req, status)
         log(f"  <- COMPLETE (GetMergerStatus) rpcReqId={rpc_req}")
+        # DtPartyMergerAlgorithm: a poll means this conn's party is in the merger
+        # pool. Once >=2 distinct local parties are pooled, merge them -- the
+        # survivor is the min-guid party, every other party is a joiner that gets
+        # told to Steam.JoinLobby the survivor's platform lobby. (min-guid is a
+        # deterministic stand-in for the real server's unobservable survivor
+        # choice; it reproduces the observed 2-peer capture where the
+        # lower-guid party 081eb2e3 was the survivor.)
+        _try_party_merge(sock, conn)
     elif rname == "GameSession.GetP2PToken":
         # On the GameSession scene the client asks for a P2P relay token. We return
         # [nil, false, nil] (no relay -> use direct EOS P2P), then broadcast this
@@ -1235,6 +1328,24 @@ def handle_scene_message(sock, conn, payload):
         # confirming it created its platform lobby for Steam.CreateLobby).
         log(f"  ** client rpc reply scene={sr.suffix} route='{rname}' "
             f"({len(rest)}B): {hexdump(rest, 32)}")
+        # The client returns its platform lobby id as the Steam.CreateLobby result
+        # via rpc.next ([true,'','',lobbyId]). Capture it so a later merge can tell
+        # a joiner to Steam.JoinLobby THIS (survivor) party's lobby. The lobby id
+        # is the lone msgpack uint64 (`cf <8 BE>`) in the small result array.
+        if (rname == "stormancer.rpc.next" and binding is not None
+                and binding.kind == "party" and binding.createlobby_req is not None
+                and len(rest) >= 3):
+            next_req = struct.unpack("<H", rest[1:3])[0]
+            if next_req == binding.createlobby_req:
+                p = rest.find(b"\xcf", 3)
+                if p >= 0 and p + 9 <= len(rest):
+                    lobby_id = int.from_bytes(rest[p + 1:p + 9], "big")
+                    conn.steam_lobby_id = lobby_id
+                    party = PARTIES.get(binding.ref)
+                    if party is not None:
+                        party.steam_lobby_id = lobby_id
+                    log(f"  ** captured steam lobby id 0x{lobby_id:x} "
+                        f"for party={binding.ref}")
         # When the client COMPLETES our Steam.CreateLobby RPC, its platform lobby
         # exists; sync party membership so everyone (and itself) converges and the
         # client proceeds to getpartystate2 (which un-greys Multiplayer).
@@ -1484,6 +1595,12 @@ def handle_system_request(sock, conn, payload):
             party = PARTIES.get(binding.ref)
             if party is not None and conn in party.members:
                 party.members.remove(conn)
+                # Tell the members that remain that this member left (route 10).
+                # In a DtPartyMergerAlgorithm merge the joiner connects to the
+                # survivor party then departs; the survivor's client gates on this
+                # notification. No-op when the party is now empty.
+                if party.members:
+                    broadcast_member_disconnected(sock, party, conn)
         send_response_msg(sock, conn, req_id, b"\x81\xa1\x76\xc3")  # {"v": true}
         send_response_complete(sock, conn, req_id, has_values=True)
         log(f"  <- RESPONSE {{v:true}} reqId={req_id} (DISCONNECT_FROM_SCENE ack, "
@@ -1791,12 +1908,14 @@ def _kind_of_routes(names):
 
 
 class _ShadowSock:
-    """Captures every datagram the emulator would have transmitted."""
+    """Captures every datagram the emulator would have transmitted, tagged with
+    its destination addr so cross-peer broadcasts (e.g. party.memberDisconnected
+    sent to the OTHER peer) can be routed to the right assert engine."""
     def __init__(self):
         self.out = []
 
     def sendto(self, b, addr):
-        self.out.append(bytes(b))
+        self.out.append((addr, bytes(b)))
 
 
 class _RelayAssert:
@@ -2031,8 +2150,41 @@ def _relay_shadow_predict(eng, data, caddr):
         log(f"  [shadow {eng.label}] EXC {type(e).__name__}: {e}")
     # Link the shadow connection so real scene handles can be adopted onto it.
     eng._shadow_conn = CONNS.get(caddr, eng._shadow_conn)
+    # Party-GUID adoption (relay-only harness fix, analogous to handle adoption):
+    # in relay mode the client follows the REAL server's party scene GUID, which
+    # differs from the GUID the shadow's CREATESESSION minted. So when the client
+    # connects to its own party scene, the shadow binds it under the real GUID,
+    # which is absent from PARTIES -> getpartystate2 / UpdatePartyUserData2 /
+    # updatepartysettings all fail to resolve the party (and never broadcast).
+    # Alias the shadow's own party under that real key so the subsequent party
+    # c2s resolve and the shadow predicts the party.* stream. This is a no-op in
+    # pure-emulator mode (there the connect key == own_party_guid, already in
+    # PARTIES).
+    conn = CONNS.get(caddr)
+    if conn is not None and conn.own_party_guid in PARTIES:
+        own = PARTIES[conn.own_party_guid]
+        for b in conn.scene_bindings.values():
+            if b.kind == "party" and b.ref not in PARTIES:
+                # Re-home the shadow party under the real GUID end-to-end: the
+                # Party object's own .guid, the PARTIES key and the conn's
+                # own_party_guid must all match b.ref, otherwise server-side
+                # member lookups keyed on party.guid (binding_for(party.guid)
+                # in on_member_lobby_ready / broadcast_*) miss and no party.*
+                # broadcast is emitted. No-op in pure-emulator mode.
+                old_guid = own.guid
+                own.guid = b.ref
+                PARTIES.pop(old_guid, None)
+                PARTIES[b.ref] = own
+                if conn.own_party_guid == old_guid:
+                    conn.own_party_guid = b.ref
+                if conn not in own.members:
+                    own.add_member(conn)
+                log(f"  [assert {eng.label}] adopt real party guid "
+                    f"{b.ref} <- shadow {old_guid}")
     for dg in shadow.out:
-        eng.feed("pred", dg)
+        addr, data_out = dg
+        target = _RELAY_ENGINES.get(addr, eng)
+        target.feed("pred", data_out)
 
 
 def relay_main():
@@ -2083,6 +2235,7 @@ def relay_main():
                     eng = asserts.get(label)
                     if eng is None:
                         eng = asserts[label] = _RelayAssert(label, _jd)
+                    _RELAY_ENGINES[caddr] = eng
                     _relay_shadow_predict(eng, data, caddr)
                     try:
                         us.send(data)
