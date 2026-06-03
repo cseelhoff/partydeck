@@ -1812,6 +1812,15 @@ class _RelayAssert:
         self.done = set()                  # keys already emitted as matched
         self.n_ok = 0
         self.n_diff = 0
+        # --- relay handle adoption (so the shadow can route the client's c2s) ---
+        # In relay mode the client follows the REAL server's scene handles, but
+        # the shadow emulator allocates its own. Track each side's SceneHandle
+        # per connect reqId; when the real handle is known, alias it into the
+        # shadow connection's bindings so party/gamesession c2s the client sends
+        # (addressed to real handles) are actually processed by the shadow.
+        self._shadow_conn = None
+        self._connect = {"pred": {}, "real": {}}   # side -> reqId -> SceneHandle
+        self._last_learned = []            # handles learned by last _decode_for_routes
 
     @staticmethod
     def _is_mp(raw):
@@ -1819,7 +1828,9 @@ class _RelayAssert:
 
     def _learn_routes(self, side, vals):
         """A scene-connect response carries {SceneHandle, RouteMappings}; record
-        the side's handle->route table so later scene messages resolve."""
+        the side's handle->route table so later scene messages resolve. Returns
+        the list of SceneHandles learned from this payload."""
+        learned = []
         for v in vals:
             if (isinstance(v, tuple) and v[0] == "map"
                     and "RouteMappings" in v[1] and "SceneHandle" in v[1]):
@@ -1830,6 +1841,25 @@ class _RelayAssert:
                               if isinstance(rh, int)}
                     self.h2r[side][sh] = routes
                     self.h2k[side][sh] = _kind_of_routes(routes.values())
+                    learned.append(sh)
+        return learned
+
+    def _adopt_real_handle(self, req):
+        """Once both sides' SceneHandle for a connect reqId are known, alias the
+        REAL handle onto the shadow connection's binding (created under the
+        shadow's own handle) so the client's subsequent c2s -- addressed to the
+        real handle -- are routed and answered by the shadow emulator."""
+        h_real = self._connect["real"].get(req)
+        h_pred = self._connect["pred"].get(req)
+        conn = self._shadow_conn
+        if (h_real is None or h_pred is None or h_real == h_pred
+                or conn is None):
+            return
+        binding = conn.scene_bindings.get(h_pred)
+        if binding is not None and h_real not in conn.scene_bindings:
+            conn.scene_bindings[h_real] = binding
+            log(f"  [assert {self.label}] adopt real scene handle "
+                f"{h_real} <- shadow {h_pred} (reqId {req})")
 
     def _classify(self, side, payload):
         """Return (alignment_key, skeleton) for one encapsulated message."""
@@ -1839,6 +1869,12 @@ class _RelayAssert:
             req = _rd_u16le(payload, 1)
             raw = payload[3:]
             vals = self._decode_for_routes(side, raw)
+            if self._last_learned:
+                # This RESP_MSG carried a scene-connect result; remember its
+                # SceneHandle under the connect reqId and try to align the
+                # shadow's binding with the real server's handle.
+                self._connect[side][req] = self._last_learned[-1]
+                self._adopt_real_handle(req)
             return ("SYS", "RESP_MSG", req), self._skel_or_binary(raw, vals)
         if mid == ID_REQUEST_RESPONSE_COMPLETE:
             req = _rd_u16le(payload, 1)
@@ -1863,10 +1899,11 @@ class _RelayAssert:
     def _decode_for_routes(self, side, raw):
         """Decode raw msgpack and, if it carries scene RouteMappings, learn them.
         Returns the decoded value list (possibly containing an ERR sentinel)."""
+        self._last_learned = []
         if not self._is_mp(raw):
             return None
         vals = self.jd.mp_all(raw)
-        self._learn_routes(side, vals)
+        self._last_learned = self._learn_routes(side, vals)
         return vals
 
     def _skel_or_binary(self, raw, vals=None):
@@ -1992,6 +2029,8 @@ def _relay_shadow_predict(eng, data, caddr):
             handle_connected(shadow, data, caddr)
     except Exception as e:
         log(f"  [shadow {eng.label}] EXC {type(e).__name__}: {e}")
+    # Link the shadow connection so real scene handles can be adopted onto it.
+    eng._shadow_conn = CONNS.get(caddr, eng._shadow_conn)
     for dg in shadow.out:
         eng.feed("pred", dg)
 
