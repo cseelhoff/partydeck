@@ -1,0 +1,265 @@
+(af0010)INFO - load_settings: Configuration Path: S:\common\Ravenswatch\NemirtingasEpicEmu.json
+(af0010)INFO - load_settings: Emulator version 0.0.0-win64
+(af0010)INFO - set_root_dir: New root directory: C:\users\steamuser\AppData\Roaming
+(af0010)INFO - set_root_dir: New root directory: C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280
+(af0010)INFO - save_settings: Saving emu settings: S:\common\Ravenswatch\NemirtingasEpicEmu.json
+(af0010)TRACE - EOS_Initialize ENTRY
+(af0010)DEBUG - set_eos_compat: Tryiing to replace EOS_Auth_CopyUserAuthToken(00006ffffc686940) with EOS_Auth_CopyUserAuthTokenNew(00006ffffc686920)
+(af0010)DEBUG - replace_func: 
+(af0010)DEBUG - find_space_for_trampoline: Opcode PUSH    RBP, base_size: 1, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode REX.W, base_size: 1, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode MOV     r/m16/32/64 r16/32/64, base_size: 2, has_r_m: 1
+(af0010)DEBUG - find_space_for_trampoline: Read 2 bytes for opcode 0x89
+(af0010)DEBUG - find_space_for_trampoline: Opcode REX.W, base_size: 1, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode ADD     r/m16/32/64 imm8, base_size: 3, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode REX.B, base_size: 1, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode MOV     eax         imm32, base_size: 5, has_r_m: 0
+(af0010)DEBUG - replace_func: Found space for replace: 14/5/14
+(af0010)DEBUG - replace_func: 
+(af0010)DEBUG - find_space_for_trampoline: Opcode PUSH    RBP, base_size: 1, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode REX.W, base_size: 1, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode MOV     r/m16/32/64 r16/32/64, base_size: 2, has_r_m: 1
+(af0010)DEBUG - find_space_for_trampoline: Read 2 bytes for opcode 0x89
+(af0010)DEBUG - find_space_for_trampoline: Opcode REX.W, base_size: 1, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode ADD     r/m16/32/64 imm8, base_size: 3, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode REX.B, base_size: 1, has_r_m: 0
+(af0010)DEBUG - find_space_for_trampoline: Opcode MOV     eax         imm32, base_size: 5, has_r_m: 0
+(af0010)DEBUG - replace_func: Found space for replace: 14/5/14
+(af0010)DEBUG - EOS_Initialize: SystemInitializeOptions = 0000000000000000
+(af0010)DEBUG - EOS_Initialize: Reserved = 0000000000000000
+(af0010)DEBUG - EOS_Initialize: ApiVersion = 4
+(af0010)DEBUG - EOS_Initialize: AllocateMemoryFunction = 0000000140893aa0
+(af0010)DEBUG - EOS_Initialize: ReallocateMemoryFunction = 0000000140893ac0
+(af0010)DEBUG - EOS_Initialize: ReleaseMemoryFunction = 0000000140893ab0
+(af0010)DEBUG - EOS_Initialize: ProductName = Ravenswatch
+(af0010)DEBUG - EOS_Initialize: ProductVersion = 1.05.00.05
+(af0010)TRACE - EOS_Initialize EXIT
+(af0010)TRACE - EOS_Logging_SetCallback ENTRY
+(af0010)TRACE - EOS_Logging_SetCallback EXIT
+(af0010)TRACE - EOS_Logging_SetLogLevel ENTRY
+(af0010)TRACE - EOS_Logging_SetLogLevel EXIT
+(af0010)TRACE - EOS_Platform_Create ENTRY
+(af0010)DEBUG - Init: TickBudgetInMilliseconds = '0'
+(af0010)DEBUG - Init: CacheDirectory = ''
+(af0010)DEBUG - Init: EncryptionKey = ''
+(af0010)DEBUG - Init: OverrideCountryCode = ''
+(af0010)DEBUG - Init: OverrideLocaleCode = ''
+(af0010)DEBUG - Init: DeploymentId = '0f5da16e34214b38ab6a61b4ea8a5170'
+(af0010)DEBUG - Init: Flags = 2
+(af0010)DEBUG - Init: ProductId = 'da715e58caef4fd1b9744cc0567c0fa2'
+(af0010)DEBUG - Init: SandboxId = 'c841cfc229e74ac3acc08a0ae117f9c8'
+(af0010)DEBUG - Init: ClientId = 'xyza7891Xf4Z3a8oqhyw3gPHzlp97waf'
+(af0010)DEBUG - Init: ClientSecret = 'y3od/cMzvhajXQcCXRdQJPbNW2aDK8jQYgpNhQiUoXw'
+(af0010)DEBUG - Init: ApiVersion = 14
+(469ef00)INFO - start_network: UDP socket started on port: 55789
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)DEBUG - EOSSDK_Connect: Userid: 930f755a4cfd05b58c38c02f2c56f7db, Productid: 3b2ac1e835bd0f1c45355f4f1271e2f0
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - register_frame ENTRY
+(af0010)TRACE - register_frame EXIT
+(af0010)INFO - load_json: Loading C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\catalog.json
+(af0010)WARN - load_json: File not found: C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\catalog.json
+(af0010)INFO - load_json: Loading C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\entitlements.json
+(af0010)WARN - load_json: File not found: C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\entitlements.json
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - register_frame ENTRY
+(af0010)TRACE - register_frame EXIT
+(af0010)TRACE - register_frame ENTRY
+(af0010)TRACE - register_frame EXIT
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - register_frame ENTRY
+(af0010)TRACE - register_frame EXIT
+(af0010)TRACE - register_frame ENTRY
+(af0010)TRACE - register_frame EXIT
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)INFO - EOSSDK_PlayerDataStorage: PlayerDataStorage files will be search in C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\remote
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - register_frame ENTRY
+(af0010)TRACE - register_frame EXIT
+(af0010)INFO - load_json: Loading C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\achievements.json
+(af0010)WARN - load_json: File not found: C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\achievements.json
+(af0010)INFO - load_json: Loading C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\achievements_db.json
+(af0010)WARN - load_json: File not found: C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\achievements_db.json
+(af0010)INFO - load_json: Loading C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\stats.json
+(af0010)WARN - load_json: File not found: C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\stats.json
+(af0010)INFO - EOSSDK_TitleStorage: TitleStorage files will be search in C:\users\steamuser\AppData\Roaming\NemirtingasEpicEmu\930f755a4cfd05b58c38c02f2c56f7db\2071280\titlestorage
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - register_frame ENTRY
+(af0010)TRACE - register_frame EXIT
+(af0010)TRACE - EOS_Platform_Create EXIT
+(af0010)INFO - EOS_Platform_GetRTCInterface: JOINDBG RTC GetRTCInterface called (returning nullptr)
+(af0010)INFO - EOS_RTC_GetAudioInterface: JOINDBG RTC GetAudioInterface called (returning nullptr)
+(af0010)TRACE - AddNotifyAuthExpiration ENTRY
+(af0010)TRACE - AddNotifyAuthExpiration EXIT
+(af0010)TRACE - AddNotifyLoginStatusChanged ENTRY
+(af0010)TRACE - AddNotifyLoginStatusChanged EXIT
+(af0010)TRACE - AddNotifyLobbyMemberStatusReceived ENTRY
+(af0010)TRACE - AddNotifyLobbyMemberStatusReceived EXIT
+(af0010)TRACE - SetRelayControl ENTRY
+(af0010)TRACE - SetRelayControl EXIT
+(af0010)TRACE - QueryNATType ENTRY
+(af0010)DEBUG - QueryNATType: TODO
+(af0010)TRACE - QueryNATType EXIT
+(469ef00)INFO - start_network: TCP socket started after 0 tries on port: 30139
+(469ef00)INFO - get_broadcasts: 10.1.1.255
+(469ef00)INFO - get_broadcasts: 127.255.255.255
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(af0010)TRACE - EOS_ByteArray_ToString ENTRY
+(af0010)INFO - EOS_ByteArray_ToString: TODO
+(af0010)TRACE - EOS_ByteArray_ToString EXIT
+(af0010)TRACE - Login ENTRY
+(af0010)TRACE - Login EXIT
+(af0010)DEBUG - run_callbacks: Callback ready: EOS_Connect_LoginCallbackInfo
+(af0010)TRACE - AddNotifyPeerConnectionRequest ENTRY
+(af0010)TRACE - AddNotifyPeerConnectionRequest EXIT
+(af0010)TRACE - AddNotifyPeerConnectionClosed ENTRY
+(af0010)TRACE - AddNotifyPeerConnectionClosed EXIT
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(af0010)DEBUG - run_callbacks: Callback ready: EOS_P2P_OnQueryNATTypeCompleteInfo
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(af0010)TRACE - CreateLobby ENTRY
+(af0010)INFO - CreateLobby: JOINDBG CreateLobby Options ApiVersion=10
+(af0010)INFO - CreateLobby: JOINDBG CreateLobby supplied LobbyId='292083'
+(af0010)INFO - CreateLobby: JOINDBG CreateLobby -> new lobby_id='292083' (supplied=1, total lobbies now 1)
+(af0010)TRACE - send_lobby_announce ENTRY
+(af0010)TRACE - send_lobby_announce EXIT
+(af0010)TRACE - CreateLobby EXIT
+(af0010)DEBUG - run_callbacks: Callback ready: EOS_Lobby_CreateLobbyCallbackInfo
+(af0010)TRACE - CopyLobbyDetailsHandle ENTRY
+(af0010)INFO - CopyLobbyDetailsHandle: JOINDBG CopyLobbyDetailsHandle wants LobbyId='292083' ; known lobbies=[292083 ]
+(af0010)TRACE - CopyLobbyDetailsHandle EXIT
+(af0010)TRACE - GetMemberCount ENTRY
+(af0010)TRACE - GetMemberCount EXIT
+(af0010)TRACE - GetMemberByIndex ENTRY
+(af0010)TRACE - GetMemberByIndex EXIT
+(af0010)TRACE - Release ENTRY
+(af0010)TRACE - Release EXIT
+(af0010)INFO - EOS_Lobby_GetRTCRoomName: JOINDBG RTC GetRTCRoomName -> 'conf+partydeck' (EOS_Success)
+(af0010)TRACE - send_lobby_announce ENTRY
+(af0010)TRACE - send_lobby_announce EXIT
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(af0010)TRACE - send_lobby_announce ENTRY
+(af0010)TRACE - send_lobby_announce EXIT
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(af0010)TRACE - send_lobby_announce ENTRY
+(af0010)TRACE - send_lobby_announce EXIT
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(af0010)TRACE - send_lobby_announce ENTRY
+(af0010)TRACE - send_lobby_announce EXIT
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(af0010)TRACE - send_lobby_announce ENTRY
+(af0010)TRACE - send_lobby_announce EXIT
+(af0010)TRACE - CopyLobbyDetailsHandle ENTRY
+(af0010)INFO - CopyLobbyDetailsHandle: JOINDBG CopyLobbyDetailsHandle wants LobbyId='292083' ; known lobbies=[292083 ]
+(af0010)TRACE - CopyLobbyDetailsHandle EXIT
+(af0010)TRACE - GetMemberCount ENTRY
+(af0010)TRACE - GetMemberCount EXIT
+(af0010)TRACE - DestroyLobby ENTRY
+(af0010)INFO - DestroyLobby: TODO
+(af0010)INFO - DestroyLobby: JOINDBG DestroyLobby erasing LobbyId='292083'
+(af0010)INFO - DestroyLobby: JOINDBG DestroyLobby queued 0 CLOSED notif(s) (self '3b2ac1e835bd0f1c45355f4f1271e2f0' skipped) lobby='292083'
+(af0010)TRACE - DestroyLobby EXIT
+(af0010)TRACE - Release ENTRY
+(af0010)TRACE - Release EXIT
+(af0010)DEBUG - run_callbacks: Callback ready: EOS_Lobby_DestroyLobbyCallbackInfo
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(af0010)TRACE - CreateLobbySearch ENTRY
+(af0010)TRACE - register_callbacks ENTRY
+(af0010)TRACE - register_callbacks EXIT
+(af0010)TRACE - CreateLobbySearch EXIT
+(af0010)TRACE - SetLobbyId ENTRY
+(af0010)TRACE - SetLobbyId EXIT
+(af0010)TRACE - Find ENTRY
+(af0010)TRACE - send_lobbies_search ENTRY
+(af0010)TRACE - send_lobbies_search EXIT
+(af0010)TRACE - Find EXIT
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(469ef00)DEBUG - process_udp: process_udp: parsed OK from 127.0.0.1:55789 len=49 type=5
+(af0010)DEBUG - run_callbacks: Callback ready: EOS_LobbySearch_FindCallbackInfo
+(af0010)TRACE - Release ENTRY
+(af0010)TRACE - Release EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - RemoveNotifyPeerConnectionRequest ENTRY
+(af0010)TRACE - RemoveNotifyPeerConnectionRequest EXIT
+(af0010)TRACE - RemoveNotifyPeerConnectionClosed ENTRY
+(af0010)TRACE - RemoveNotifyPeerConnectionClosed EXIT
+(af0010)TRACE - RemoveNotifyAuthExpiration ENTRY
+(af0010)TRACE - RemoveNotifyAuthExpiration EXIT
+(af0010)TRACE - RemoveNotifyLoginStatusChanged ENTRY
+(af0010)TRACE - RemoveNotifyLoginStatusChanged EXIT
+(af0010)TRACE - RemoveNotifyLobbyMemberStatusReceived ENTRY
+(af0010)TRACE - RemoveNotifyLobbyMemberStatusReceived EXIT
+(af0010)TRACE - unregister_frame ENTRY
+(af0010)TRACE - unregister_frame EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_frame ENTRY
+(af0010)TRACE - unregister_frame EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_frame ENTRY
+(af0010)TRACE - unregister_frame EXIT
+(af0010)TRACE - unregister_frame ENTRY
+(af0010)TRACE - unregister_frame EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_frame ENTRY
+(af0010)TRACE - unregister_frame EXIT
+(af0010)TRACE - unregister_frame ENTRY
+(af0010)TRACE - unregister_frame EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_frame ENTRY
+(af0010)TRACE - unregister_frame EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - unregister_callbacks ENTRY
+(af0010)TRACE - unregister_callbacks EXIT
+(af0010)TRACE - EOS_Shutdown ENTRY
+(af0010)TRACE - EOS_Shutdown EXIT
+(af0010)DEBUG - ~Network: Shutting down Network

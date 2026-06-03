@@ -1,6 +1,11 @@
 # Ravenswatch co-op join — WORKING / DESIRED flow (real online, 2 Steam accounts)
 
-This is the **ground-truth** sequence of a successful "join by code" between two real Steam
+> **These are working notes, NOT the authoritative record.** The packet captures and their CSV
+> decodes in `pcaps/` (`join_online_*.csv` for this working run) are ground truth for what went on
+> the wire; the engine log and wire-decode corroborate. Where this note disagrees with a capture,
+> the capture wins.
+
+This is the sequence of a successful "join by code" between two real Steam
 accounts over the internet, reconstructed from:
 
 - Engine log: `Ravenswatch/_Logs/logs_2026-06-02_04h-34m-34s.txt` (JOINER side, full).
@@ -70,8 +75,9 @@ Status column = does the **partydeck (EOS-emu + Goldberg + raknet.py)** build do
 
 **State after Phase A:** JOINER sits in its own party (code 396879), with an EOS lobby + live RTC
 voice conference (`conf+1514391690`), registered on gamefinder, advertised via a Steam lobby.
-**Offline:** identical EXCEPT no RTC voice room exists (the emu returns `GetRTCRoomName =
-NotImplemented`); the game treats this as "no voice" and proceeds normally. Phase A is otherwise ✅.
+**Offline:** identical; the emu now returns a stub `GetRTCRoomName = conf+partydeck` (earlier it
+returned `NotImplemented`). RTC parity made no difference to the Phase-B hang (online removes the
+RTC disconnect handler before leaving the room, so the join is not gated on RTC). Phase A is ✅.
 
 ---
 

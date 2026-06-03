@@ -1,17 +1,27 @@
 # Ravenswatch co-op join — CURRENT partydeck / offline flow (where it hangs)
 
-Same two-account join, but offline through partydeck (NEE EOS emu + Goldberg Steam + local
-`raknet.py` Stormancer broker). Reconstructed from real captured logs of the failing run:
+> **These are working notes, NOT the authoritative record.** The packet captures and their CSV
+> decodes in `pcaps/` (`join_offline_*.csv`, `join_fwd_*.csv`, `join_online_*.csv`) are ground
+> truth for what actually went on the wire; engine/emu/broker text logs corroborate. Where this
+> note disagrees with a capture, the capture wins. Claims below have been revised across several
+> runs — superseded hypotheses are kept and marked `~~struck / SUPERSEDED~~` so we don't re-test them.
 
-- JOIN engine log: `profiles/Elsie/…/Ravenswatch/_Logs/logs_2026-06-02_13h-24m-23s.txt`.
+Same two-account join, but offline through partydeck (NEE EOS emu + Goldberg Steam + local
+`raknet.py` Stormancer broker). Reconstructed from real captured logs across multiple failing runs
+(the symptom is identical every time):
+
+- JOIN engine logs: `profiles/Elsie/…/Ravenswatch/_Logs/logs_*.txt` (identify the run by mtime).
 - EOS emu log: `profiles/Elsie/…/Ravenswatch/nemirtingassteamemu.log`.
-- Broker decoded log: live `raknet.py` decode (C1 = Dad/HOST conn, C2 = Elsie/JOIN conn).
+- Broker decoded log + capture: live `raknet.py` decode (C1 = Dad/HOST conn, C2 = Elsie/JOIN conn)
+  and `pcaps/join_fwd_*.csv` / `join_offline_*.csv`.
 
 Compare against `flow_working_online.md`. **Phase A is reproduced correctly. Phase B's managed
-continuation never starts — and the join does NOT fail instantly: the engine log goes completely
-silent for ~19 minutes, then the idle RakNet link to the broker times out, every scene is torn
-down, and a reconnect-failure loop runs forever.** The full network detail of that sequence is
-below (it was previously mis-summarised as an "instant hang").
+continuation never starts.** After `_OnLobbyDestroyed` the engine log goes completely silent and
+JOIN sends nothing but keep-alive pings to the broker. If left alone the idle RakNet link
+eventually times out (~19 min in the original capture) and a reconnect-failure loop runs forever;
+in later runs the silence simply lasts until the broker is shut down manually (~80–90 s) — **the
+trailing timeout/teardown is just shutdown noise, not part of the bug.** The hang itself is the
+open-ended silence after the EOS destroy callback.
 
 ---
 
@@ -49,16 +59,20 @@ This matches the working flow step-for-step (just with local stand-ins).
 | 0:08 | STORM → JOIN | RakNet | `Party | Generated invitation code: 161837` | broker `CreateInvitationCode` |
 | 0:08 | — | game | `Party State | Not ready` | JOIN idle in own party |
 | 0:08 | — | game | `EOS: _OnLobbyCreated (eConnected)` | emu lobby create OK |
-| 0:08 | JOIN → EOSemu | EOS | `ERROR EOS_Lobby_GetRTCRoomName : EOS_NotImplemented` | **no RTC room** (emu has no voice) — non-fatal, game continues |
+| 0:08 | JOIN → EOSemu | EOS | `EOS_Lobby_GetRTCRoomName -> 'conf+partydeck' (EOS_Success)` | emu now returns a stub RTC room name (parity with online) |
 
-EOS emu confirms the lobby bookkeeping:
-`CopyLobbyDetailsHandle wants LobbyId='161837' ; known lobbies=[161837 705777 ]`
-→ both JOIN's own (161837) and HOST's (705777) lobbies are visible to the emu (Goldberg LAN
-discovery surfaced the host's lobby).
+EOS emu lobby bookkeeping (current build):
+`CopyLobbyDetailsHandle wants LobbyId='161837' ; known lobbies=[161837 ]`
+→ **own lobby only.** Earlier builds also pre-registered the HOST's lobby here
+(`known lobbies=[161837 705777 ]`) because the two co-located emu instances cross-announce their
+EOS lobbies over the emu UDP net. `on_lobby_update` now **IGNOREs** unsolicited remote announces, so
+JOIN's `_lobbies` matches the online reference (own-only) at join time. **The hang is unchanged**
+with or without the host pre-registered → that pollution was a red herring (see candidates below).
 
-**Difference vs online (benign):** online, lobby creation also builds an RTC voice room; offline the
-emu returns `GetRTCRoomName = NotImplemented`, so JOIN's own lobby has **no RTC room**. The game
-treats this as "no voice" and proceeds (it reached `Party State | Not ready` and ran 12 s further).
+**RTC (was flagged as a benign difference, now PARITY):** the emu's `GetRTCRoomName` previously
+returned `NotImplemented`; it now returns `conf+partydeck (EOS_Success)`. This made no difference to
+the hang — online the joiner *removes* the RTC disconnect handler before leaving the room, so the
+join is not gated on RTC anyway.
 
 ---
 
@@ -76,7 +90,7 @@ link times out and the whole session unwinds.
 | 00-00-03 | JOIN → STORM | RakNet | `connecting rakpeer to dt-live…:30100` → `Received ID_CONNECTION_REQUEST_ACCEPTED from 127.0.0.1:30100` | **boot handshake to broker SUCCEEDS** ✅ |
 | 00-00-03..08 | JOIN ↔ STORM | RakNet | `Connected to scene [authenticator]`, `[friends]`, `[party-manager]`, `[party-e271061d]` (own), `[matchmaking]` | all Phase-A scenes up ✅ |
 | 00-00-20 | — | game | `Stormancer | Party State | Joining with code (705777)` | **join coroutine starts** |
-| 00-00-20 | JOIN → EOSemu | EOS | `DestroyLobby erasing LobbyId='161837'` → `queued 1 CLOSED notif` → `Callback ready: EOS_Lobby_DestroyLobbyCallbackInfo` | own EOS lobby destroyed, callback delivered ✅ |
+| 00-00-20 | JOIN → EOSemu | EOS | `DestroyLobby erasing LobbyId='161837'` → `queued 0 CLOSED notif(s) (self skipped)` → `Callback ready: EOS_Lobby_DestroyLobbyCallbackInfo` | own EOS lobby destroyed, callback delivered ✅ |
 | 00-00-20 | — | game | `EOS: _OnLobbyDestroyed` | **managed destroy callback fired** |
 | — | — | — | **⛔ ENGINE LOG EMITS ZERO LINES FOR ~19 MINUTES ⛔** | managed `JoinByCode` continuation is blocked |
 | 00-19-19 | STORM → JOIN | RakNet | `RakNetTransport | Peer lost the connection [127.0.0.1:30100]` | **idle link times out** (no app traffic kept it alive) |
@@ -111,11 +125,16 @@ Broker log during the freeze (both connections idle until the timeout):
 
 ### Why EOS is NOT the blocker (evidence)
 
-- The emu delivered **both** the `DestroyLobby` completion callback **and** the `CLOSED` member-status
-  to a **registered** handler: `member_status deliver lobby='161837' member='3b2ac1e8…e2f0' status=5
-  handlers=1`.
-- Elsie's emu had **already discovered the host lobby**: `CopyLobbyDetailsHandle wants
-  LobbyId='161837' ; known lobbies=[161837 705777 ]`. The data needed to join is present.
+- **Decisive:** the EOS emu trace now matches the WORKING Config C run (`docs/captures_configC/`)
+  step-for-step — same `CreateLobby` → `CopyLobbyDetailsHandle(own)` → `DestroyLobby` →
+  `DestroyLobbyCallbackInfo` delivered — and the join **still hangs**. Config C uses the SAME emu
+  with a REAL backend and WORKS; offline uses the broker and hangs. So the divergence is downstream
+  of EOS.
+- The emu delivered the `DestroyLobby` completion callback. (Earlier builds also queued a self
+  `CLOSED` member-status to `handlers=1`; that is now **skipped** — `queued 0 CLOSED (self skipped)`
+  — and Config C, which also skips it, works. The self-`CLOSED` theory is disproven.)
+- The data needed to join is present either way; pre-registering the host lobby is no longer done
+  (`known lobbies=[161837 ]`, own-only) and the hang is unchanged.
 - The EOS callback dispatch (`callback_manager.cpp` `run_callbacks`, lines 171-220) holds
   `GLOBAL_LOCK` (a `std::recursive_mutex`, `helper_funcs.h:32-34`) while invoking the game's
   completion lambda inline — but a recursive mutex permits same-thread re-entry, and the tick thread
@@ -171,33 +190,71 @@ continuation that, online, fires synchronously in the same tick — and offline 
 
 ---
 
-## Candidate root causes to investigate next (ranked)
+## Candidate root causes (ranked, with what the captures have RULED OUT)
 
-1. **Spurious self-`CLOSED` member-status from our deferred-notify destroy fix.** Our
-   `eossdk_lobby.cpp` `DestroyLobby` queues a `CLOSED` member-status for **JOIN itself** (the lobby
-   owner) when it destroys its *own* lobby (`member='3b2ac1e8…e2f0' status=5 handlers=1`). Real EOS
-   normally gives the destroying owner only the `DestroyLobby` completion — *other* members get
-   `CLOSED`. A self-`CLOSED` arriving mid-join could make the managed state machine treat itself as
-   kicked and abort the continuation. **Cheapest decisive test:** suppress the self-member `CLOSED`
-   (keep it only for other members) while still firing the destroy success callback; rebuild,
-   redeploy, reproduce.
-2. **A Goldberg Steam matchmaking gate.** Online, the continuation interleaves `Steam | Leaving
-   lobby [own]` then `Steam | Join lobby [host]`; offline JOIN never sees the host's Steam lobby. If
-   the managed `JoinByCode` awaits a Goldberg lobby callback/state (own leave done, or host-lobby
-   discovery) before driving Stormancer, the release-build Goldberg may never satisfy it offline.
-   Confirm whether Goldberg surfaces the host lobby to the joiner instance.
-3. **The destroy callback shape/ordering does not satisfy the C# `await`.** `_OnLobbyDestroyed` ran,
-   but verify the emu fires the *completion delegate the coroutine awaited* (not just a side
-   notification), with `ResultCode = EOS_Success`, in the order the managed code expects relative to
-   the `CLOSED` notification.
-4. **RTC is a RED HERRING offline (deprioritised).** Online, the joiner *removes* the
-   `EOS_RTC_DisconnectedCallbackInfo` handler (Id 47) **before** `RTCRoom LeaveRoom`, so it does
-   **not** await the RTC disconnect; and offline there is no RTC room at all (`GetRTCRoomName =
-   NotImplemented` at create → no `JoinRoom`). So the missing `Conference End` is unlikely to be the
-   gate. Keep only as a fallback if (1)-(3) are disproven.
+1. ~~**Spurious self-`CLOSED` member-status from the deferred-notify destroy fix.**~~ **SUPERSEDED /
+   DISPROVEN.** `DestroyLobby` now skips the self `CLOSED` (`queued 0 CLOSED (self skipped)`), and the
+   WORKING Config C run also skips it — yet offline still hangs and Config C works. Not the gate.
+2. ~~**EOS host-lobby pre-registration pollutes `_lobbies`.**~~ **SUPERSEDED / DISPROVEN.**
+   `on_lobby_update` now IGNOREs unsolicited remote announces, so `_lobbies` is own-only at join time
+   (matches online). Hang unchanged. Not the gate (it only mattered at search time, which never runs).
+3. ~~**RTC is a red herring / missing room.**~~ **SUPERSEDED.** Emu now returns
+   `GetRTCRoomName = conf+partydeck (EOS_Success)` (parity); online removes the RTC disconnect handler
+   before leaving, so the join is not gated on RTC. No effect on the hang.
+4. **LEADING: the managed `JoinByCode` coroutine never advances to SUBMIT the code.** Authoritative (`pcaps/join_online_102258.csv` WORKS vs
+   `pcaps/join_fwd_211504.csv` HANGS):
+   - Online: `0x8e` has a **route-1** exchange (register/token) **and** a **route-2** exchange that
+     submits the host code (`0x8e 0 | 2 | 0 | '631790' | {RequestedHero…}`) → reply carries the
+     host-party connect token (`{"endpoints":{"raknet":[…]}}`). That route-2 submit IS the join.
+   - Offline: `0x8e` has **only route-1** exchanges (×2), and the broker **completes each one**
+     (`RAKNET->JOINER  SCENE h=0x8e 0 | 1 | 1 | 0`). There is **NO route-2 code submission at all.**
+   So the broker completed every RPC the joiner actually sent — **the earlier "missing `route=1`
+   completion" idea is refuted by the capture.** The real gap is upstream: the managed coroutine
+   never reaches the point of emitting `DISCONNECT_FROM_SCENE` + the `0x8e` route-2 code submit.
+   **Open question / next test:** is the offline route-1 *reply* (decoded as bare `0`) materially
+   different from online's route-1 reply (which carries a token), and could that stall the coroutine
+   before route-2? Inspect the raw route-1 payloads (`raw_hex` column) online vs offline next.
 
-The fix is most likely in the **EOS emu** (`/home/caleb/epic_emu`) around lobby destroy/notify
-delivery — but **not** by spontaneously firing `_OnLobbyJoined` (that is the trailing voice step and
-would not produce Stormancer party membership). The objective is to get the managed coroutine to
-advance so the native Stormancer client emits `DISCONNECT_FROM_SCENE` + `0x8e :: <code>` to the
-broker, which is already prepared to answer them.
+### What the authoritative captures have RULED OUT (do not re-test)
+
+- **PartyMerging.GetMergerStatus counts are NOT the gate.** Our broker answers `partiesCount=1,
+  playersCount=1`; the real backend's counts **vary as live-pool noise** (online capture showed
+  `2/4`, `1/1`, `2/4`, `0/0` across one minute) and online even returned **`1/1`** (identical to
+  offline) at t=28 and the join still worked. The count is informational ("X players searching" UI);
+  the game does not gate a user's explicit join-by-code on it. Confirmed by `raknet.py`
+  `build_merger_status` comment + `pcaps/join_online_102258.csv`.
+- **Phase-A matchmaking scene is well replicated.** Offline (`pcaps/join_fwd_211504.csv`, handle
+  `0xa0`) the broker pushes the full set: party state arrays, per-member `RequestedHero/PlayerName`
+  userdata, `CreateInvitationCode` results, `partyDataToken`, and steady `GetMergerStatus` polls —
+  matching the online matchmaking scene's shape. So the joiner reaches the same idle "registered in
+  game finder" state online and offline before the click.
+- **The hang has no server→client gate at the click.** In the online capture the post-destroy steps
+  (`DISCONNECT_FROM_SCENE` ×2 → `0x8e` code submit) are all **client→server** with no inbound
+  message required between `_OnLobbyDestroyed` and the first `DISCONNECT_FROM_SCENE` (same tick). So
+  offline's failure to emit them is a **synchronous managed continuation that does not run** — caused
+  by either (a) a state value our broker/Goldberg set during Phase A that makes the coroutine bail,
+  or (b) a thrown exception (Proton `+seh` shows a C++ throw `0x20474343` near the click). Since the
+  EOS emu is exonerated (Config C uses it with the real backend and works), the Phase-A state must
+  come from the **broker or Goldberg**.
+
+> **Reliability caveat for these CSV diffs:** Stormancer scene *handles* (the `h=0x8e`/`0x90`/`0xa0`
+> byte) and *route numbers* are assigned per session, so they COLLIDE across captures (offline
+> `0x8e` is a different scene than online `0x8e`). Compare by route **name** (the `RouteMappings`
+> blocks and the broker's `rname` log), never by raw handle/route number across two runs.
+5. **A Goldberg Steam matchmaking gate (NOW co-equal suspect, not a fallback).** **Config C only
+   exonerates the EOS emu** — it ran our emu against the **REAL** Stormancer backend
+   (`dt-live.passtechgames.com:30100`) **and REAL Steam** (its emu log shows `known lobbies=[own]`
+   only, i.e. no co-located peer). Offline differs from Config C in **two** planes at once: the
+   `raknet.py` broker **and** Goldberg (plus co-location side-effects on the emu's own UDP net). So
+   raknet.py and Goldberg are **both** still suspects; "EOS ruled out" does **not** narrow to the
+   broker. To isolate, change ONE plane vs Config C (real-Stormancer + Goldberg, or our-broker +
+   real-Steam) and see which reintroduces the hang.
+
+**Where the stall actually is (authoritative, from the captures):** in ALL offline captures there are
+**zero** `DISCONNECT_FROM_SCENE` messages, and the merger-status polls **continue to end-of-capture**
+(online they **stop** at the join click because the game leaves the matchmaking scene first). So the
+game hangs **before** the first `DISCONNECT_FROM_SCENE`, while **still in its own matchmaking scene**.
+The online teardown is driven **locally** off the join click (no inbound server message gates the
+first disconnect), so offline the game is parked on a **local callback** owed by the emu or Goldberg
+— not on a missing wire reply. The objective remains to get the coroutine to advance to the first
+`DISCONNECT_FROM_SCENE`.

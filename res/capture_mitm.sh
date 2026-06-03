@@ -101,6 +101,25 @@ fi
 mkdir -p "$CONFDIR"
 cat "$CA_DIR/ca.key" "$CA_DIR/ca.crt" > "$CONFDIR/mitmproxy-ca.pem"
 
+# Use the EXACT pre-built server cert (server.crt) the game already accepted when
+# talking straight to server.py, instead of letting mitmproxy MINT a leaf. The
+# minted leaf lacked the critical KeyUsage (Digital Signature, Key Encipherment)
+# extension, which Wine's schannel requires for the TLS 1.2 RSA/ECDHE key
+# exchange -> the game completed the handshake then sent NO request and
+# disconnected (proxy log: connect/disconnect, server.py got nothing, no join
+# code). server.crt has KeyUsage + SANs for all dt-live* hosts + 127.0.0.1.
+# Bundle = key + leaf + CA chain (PEM), presented per target host via --certs.
+CERT_ARGS=()
+if [[ -f "$CA_DIR/server.crt" && -f "$CA_DIR/server.key" ]]; then
+    cat "$CA_DIR/server.key" "$CA_DIR/server.crt" "$CA_DIR/ca.crt" > "$CONFDIR/server_bundle.pem"
+    for h in $HOSTS; do CERT_ARGS+=("--certs $h=$CONFDIR/server_bundle.pem"); done
+    echo "[capmitm] presenting pre-built server.crt to the game for: $HOSTS"
+else
+    echo "[capmitm] NOTE: $CA_DIR/server.crt[.key] not found — mitmproxy will MINT leaves" >&2
+    echo "[capmitm]   (Wine schannel may reject minted certs lacking KeyUsage; prefer server.crt)" >&2
+fi
+CERT_STR="${CERT_ARGS[*]}"
+
 TD_PID="" ; DNS_PID="" ; MITM_PID="" ; RESOLV_SWAPPED=0
 
 restore_resolv() {
@@ -171,14 +190,35 @@ fi
 #    --ssl-insecure: don't fail if an upstream cert can't be verified here.
 #    connection_strategy=lazy: let the addon set the upstream before connecting.
 #    keep_host_header: preserve the game's real Host header for upstream routing.
+#    tls_version_client_max=TLS1_2: CRITICAL — Wine's schannel/winhttp can complete
+#      a TLS 1.3 handshake but then chokes on post-handshake messages
+#      (NewSessionTicket/KeyUpdate), returning ERROR_WINHTTP_SECURE_CHANNEL_ERROR
+#      and sending NO request (client connects then instantly disconnects). The
+#      real passtech backend AND our server.py both cap at TLS 1.2; mitmproxy must
+#      too on its client-facing side or the game never sends a single request.
 export MITM_LOG="$MITMLOG"
 export MITM_REAL_DNS="$UPSTREAM"
 export MITM_HOSTMAP="$HOSTMAP"
 export MITM_REAL_PORT="$REAL_PORT"
-"$NIXSHELL" -p mitmproxy --run "mitmdump --mode reverse:https://$PRIMARY \
+# Offline: force ALL flows to the local server.py so nothing can leak to the real
+# backend even if a Host header doesn't match the hostmap. (Online leaves this
+# unset so the addon retargets to the pre-resolved real upstream per host.)
+if [[ "$MODE" == "offline" ]]; then
+    export MITM_FORCE_UPSTREAM="$LOCAL_BACKEND_IP:$LOCAL_BACKEND_PORT"
+    # Reverse target IS the local server.py: mitmproxy reverse mode pins the
+    # upstream to this address (the request-hook override alone does NOT escape
+    # reverse-mode DNS), guaranteeing every request reaches server.py.
+    REVERSE_TARGET="https://$LOCAL_BACKEND_IP:$LOCAL_BACKEND_PORT"
+else
+    unset MITM_FORCE_UPSTREAM
+    REVERSE_TARGET="https://$PRIMARY"
+fi
+"$NIXSHELL" -p mitmproxy --run "mitmdump --mode reverse:$REVERSE_TARGET \
     --listen-host 0.0.0.0 --listen-port 443 \
     --set confdir=$CONFDIR --set connection_strategy=lazy \
     --set keep_host_header=true --ssl-insecure \
+    --set tls_version_client_max=TLS1_2 \
+    $CERT_STR \
     -s $HERE/mitm_addon.py" >"$PROXLOG" 2>&1 &
 MITM_PID=$!
 # nix-shell may need to realise mitmproxy on first run; give it a moment.

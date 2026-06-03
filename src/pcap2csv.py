@@ -13,7 +13,7 @@ extract SNI from ClientHello and otherwise mark size/direction. Other planes
 
 Usage: pcap2csv.py <in.pcap> <out.csv>
 """
-import sys, struct, csv, json, base64, os
+import sys, struct, csv, json, base64, os, re
 
 # ---- RakNet / Stormancer constants (from broker raknet.py) ----
 ID_UNCONNECTED_PING = 0x01; ID_UNCONNECTED_PING_OPEN_CONN = 0x02; ID_UNCONNECTED_PONG = 0x1C
@@ -1025,11 +1025,128 @@ def load_mitm(path):
         return []
     return recs
 
+# ---- Goldberg (gbe_fork Steam emu) log ingestion ----------------------------
+# res/capture_fwdproxy.sh harvests each instance's STEAM_LOG_*.log into a sibling
+# dir named goldberg_<label>_<ts>/ (files: ccloader-<idx>_<ROLE>_STEAM_LOG_*.log).
+# Each line is:  [<ms> ms, <us> us] [tid <n>] Func::Name() free-form message
+# us is microseconds-since-DLL-load (process-relative). We fold the steam control
+# plane into the CSV so the Goldberg lobby/matchmaking flow is visible inline with
+# the wire. Time is END-ANCHORED: the games and tcpdump are torn down together, so
+# each log's last line ~ the last packet -> offset_role = pcap_end - log_max.
+GBE_TS_RE = re.compile(r"^\[(\d+) ms, (\d+) us\] \[tid (\d+)\] (.*)$")
+GBE_FUNC_RE = re.compile(r"^([\w:]+)\(\)\s?(.*)$")
+# default keep-set: lobby/matchmaking control plane + LAN announce + auth/identity,
+# dropping the per-tick callback pump (RunCallbacks/GetNextCallback/BGetCallback).
+GBE_DEFAULT_RE = re.compile(
+    r"Matchmaking|Lobby|Friends::Callback|GetFriendPersonaName|RichPresence|"
+    r"JoinRequest|Invite|GetAuthTicket|GetSteamID|Networking::(?!Run\b)|"
+    r"new_connection|add_id_connection|ConnectToGlobalUser|Mine_Connect|parse_auto",
+    re.I)
+
+def parse_goldberg_dir(dirpath, keep_all=False, grep=None):
+    """Parse harvested Goldberg logs -> {role: [ {rt,tid,func,msg}, ... ]}.
+    rt = seconds since that instance's DLL load. Filtered to GBE_DEFAULT_RE unless
+    keep_all, or to a custom case-insensitive `grep` regex."""
+    import glob as _g
+    rx = re.compile(grep, re.I) if grep else (None if keep_all else GBE_DEFAULT_RE)
+    out = {}
+    for f in sorted(_g.glob(os.path.join(dirpath, "*.log"))):
+        base = os.path.basename(f)
+        m = re.search(r"ccloader-\d+_([A-Za-z0-9]+)_", base)
+        role = m.group(1) if m else os.path.splitext(base)[0]
+        evs = out.setdefault(role, [])
+        try:
+            fh = open(f, errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for ln in fh:
+                mt = GBE_TS_RE.match(ln.rstrip("\n"))
+                if not mt: continue
+                us = int(mt.group(2)); tid = mt.group(3); body = mt.group(4)
+                mf = GBE_FUNC_RE.match(body)
+                func, msg = (mf.group(1), mf.group(2)) if mf else ("", body)
+                if rx is not None and not rx.search(func or msg): continue
+                evs.append({"rt": us / 1e6, "tid": tid, "func": func, "msg": msg})
+    return out
+
+def _auto_gbe_dir(pcap_path):
+    """Locate the sibling goldberg_* harvest dir for a join_<label>.pcap."""
+    import glob as _g
+    d = os.path.dirname(os.path.abspath(pcap_path)) or "."
+    stem = os.path.splitext(os.path.basename(pcap_path))[0]   # e.g. join_fwd_234143
+    cands = []
+    if "_" in stem:
+        cands.append(os.path.join(d, "goldberg_" + stem.split("_", 1)[1]))
+    cands.append(os.path.join(d, "goldberg_" + stem))
+    tok = stem.rsplit("_", 1)[-1]
+    cands += _g.glob(os.path.join(d, f"goldberg_*{tok}"))
+    for c in cands:
+        if os.path.isdir(c): return c
+    return None
+
+
+# ---- plane classification + filtering (cut noise, focus on broker/steam) ----
+# Each row belongs to exactly one logical "plane" so captures can be filtered to
+# the planes we actually control/suspect. The deterministic game binary is fixed;
+# the only offline variables are raknet.py (broker), the EOS emu, and Goldberg
+# (steam). EOS-emu was exonerated via Config C, so the default "signal" view keeps
+# just the broker (raknet) + steam planes and drops TLS/DNS/RTC/EOS-P2P/ICMP noise.
+PLANES = ("raknet","steam","eosp2p","rtc","tls","dns","http","icmp","other")
+
+def row_plane(r):
+    """Classify a built row dict into one of PLANES using src/dst labels + summary."""
+    src=r.get("src","");dst=r.get("dst","");summ=(r.get("summary","") or "").lower()
+    dec=(r.get("decoded","") or "").lower()
+    ep=src+" "+dst
+    if "RAKNET" in ep: return "raknet"
+    if "STEAM-LAN" in ep or summ.startswith("gbe") or "gbe-" in summ: return "steam"
+    if "EOS-P2P" in ep or "nee-p2p" in summ or "nee-p2p" in dec: return "eosp2p"
+    if "EOS-RTC" in ep or "rtc-media" in ep.lower(): return "rtc"
+    if "EOS-LOBBY-WSS" in ep or summ.startswith("https") or ep.find("HTTPS:")>=0: return "tls"
+    if summ.startswith(("tls","tcp-ctrl")) or "tls-" in summ: return "tls"
+    if summ.startswith(("dns","mdns")) or " DNS" in ep or "DNS" in (src,dst): return "dns"
+    if summ.startswith("http"): return "http"
+    if summ=="icmp" or dec.startswith("icmp"): return "icmp"
+    return "other"
+
+def _parse_plane_args(argv):
+    """Pull plane-filter flags out of argv (mutating a copy). Returns (positional, keep_set).
+    Flags:
+      --signal                keep only raknet+steam (the two unproven planes)  [shorthand]
+      --only=a,b,c            keep only the named planes
+      --drop=a,b,c            drop the named planes (start from all)
+      --planes                print plane counts and exit
+      --gbe=DIR               merge Goldberg logs from DIR (default: auto-detect sibling)
+      --no-gbe                do not merge Goldberg logs
+      --gbe-all               include every Goldberg log line (not just the control plane)
+      --gbe-grep=RE           include Goldberg lines whose func/msg match regex RE
+    """
+    pos=[]; keep=set(PLANES); show_counts=False
+    gbe={"dir":None,"off":False,"all":False,"grep":None}
+    for a in argv:
+        if a=="--signal": keep={"raknet","steam"}
+        elif a.startswith("--only="): keep={p.strip() for p in a.split("=",1)[1].split(",") if p.strip()}
+        elif a.startswith("--drop="): keep=set(PLANES)-{p.strip() for p in a.split("=",1)[1].split(",") if p.strip()}
+        elif a=="--planes": show_counts=True
+        elif a.startswith("--gbe="): gbe["dir"]=a.split("=",1)[1]
+        elif a=="--no-gbe": gbe["off"]=True
+        elif a=="--gbe-all": gbe["all"]=True
+        elif a.startswith("--gbe-grep="): gbe["grep"]=a.split("=",1)[1]
+        else: pos.append(a)
+    return pos, keep, show_counts, gbe
+
 def main():
-    if len(sys.argv)<2:
-        raise SystemExit(f"usage: {sys.argv[0]} <input.pcap> [output.csv] [mitm.jsonl]")
-    inp=sys.argv[1]
-    out=sys.argv[2] if len(sys.argv)>2 else os.path.splitext(inp)[0]+".csv"
+    argv,keep_planes,show_counts,gbe_opts=_parse_plane_args(sys.argv[1:])
+    if len(argv)<1:
+        raise SystemExit(
+            f"usage: {sys.argv[0]} <input.pcap> [output.csv] [mitm.jsonl] "
+            f"[--signal|--only=raknet,steam|--drop=tls,dns,rtc,eosp2p] [--planes]\n"
+            f"  [--gbe=DIR|--no-gbe|--gbe-all|--gbe-grep=RE]\n"
+            f"  planes: {', '.join(PLANES)}")
+    inp=argv[0]
+    out=argv[1] if len(argv)>1 else os.path.splitext(inp)[0]+".csv"
+    _mitm_arg=argv[2] if len(argv)>2 else None
     linktype,pkts=parse_pcap(inp)
     if not pkts: raise SystemExit("no packets")
     t0=pkts[0][0]
@@ -1182,7 +1299,7 @@ def main():
                      "src":srcl,"dst":dstl,"decoded":decoded,"raw_hex":rawhex})
 
     # ---- merge decrypted HTTPS from the MITM sidecar (res/mitm_https.py) ----
-    mitm_path=sys.argv[3] if len(sys.argv)>3 else None
+    mitm_path=_mitm_arg
     if not mitm_path:
         stem=os.path.splitext(inp)[0]
         for cand in (stem+".mitm.jsonl", os.path.join(os.path.dirname(inp) or ".","mitm_http.jsonl")):
@@ -1217,12 +1334,51 @@ def main():
                         relabeled+=1
         print(f"  merged {added} HTTPS records from {mitm_path} ({relabeled} tls rows relabeled)")
 
+    # ---- merge Goldberg (gbe_fork Steam emu) logs from the harvest dir ----
+    gbe_dir=gbe_opts["dir"]
+    if gbe_dir is None and not gbe_opts["off"]:
+        gbe_dir=_auto_gbe_dir(inp)
+    if gbe_dir and not gbe_opts["off"]:
+        if not os.path.isdir(gbe_dir):
+            print(f"  gbe dir not found: {gbe_dir}")
+        else:
+            # end-anchor: games + tcpdump are torn down together, so each log's last
+            # line ~ the last packet -> offset_role = pcap_end - log_max_reltime.
+            pcap_end=max((float(r["t_off"]) for r in rows), default=0.0)
+            glog=parse_goldberg_dir(gbe_dir, keep_all=gbe_opts["all"], grep=gbe_opts["grep"])
+            added=0
+            for role,evs in sorted(glog.items()):
+                if not evs: continue
+                rmax=max(e["rt"] for e in evs)
+                off=pcap_end-rmax
+                for e in evs:
+                    rows.append({"id":0,"t_off":f"{e['rt']+off:.6f}",
+                                 "summary":("GBE-LOG "+e["func"]) if e["func"] else "GBE-LOG",
+                                 "src":f"GBE:{role}","dst":"(steam-emu)",
+                                 "decoded":e["msg"],"raw_hex":""})
+                    added+=1
+                print(f"  gbe {role:8s}: {len(evs)} events, offset {off:+.3f}s (end-anchored)")
+            if added: print(f"  merged {added} Goldberg log events from {gbe_dir}")
+
     rows.sort(key=lambda r:float(r["t_off"]))
+    # ---- plane classification + filtering (drop noise planes) ----
+    for r in rows: r["plane"]=row_plane(r)
+    counts={}
+    for r in rows: counts[r["plane"]]=counts.get(r["plane"],0)+1
+    if show_counts:
+        print("plane counts (all rows):")
+        for p in PLANES:
+            if counts.get(p): print(f"  {p:8s} {counts[p]}")
+        return
+    if keep_planes!=set(PLANES):
+        before=len(rows)
+        rows=[r for r in rows if r["plane"] in keep_planes]
+        print(f"  filtered planes -> keeping {sorted(keep_planes)}: {before} -> {len(rows)} rows")
     for i,r in enumerate(rows,1): r["id"]=i
     with open(out,"w",newline="") as f:
-        w=csv.DictWriter(f,fieldnames=["id","t_off","summary","src","dst","decoded","raw_hex"])
+        w=csv.DictWriter(f,fieldnames=["id","t_off","summary","src","dst","decoded","raw_hex","plane"])
         w.writeheader()
-        for r in rows: w.writerow(r)
+        for r in rows: w.writerow({k:r.get(k,"") for k in ("id","t_off","summary","src","dst","decoded","raw_hex","plane")})
     print(f"wrote {len(rows)} rows -> {out}")
     for ep,r in roles.items(): print(f"  role {r:8s} = {ep[0]}:{ep[1]}")
 

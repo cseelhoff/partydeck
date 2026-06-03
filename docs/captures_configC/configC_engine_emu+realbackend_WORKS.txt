@@ -1,0 +1,141 @@
+00-00-00 INFO     | Build version: 1.05.00.05.27354 2026/04/27 #12d1baa4eb
+00-00-00 INFO     | EOS (Passtech): EOS_P2P_SetRelayControl EOS_RC_AllowRelays
+00-00-01 INFO     | Stormancer | Party State | Disconnected
+00-00-01 WARN *   | EOS_Platform_Tick not called for 178520s
+00-00-01 INFO     | EOS: Authenticating using external account
+00-00-02 INFO     | Steam: GetAuthTicketForWebApi k_EResultOK
+00-00-02 INFO     | EOS: Connecting using external account
+00-00-02 INFO     | Stormancer | PID 316|2026-06-03T01:27:49|Info |PartyPlugin| Registered Party plugin, revision [2020-08-21.1]
+
+00-00-02 INFO     | Stormancer | PID 316|2026-06-03T01:27:49|Info |Steam| SteamAPI_Init success
+
+00-00-02 INFO     | Stormancer | PID 316|2026-06-03T01:27:49|Info |connection| Game connection state changed [1]
+
+00-00-03 INFO     | Stormancer | PID 316|2026-06-03T01:27:50|Info |raknet| connecting to dt-live.passtechgames.com:30100 with id='passtech-live', parentId=''
+
+00-00-03 INFO     | Stormancer | PID 316|2026-06-03T01:27:50|Info |raknet| Starting connection attempt to remote peer. Pending connections count : 1 [dt-live.passtechgames.com:30100]
+
+00-00-03 INFO     | Stormancer | PID 316|2026-06-03T01:27:50|Info |raknet| connecting rakpeer to dt-live.passtechgames.com with id='passtech-live', parentId='', socketdescriptor=0, result=0
+
+00-00-03 INFO     | EOS: Connected (external account)
+00-00-03 INFO     | Product user ID: 3b2ac1e835bd0f1c45355f4f1271e2f0
+00-00-03 INFO     | Stormancer | PID 316|2026-06-03T01:27:51|Info |raknet| Received ID_CONNECTION_REQUEST_ACCEPTED from: [162.19.84.58:30100]
+
+00-00-03 INFO     | Stormancer | PID 316|2026-06-03T01:27:51|Info |RakNetTransport| Received ID_CONNECTION_RESULT. [162.19.84.58|30100]
+
+00-00-03 INFO     | Stormancer | PID 316|2026-06-03T01:27:51|Info |connections| Completed connection [passtech-live]
+
+00-00-03 INFO     | Stormancer | PID 316|2026-06-03T01:27:51|Info |session| Session id acquired from cluster. [DLjcweJbk0q-nAUJQnUW-w]
+
+00-00-04 INFO     | Steam: GetAuthTicketForWebApi k_EResultOK
+00-00-04 INFO     | Stormancer | PID 316|2026-06-03T01:27:52|Info |client| Connecting to scene [scene:/passtech-live/darktales/live-1-05-00/authenticator]
+
+00-00-04 INFO     | Stormancer | PID 316|2026-06-03T01:27:52|Info |client| Connected to scene. [scene:/passtech-live/darktales/live-1-05-00/authenticator]
+
+00-00-05 INFO     | EOS_P2P_QueryNATType: EOS_NAT_Open
+00-00-06 INFO     | Stormancer | PID 316|2026-06-03T01:27:54|Info |connection| Game connection state changed [2]
+
+00-00-06 INFO     | Stormancer | PID 316|2026-06-03T01:27:54|Info |authentication| Getting token for service type 'stormancer.friends' and name ''
+
+00-00-06 INFO     | Stormancer | PID 316|2026-06-03T01:27:54|Info |authentication| Got token for service type 'stormancer.friends' and name ''
+
+00-00-06 INFO     | Stormancer | PID 316|2026-06-03T01:27:54|Info |authentication| Retrieved scene connection token for service type 'stormancer.friends' and name ''
+
+00-00-07 INFO     | Stormancer | PID 316|2026-06-03T01:27:54|Info |Client| Get private scene [scene:/passtech-live/darktales/live-1-05-00/friends]
+
+00-00-07 INFO     | Stormancer | PID 316|2026-06-03T01:27:55|Info |client| Connecting to scene [scene:/passtech-live/darktales/live-1-05-00/friends]
+
+00-00-07 INFO     | Stormancer | PID 316|2026-06-03T01:27:55|Info |client| Connected to scene. [scene:/passtech-live/darktales/live-1-05-00/friends]
+
+00-00-37 INFO     | Lobby | Host: true | Enter | StateHeroSelection
+00-00-37 INFO     | Stormancer | Party State | Creating with code
+00-00-37 INFO     | Stormancer | PID 316|2026-06-03T01:28:25|Info |authentication| Getting token for service type 'stormancer.plugins.partyManagement' and name ''
+
+00-00-38 INFO     | Stormancer | PID 316|2026-06-03T01:28:26|Info |authentication| Got token for service type 'stormancer.plugins.partyManagement' and name ''
+
+00-00-38 INFO     | Stormancer | PID 316|2026-06-03T01:28:26|Info |authentication| Retrieved scene connection token for service type 'stormancer.plugins.partyManagement' and name ''
+
+00-00-38 INFO     | Stormancer | PID 316|2026-06-03T01:28:26|Info |Client| Get private scene [scene:/passtech-live/darktales/live-1-05-00/party-manager]
+
+00-00-38 INFO     | Stormancer | PID 316|2026-06-03T01:28:26|Info |client| Connecting to scene [scene:/passtech-live/darktales/live-1-05-00/party-manager]
+
+00-00-38 INFO     | Stormancer | PID 316|2026-06-03T01:28:26|Info |client| Connected to scene. [scene:/passtech-live/darktales/live-1-05-00/party-manager]
+
+00-00-38 INFO     | Stormancer | PID 316|2026-06-03T01:28:26|Info |PartyManagementService| Protocol version: client=2020-05-20.1, server=2020-05-20.1
+
+00-00-39 INFO     | Stormancer | PID 316|2026-06-03T01:28:26|Info |Client| Get private scene [scene:/passtech-live/darktales/live-1-05-00/party-3ab30ed4-a7b7-4f8d-bb1d-bcaa771efe2a]
+
+00-00-39 INFO     | Stormancer | PID 316|2026-06-03T01:28:27|Info |PartyService| Protocol version: client=2022-06-09.1, server=2022-06-09.1
+
+00-00-39 INFO     | Stormancer | PID 316|2026-06-03T01:28:27|Info |PartyService| Server revision=2020-08-21.1
+
+00-00-39 INFO     | Stormancer | PID 316|2026-06-03T01:28:27|Info |client| Connecting to scene [scene:/passtech-live/darktales/live-1-05-00/party-3ab30ed4-a7b7-4f8d-bb1d-bcaa771efe2a]
+
+00-00-39 INFO     | Stormancer | PID 316|2026-06-03T01:28:27|Info |client| Connected to scene. [scene:/passtech-live/darktales/live-1-05-00/party-3ab30ed4-a7b7-4f8d-bb1d-bcaa771efe2a]
+
+00-00-39 INFO     | Stormancer | PID 316|2026-06-03T01:28:27|Info |steam| Creating steam lobby. [joinable=1,maxMembers=4,lobbyType=friendsOnly,metadata={partyDataToken=eyJQYXJ0eUlkIjoiM2FiMzBlZDQtYTdiNy00ZjhkLWJiMWQtYmNhYTc3MWVmZTJhIiwiTGVhZGVyVXNlcklkIjoiNDE2OGZmYjI0ZGUyNDVmODgwNjBkMjdjOTU4MDY4NWUiLCJMZWFkZXJTdGVhbUlkIjo3NjU2MTE5Nzk3Nzg3MDI2N30=.HI0BJAel2ElY1ZUuHfB3vw008cu5/8O/7MEJiMWmBeY=,}]
+
+00-00-39 INFO     | Stormancer | PID 316|2026-06-03T01:28:27|Info |Steam| Creating lobby
+
+00-00-39 INFO     | Stormancer | PID 316|2026-06-03T01:28:27|Info |Steam| Lobby created [109775242743558097]
+
+00-00-39 INFO     | Stormancer | PID 316|2026-06-03T01:28:27|Info |steam| Steam lobby created [109775242743558097]
+
+00-00-40 INFO     | Stormancer | PID 316|2026-06-03T01:28:28|Info |authentication| Getting token for service type 'stormancer.plugins.gamefinder' and name 'matchmaking'
+
+00-00-40 INFO     | Stormancer | Party | Created, generating invitation code
+00-00-40 INFO     | Stormancer | PID 316|2026-06-03T01:28:28|Info |authentication| Got token for service type 'stormancer.plugins.gamefinder' and name 'matchmaking'
+
+00-00-40 INFO     | Stormancer | PID 316|2026-06-03T01:28:28|Info |authentication| Retrieved scene connection token for service type 'stormancer.plugins.gamefinder' and name 'matchmaking'
+
+00-00-40 INFO     | Stormancer | PID 316|2026-06-03T01:28:28|Info |Client| Get private scene [scene:/passtech-live/darktales/live-1-05-00/matchmaking]
+
+00-00-40 INFO     | Stormancer | Party | Generated invitation code: 292083
+00-00-40 INFO     | Stormancer | Party State | Not ready
+00-00-40 INFO     | Stormancer | PID 316|2026-06-03T01:28:28|Info |client| Connecting to scene [scene:/passtech-live/darktales/live-1-05-00/matchmaking]
+
+00-00-40 INFO     | EOS: _OnLobbyCreated (eConnected)
+00-00-41 INFO     | Stormancer | PID 316|2026-06-03T01:28:28|Info |client| Connected to scene. [scene:/passtech-live/darktales/live-1-05-00/matchmaking]
+
+00-00-50 INFO     | Stormancer | Party State | Joining with code (343566)
+00-00-50 INFO     | EOS: _OnLobbyDestroyed
+00-00-51 INFO     | Stormancer | PID 316|2026-06-03T01:28:39|Info |Scene| Scene destroyed [scene:/passtech-live/darktales/live-1-05-00/party-3ab30ed4-a7b7-4f8d-bb1d-bcaa771efe2a]
+
+00-00-51 INFO     | Stormancer | PID 316|2026-06-03T01:28:39|Info |Steam| Leaving lobby [109775242743558097]
+
+00-00-51 INFO     | Stormancer | PID 316|2026-06-03T01:28:39|Info |Scene| Scene destroyed [scene:/passtech-live/darktales/live-1-05-00/matchmaking]
+
+00-00-51 INFO     | Stormancer | PID 316|2026-06-03T01:28:39|Info |Client| Get private scene [scene:/passtech-live/darktales/live-1-05-00/party-4d1c7f8c-f6cc-4b3a-b19b-280b34e1cc22]
+
+00-00-52 INFO     | Stormancer | PID 316|2026-06-03T01:28:40|Info |PartyService| Protocol version: client=2022-06-09.1, server=2022-06-09.1
+
+00-00-52 INFO     | Stormancer | PID 316|2026-06-03T01:28:40|Info |PartyService| Server revision=2020-08-21.1
+
+00-00-52 INFO     | Stormancer | PID 316|2026-06-03T01:28:40|Info |client| Connecting to scene [scene:/passtech-live/darktales/live-1-05-00/party-4d1c7f8c-f6cc-4b3a-b19b-280b34e1cc22]
+
+00-00-52 INFO     | Stormancer | PID 316|2026-06-03T01:28:40|Info |client| Connected to scene. [scene:/passtech-live/darktales/live-1-05-00/party-4d1c7f8c-f6cc-4b3a-b19b-280b34e1cc22]
+
+00-00-52 INFO     | Stormancer | PID 316|2026-06-03T01:28:40|Info |Steam| Lobby data updated [ islobby=1 lobby=109775242743557893 member=109775242743557893]
+
+00-00-52 INFO     | Stormancer | PID 316|2026-06-03T01:28:40|Info |Steam| Join lobby [109775242743557893]
+
+00-00-52 INFO     | Stormancer | PID 316|2026-06-03T01:28:40|Info |Steam| Joined steam lobby [109775242743557893]
+
+00-00-52 INFO     | Stormancer | PID 316|2026-06-03T01:28:40|Info |Steam| Joined steam lobby [109775242743557893]
+
+00-00-53 INFO     | Stormancer | PID 316|2026-06-03T01:28:41|Info |authentication| Getting token for service type 'stormancer.plugins.gamefinder' and name 'matchmaking'
+
+00-00-53 INFO     | Tunnel: client created: 127.0.0.1:59468
+00-00-53 INFO     | Stormancer | Party | Party joined (343566)
+00-00-53 INFO     | Stormancer | Party State | Not ready
+00-00-53 INFO     | Stormancer | PID 316|2026-06-03T01:28:41|Info |authentication| Got token for service type 'stormancer.plugins.gamefinder' and name 'matchmaking'
+
+00-00-53 INFO     | Stormancer | PID 316|2026-06-03T01:28:41|Info |authentication| Retrieved scene connection token for service type 'stormancer.plugins.gamefinder' and name 'matchmaking'
+
+00-00-53 INFO     | Stormancer | PID 316|2026-06-03T01:28:41|Info |Client| Get private scene [scene:/passtech-live/darktales/live-1-05-00/matchmaking]
+
+00-00-54 INFO     | Stormancer | PID 316|2026-06-03T01:28:42|Info |client| Connecting to scene [scene:/passtech-live/darktales/live-1-05-00/matchmaking]
+
+00-00-54 INFO     | Stormancer | PID 316|2026-06-03T01:28:42|Info |client| Connected to scene. [scene:/passtech-live/darktales/live-1-05-00/matchmaking]
+
+00-00-58 INFO     | Stormancer | Party State | Disconnected

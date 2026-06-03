@@ -71,6 +71,37 @@ class CaptureAddon:
         self.logpath = os.environ.get("MITM_LOG", "mitm_http.jsonl")
         self.real_dns = os.environ.get("MITM_REAL_DNS", "").strip()
         self.real_port = int(os.environ.get("MITM_REAL_PORT", "443"))
+        # Offline override: force EVERY flow to one upstream "ip:port" (the local
+        # server.py), bypassing all host-header parsing / DNS. Set by
+        # capture_mitm.sh MODE=offline so traffic can never leak to the real
+        # backend even if a Host header doesn't match the hostmap.
+        self.force_upstream = None
+        fu = os.environ.get("MITM_FORCE_UPSTREAM", "").strip()
+        if fu:
+            fip, _, fport = fu.partition(":")
+            self.force_upstream = (fip, int(fport) if fport else self.real_port)
+        # Forward-proxy (regular mode) selective redirect: only the hosts listed
+        # in MITM_LOCAL_HOSTS are retargeted to the local backend (server.py);
+        # every OTHER host is forwarded to its real destination, which mitmproxy
+        # resolves itself from the CONNECT host. This is the Burp/Fiddler model:
+        # the game is configured to use us as its HTTPS proxy, we decrypt all of
+        # it, and only the emulated Stormancer hosts are pointed at server.py.
+        self.local_backend = None
+        lb = os.environ.get("MITM_LOCAL_BACKEND", "").strip()
+        if lb:
+            lip, _, lport = lb.partition(":")
+            self.local_backend = (lip, int(lport) if lport else self.real_port)
+        self.local_hosts = {h.strip() for h in
+                            os.environ.get("MITM_LOCAL_HOSTS", "").split(",") if h.strip()}
+        # In offline forward-proxy mode the game frequently connects to a loopback
+        # IP literal (a stale Stormancer scene endpoint, e.g. 127.1.33.7) instead
+        # of the hostname. When MITM_LOCAL_LOOPBACK is set, treat ANY 127.0.0.0/8
+        # destination as the emulated backend and redirect it to local_backend.
+        self.local_loopback = os.environ.get("MITM_LOCAL_LOOPBACK", "").strip() in ("1", "true", "yes")
+        # Legacy reverse-online behavior: re-resolve the real upstream IP for
+        # every flow (needed only when DNS was poisoned). In forward mode this is
+        # OFF — mitmproxy connects to the real host on its own.
+        self.retarget_real = os.environ.get("MITM_RETARGET_REAL", "").strip() in ("1", "true", "yes")
         self.hostmap = {}
         for pair in os.environ.get("MITM_HOSTMAP", "").split(","):
             if "=" in pair:
@@ -87,6 +118,10 @@ class CaptureAddon:
         with self._lock:
             self._fp.write(line)
             self._fp.flush()
+
+    @staticmethod
+    def _is_loopback(h):
+        return bool(h) and (h == "localhost" or h.startswith("127."))
 
     def _resolve_real(self, host):
         if not host:
@@ -114,7 +149,8 @@ class CaptureAddon:
     # -- mitmproxy hooks -------------------------------------------------
     def load(self, loader):
         ctx.log.info(f"[capture-addon] log={self.logpath} real_dns={self.real_dns or '(system)'} "
-                     f"hostmap={self.hostmap or '{}'}")
+                     f"hostmap={self.hostmap or '{}'} local_backend={self.local_backend} "
+                     f"local_hosts={self.local_hosts or '{}'} local_loopback={self.local_loopback}")
 
     def tls_clienthello(self, data: tls.ClientHelloData):
         """If a previous handshake to this host failed, tunnel raw bytes through."""
@@ -143,13 +179,57 @@ class CaptureAddon:
         host = flow.request.host_header or flow.request.pretty_host or flow.request.host
         if host and ":" in host:
             host = host.split(":")[0]
-        ip = self._resolve_real(host)
-        if ip:
+        # The CONNECT target the client asked for (set before we override it).
+        # For an HTTPS tunnel this is the host/IP from the CONNECT line, which is
+        # the reliable signal when the game uses a loopback IP literal.
+        conn_host = None
+        try:
+            if flow.server_conn.address:
+                conn_host = flow.server_conn.address[0]
+        except Exception:
+            conn_host = None
+        # The TLS SNI the client sent (real hostname even when CONNECT used an IP).
+        sni = getattr(flow.client_conn, "sni", None)
+        if self.force_upstream:
+            # Legacy reverse/offline: pin everything to the local server.py.
             try:
-                flow.server_conn.address = (ip, self.real_port)
+                flow.server_conn.address = self.force_upstream
                 flow.server_conn.sni = host
             except Exception as e:
-                ctx.log.warn(f"[capture-addon] retarget failed for {host}: {e!r}")
+                ctx.log.warn(f"[capture-addon] force-upstream failed for {host}: {e!r}")
+            return
+        if self.local_backend and (
+                host in self.local_hosts or sni in self.local_hosts
+                or (self.local_loopback and (self._is_loopback(host) or self._is_loopback(conn_host)))):
+            # Forward proxy: the emulated Stormancer endpoints (hostname or a
+            # loopback IP) go to server.py; everything else is left for mitmproxy
+            # to reach at its real address. For a CONNECT tunnel the upstream is
+            # pinned at CONNECT time, so overriding flow.server_conn.address in the
+            # request hook is too late — rewrite the request target (host/port)
+            # instead, which mitmproxy honors for the (lazy) upstream connection.
+            orig = sni or host or conn_host
+            try:
+                if orig:
+                    flow.request.host_header = orig    # preserve real Host for server.py + logging
+                flow.request.host = self.local_backend[0]
+                flow.request.port = self.local_backend[1]
+                flow.server_conn.sni = orig if (orig and not self._is_loopback(orig)) else \
+                    (next(iter(self.local_hosts), None) or orig)
+                ctx.log.info(f"[capture-addon] local-redirect {orig} -> {self.local_backend}")
+            except Exception as e:
+                ctx.log.warn(f"[capture-addon] local-redirect failed for {orig}: {e!r}")
+            return
+        if self.retarget_real:
+            ip = self._resolve_real(host)
+            if ip:
+                try:
+                    flow.server_conn.address = (ip, self.real_port)
+                    flow.server_conn.sni = host
+                except Exception as e:
+                    ctx.log.warn(f"[capture-addon] retarget failed for {host}: {e!r}")
+            return
+        # Forward/regular mode (default): let mitmproxy connect to the real host
+        # parsed from the CONNECT request — no override needed.
 
     def response(self, flow: http.HTTPFlow):
         cc = flow.client_conn
@@ -161,13 +241,18 @@ class CaptureAddon:
             server_ip = flow.server_conn.peername[0] if flow.server_conn.peername else flow.request.host
         except Exception:
             server_ip = flow.request.host
+        # actual upstream port we connected to (force_upstream/offline aware)
+        try:
+            server_port = flow.server_conn.peername[1] if flow.server_conn.peername else self.real_port
+        except Exception:
+            server_port = self.real_port
         req_body = flow.request.raw_content or b""
         resp_body = flow.response.raw_content or b"" if flow.response else b""
         self._emit({
             "t": (flow.response.timestamp_end if flow.response else time.time()),
             "kind": "http",
             "client_ip": peer[0], "client_port": peer[1],
-            "server_ip": server_ip, "server_port": self.real_port,
+            "server_ip": server_ip, "server_port": server_port,
             "sni": sni, "host": host,
             "method": flow.request.method, "path": flow.request.path,
             "status": flow.response.status_code if flow.response else None,
