@@ -131,9 +131,12 @@ def build_connection_data(scene_id: str = REAL_SCENE_ID,
 # ON the token parses and RakNet connects. So encryption stays ON.
 ENABLE_ENCRYPTION = True
 
-# Where the game should send RakNet UDP. The game pins this hostname to
-# 127.0.0.1 via partydeck's /etc/hosts, so it reaches our local RakNet server.
-RAKNET_ENDPOINT = "dt-live.passtechgames.com:30100"
+# Where the game should send RakNet UDP. Legacy flows pin this hostname to
+# 127.0.0.1 via partydeck's /etc/hosts (host_aliases) so it reaches our local
+# RakNet server. The winhttp_shim refactor retires /etc/hosts, so set
+# RAKNET_ENDPOINT=127.0.0.1:30100 in the environment to embed the loopback
+# address straight into the token envelope — no DNS pin needed.
+RAKNET_ENDPOINT = os.environ.get("RAKNET_ENDPOINT", "dt-live.passtechgames.com:30100")
 
 LAST_ENCRYPTION = {}  # token-id (b64) -> raw 32-byte key, for Phase B lookup
 

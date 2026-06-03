@@ -1,0 +1,17 @@
+WinHttpAddRequestHeaders
+WinHttpCloseHandle
+WinHttpConnect
+WinHttpGetProxyForUrl
+WinHttpOpen
+WinHttpOpenRequest
+WinHttpQueryAuthSchemes
+WinHttpQueryDataAvailable
+WinHttpQueryHeaders
+WinHttpReadData
+WinHttpReceiveResponse
+WinHttpSendRequest
+WinHttpSetCredentials
+WinHttpSetOption
+WinHttpSetStatusCallback
+WinHttpSetTimeouts
+WinHttpWriteData
