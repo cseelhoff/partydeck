@@ -154,6 +154,7 @@ class Party:
         self.steam_lobby_id = None       # int | None
         self.in_merger = False           # a member has polled GetMergerStatus
         self.join_lobby_sent = False     # Steam.JoinLobby already pushed (joiner)
+        self.lobby_joinable_sent = False # Steam.UpdateLobbyJoinable pushed (survivor)
 
     def add_member(self, conn):
         if conn not in self.members:
@@ -584,6 +585,21 @@ def mp_map(pairs) -> bytes:
     return hdr + b"".join(k + v for k, v in pairs)
 
 
+def mp_timestamp(when=None) -> bytes:
+    """Encode a MessagePack timestamp (the reserved ext type -1, i.e. 0xFF) in
+    the 8-byte timestamp64 layout: high 30 bits = nanoseconds, low 34 bits =
+    seconds, as a big-endian uint64 inside a fixext8 (0xD7). Confirmed BYTE-shape
+    from the real match-found gamefinder.update push, whose fixext255 value
+    decoded to the capture's wall-clock time -- it is the gamesession creation
+    timestamp."""
+    if when is None:
+        when = time.time()
+    secs = int(when)
+    nanos = int((when - secs) * 1_000_000_000) & 0x3FFFFFFF
+    v = (nanos << 34) | (secs & 0x3FFFFFFFF)
+    return b"\xd7\xff" + struct.pack(">Q", v)
+
+
 # Stormancer RPC reserved-route handles, as assigned by the CLIENT in its
 # CONNECT_TO_SCENE "Routes" list (confirmed in relay capture):
 #   stormancer.rpc.completed -> 1, stormancer.rpc.next -> 2.
@@ -818,13 +834,26 @@ def build_settings_array(party):
        isJoinable(True), serverData{}, '', partyId(bare guid)]
     `settingsRev` tracked the party version minus 2 in every captured sample
     (settingsUpdated v3->1, v5->3, v7->5, v9->7)."""
+    # Once a match is found the real backend flips the party to its in-session
+    # state: isJoinable -> False and serverData carries the party status +
+    # gamesession guid (byte-exact from the 2-peer capture). Before a match the
+    # party is joinable with an empty serverData map.
+    if party.gs_guid is not None:
+        joinable = MP_FALSE
+        server_data = mp_map([
+            (mp_str("stormancer.partyStatus"), mp_str("gamesession")),
+            (mp_str("stormancer.partyStatus.details"), mp_str(party.gs_guid)),
+        ])
+    else:
+        joinable = MP_TRUE
+        server_data = MP_EMPTY_MAP
     return mp_array([
         mp_str("matchmaking"),               # gameFinderName
         mp_str(party.custom_data),           # customData JSON (client-set)
         mp_uint(max(1, party.version - 2)),  # settings revision
         MP_FALSE,                            # onlyLeaderCanInvite
-        MP_TRUE,                             # isJoinable
-        MP_EMPTY_MAP,                        # public server data
+        joinable,                            # isJoinable
+        server_data,                         # public server data
         mp_str(""),                          #
         mp_str(party.guid),                  # partyId (bare guid)
     ])
@@ -1005,6 +1034,27 @@ def send_steam_joinlobby(sock, conn, binding, lobby_id):
         f"lobby={lobby_id} -> {conn.user_id[:8]} (merge)")
 
 
+def send_steam_updatelobbyjoinable(sock, conn, binding, lobby_id, joinable):
+    """Server-initiated RPC telling the SURVIVOR's leader to flip its platform
+    lobby's joinable flag during the merge. Route Steam.UpdateLobbyJoinable, args
+    byte-exact from the 2-peer relay capture: [lobbyId(uint64), joinable(bool)]
+    (a 2-element array). The captured value was joinable=False -- the merger
+    closes the survivor lobby to further matchmaking once a joiner has been
+    pointed at it."""
+    sr = binding.sr
+    route = sr.client_recv.get("Steam.UpdateLobbyJoinable")
+    if route is None:
+        log("  !! Steam.UpdateLobbyJoinable route not found in party scene")
+        return
+    req = binding.srv_rpc_id
+    binding.srv_rpc_id += 1
+    args = mp_array([mp_uint(lobby_id or 0),
+                     MP_TRUE if joinable else MP_FALSE])
+    send_scene_msg(sock, conn, sr.handle, route, struct.pack("<H", req) + args)
+    log(f"  <- Steam.UpdateLobbyJoinable (server RPC) reqId={req} route={route} "
+        f"lobby={lobby_id} joinable={joinable} -> {conn.user_id[:8]} (merge)")
+
+
 def _try_party_merge(sock, conn):
     """DtPartyMergerAlgorithm local 2-party merge. Mark conn's party as pooled in
     the merger and, once >=2 distinct parties are pooled, merge: survivor =
@@ -1027,6 +1077,16 @@ def _try_party_merge(sock, conn):
         return
     party.join_lobby_sent = True
     send_steam_joinlobby(sock, conn, binding, survivor.steam_lobby_id)
+    # Mirror the capture: once a joiner is pointed at the survivor's lobby, the
+    # merger tells the survivor's leader to mark that lobby not-joinable (closed
+    # to further matchmaking). Fire once per merge.
+    if not survivor.lobby_joinable_sent and survivor.members:
+        leader = survivor.members[0]
+        lb = leader.binding_for("party", survivor.guid)
+        if lb is not None:
+            survivor.lobby_joinable_sent = True
+            send_steam_updatelobbyjoinable(sock, leader, lb,
+                                           survivor.steam_lobby_id, False)
 
 
 def on_member_lobby_ready(sock, conn, party):
@@ -1071,6 +1131,52 @@ def mint_scene_token(scene_id):
     }, separators=(",", ":"))
 
 
+def build_gamefinder_match(gs, party, token):
+    """Build the match-found gamefinder.update value, byte-structure-exact from a
+    2-peer relay capture (matchmaking/gamefinder.update, status 3):
+        [ 3, tokenStr, gsInfo ]
+    where gsInfo =
+        [ gsGuid, {}, [ [ "0", [ [          # one bucket, difficulty "0"
+            partyGuid,
+            { memberGuid: [userdataBin, sessionId16, memberGuid, nil], ... },
+            partyCustomDataJson,
+            <msgpack timestamp = gs creation time>,
+            0,
+            leaderMemberGuid,
+            nil
+        ] ] ] ] ]
+    Every per-member field (guid, userdata, sessionId) is the SAME value the
+    party.memberConnected member carries -- differenced against both real peers."""
+    members = []
+    for m in party.members:
+        ud = m.party_userdata or b"{}"
+        if m.party_session_id is None:
+            m.party_session_id = os.urandom(16)
+        members.append((mp_str(m.user_id), mp_array([
+            mp_bin(ud), mp_bin(m.party_session_id), mp_str(m.user_id), MP_NIL,
+        ])))
+    bucket_entry = mp_array([
+        mp_str(party.guid),                       # survivor party guid
+        mp_map(members),                          # members keyed by guid
+        mp_str(party.custom_data or "{}"),        # party customData JSON
+        mp_timestamp(),                           # gamesession creation time
+        mp_uint(0),
+        mp_str(party.leader_user_id),             # leader member guid
+        MP_NIL,
+    ])
+    gs_info = mp_array([
+        mp_str(gs.guid),                          # gamesession guid
+        MP_EMPTY_MAP,
+        mp_array([mp_array([
+            mp_str("0"),                          # difficulty bucket
+            mp_array([bucket_entry]),
+        ])]),
+    ])
+    # The body is three CONCATENATED top-level msgpack values (status, token,
+    # gsInfo) -- NOT a wrapping array -- matching the captured wire bytes.
+    return mp_uint(3) + mp_str(token) + gs_info
+
+
 def maybe_start_game(sock, party):
     """If every member of the party has readied up to play, create one shared
     GameSession and push gamefinder.update (carrying the gamesession token) to
@@ -1084,7 +1190,6 @@ def maybe_start_game(sock, party):
     gs = GameSession(guid, party)
     GAMESESSIONS[guid] = gs
     party.gs_guid = guid
-    token = mint_scene_token(gs.scene_id)
     log(f"  ** MATCH: party={party.guid} members={len(party.members)} -> "
         f"GameSession {guid}")
     for m in party.members:
@@ -1094,10 +1199,17 @@ def maybe_start_game(sock, party):
                 f"cannot deliver gamefinder.update")
             continue
         route = mb.sr.client_recv.get("gamefinder.update")
-        value = mp_array([mp_uint(3), mp_str(token)])
+        token = mint_scene_token(gs.scene_id)  # per-member connection token
+        value = build_gamefinder_match(gs, party, token)
         send_scene_msg(sock, m, mb.sr.handle, route, value)
-        log(f"  <- gamefinder.update to {m.user_id[:8]} route={route} "
-            f"(GameSession token, {len(token)}B json)")
+        log(f"  <- gamefinder.update (MATCH) to {m.user_id[:8]} route={route} "
+            f"({len(value)}B; gs={guid[:8]})")
+    # The real backend, on match, also pushes party.settingsUpdated flipping the
+    # party to its in-gamesession state: isJoinable -> False and serverData
+    # carrying stormancer.partyStatus="gamesession" + the gamesession guid
+    # (byte-exact from the 2-peer capture). Mirror it so the party UI/reducer
+    # tracks the transition.
+    broadcast_settings_updated(sock, party)
 
 
 
@@ -1522,7 +1634,8 @@ def handle_system_request(sock, conn, payload):
                     f"falling back to authenticator")
             handle = scenes.scene_handle(blob)
             sr = scenes.routes_for_handle(handle)
-            conn.scene_bindings[handle] = SceneBinding("static", scene_id, sr)
+            conn.scene_bindings[handle] = SceneBinding("static", scene_id, sr,
+                                                       scene_id)
         elif kind == "party":
             handle = conn.alloc_handle()
             infos = scenes.party_infos(key)
@@ -2073,52 +2186,44 @@ class _RelayAssert:
         return vals
 
     def _skel_or_binary(self, raw, vals=None):
-        """Identity-masked skeleton of a msgpack payload, or "<binary:N>" when the
-        bytes are not cleanly decodable msgpack. Many RakNet system payloads
-        (ping/clock = 16 bytes) are raw binary whose first byte can land in the
-        msgpack fixmap range (0x80..0x8f); decoding those yields a spurious ERR
-        sentinel that differs per side. Treating any payload whose decode hits an
-        ERR (or which lacks a msgpack marker) as binary keeps the two sides
-        aligned and avoids false DIFFs."""
+        """Render a payload as FULL LITERAL content -- nothing masked, nothing
+        summarized. Strings are shown verbatim, binary as hex, ints/floats/bools
+        as themselves. This is the ground-truth representation used for both the
+        diff comparison AND the human-readable assert log, so every byte the real
+        server emits (and every byte the emulator predicts) is visible and can be
+        reproduced. When the bytes do not cleanly decode as msgpack, the entire
+        payload is emitted as a hex string so it is still fully printable."""
         if not self._decodable(raw):
-            return "<binary:%d>" % len(raw)
+            return {"hex": raw.hex(), "len": len(raw)}
         if vals is None:
             vals = self.jd.mp_all(raw)
         if any(isinstance(v, (tuple, list)) and v and v[0] == "ERR" for v in vals):
-            return "<binary:%d>" % len(raw)
-        # The 16-byte connected-clock (ID_PING) response is two int64 timestamps;
-        # it is never structured msgpack but can tile as an int-keyed map/array on
-        # one side and stay binary on the other. No genuine structured RESP is
-        # exactly 16 bytes, so treat that length as binary outright.
-        if len(raw) == 16:
-            return "<binary:%d>" % len(raw)
-        # A real structured Stormancer payload always carries at least one string
-        # or map (route names, ids, metadata keys). A decode that is purely ints
-        # / nested int-arrays is a raw binary blob -- the 16-byte connected-clock
-        # (ID_PING) response is the classic case: it tiles cleanly as msgpack on
-        # whichever side's first byte lands on an array marker but is plain
-        # binary on the other, producing a phantom diff. Treat text-free decodes
-        # as binary so both sides agree.
-        if not self._has_text(vals):
-            return "<binary:%d>" % len(raw)
-        return [self.jd.skel(v) for v in vals]
+            return {"hex": raw.hex(), "len": len(raw)}
+        return [self._literal(v) for v in vals]
 
-    @staticmethod
-    def _has_text(v):
-        """True if the decoded msgpack value (or list of values) contains any
-        string or map anywhere -- the signature of a genuine structured payload
-        as opposed to a raw numeric blob (clock/ping/handshake bytes)."""
-        if isinstance(v, list):
-            return any(_RelayAssert._has_text(x) for x in v)
+    @classmethod
+    def _literal(cls, v):
+        """Convert a join_diff tagged msgpack value into a fully literal,
+        JSON-serializable form with NO masking: real strings verbatim, binary and
+        ext payloads as hex, scalars as themselves."""
         if isinstance(v, tuple):
             tag = v[0]
             if tag == "str":
-                return True
-            if tag == "map":
-                return True
+                return v[1]
             if tag == "arr":
-                return any(_RelayAssert._has_text(x) for x in v[1])
-        return False
+                return [cls._literal(x) for x in v[1]]
+            if tag == "map":
+                return {k: cls._literal(val) for k, val in v[1].items()}
+            if tag == "bin":
+                return {"bin_hex": v[1].hex(), "len": len(v[1])}
+            if tag in ("f32", "f64"):
+                return v[1]
+            if tag in ("ext", "fixext"):
+                return {"ext": v[1], "hex": v[2].hex()}
+            if tag == "ERR":
+                return {"ERR": v[1], "hex": v[2]}
+            return [cls._literal(x) for x in v]
+        return v
 
     def feed(self, side, datagram):
         """Decode one s2c datagram (real or predicted) and compare as keys land
@@ -2210,9 +2315,16 @@ def _relay_assert_write(rec):
     _relay_assert_fh.write(json.dumps(rec, default=str) + "\n")
 
 
-def _relay_shadow_predict(eng, data, caddr):
+def _relay_shadow_predict(eng, data, caddr, feed=True):
     """Run the emulator against one real c2s datagram and feed its would-be
-    replies into the assert engine as the PREDICTION."""
+    replies into the assert engine as the PREDICTION.
+
+    When `feed` is True (default, used by relay_main) the shadow's output
+    datagrams are routed into the destination engine via feed("pred", ...).
+    When `feed` is False the routing is skipped and the raw shadow output is
+    returned untouched, so an external caller (e.g. sync-raknet.py) can capture
+    the predicted datagrams itself. Always returns the list of (addr, bytes)
+    the shadow emitted."""
     shadow = _ShadowSock()
     try:
         mid = data[0]
@@ -2260,10 +2372,12 @@ def _relay_shadow_predict(eng, data, caddr):
                     own.add_member(conn)
                 log(f"  [assert {eng.label}] adopt real party guid "
                     f"{b.ref} <- shadow {old_guid}")
-    for dg in shadow.out:
-        addr, data_out = dg
-        target = _RELAY_ENGINES.get(addr, eng)
-        target.feed("pred", data_out)
+    if feed:
+        for dg in shadow.out:
+            addr, data_out = dg
+            target = _RELAY_ENGINES.get(addr, eng)
+            target.feed("pred", data_out)
+    return shadow.out
 
 
 def relay_main():
