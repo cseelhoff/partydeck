@@ -21,7 +21,7 @@
 #include "eos_sdk/eos_p2p.h"
 
 // ---- real DLL access ---------------------------------------------------------
-// Handle to the renamed genuine SDK (EOSSDK-Win64-Shipping.orig.dll).
+// Handle to the renamed genuine SDK (EOSSDK-Win64-Shipping-pointed-to-by-shim.dll).
 void* shim_real_module();
 
 // Resolve a symbol from the real SDK (cached by the caller via REAL()).

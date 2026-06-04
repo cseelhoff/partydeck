@@ -3,6 +3,9 @@
 LIBRARY winhttp
 EXPORTS
     DllCanUnloadNow = winhttp_real.DllCanUnloadNow
+    DllGetClassObject = winhttp_real.DllGetClassObject
+    DllRegisterServer = winhttp_real.DllRegisterServer
+    DllUnregisterServer = winhttp_real.DllUnregisterServer
     WinHttpAddRequestHeaders
     WinHttpCheckPlatform = winhttp_real.WinHttpCheckPlatform
     WinHttpCloseHandle

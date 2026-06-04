@@ -16,7 +16,7 @@
 // (hyphen, not '.orig') so PE forwarders in eos_shim.def resolve correctly --
 // the loader would otherwise treat '.orig' as an extension and fail to append
 // '.dll', crashing the process at load time.
-static const wchar_t* kRealDllName = L"EOSSDK-Win64-Shipping-orig.dll";
+static const wchar_t* kRealDllName = L"EOSSDK-Win64-Shipping-pointed-to-by-shim.dll";
 
 static std::atomic<void*> g_real{nullptr};
 static std::mutex g_log_mtx;
@@ -36,7 +36,7 @@ static void load_real() {
                  "\"msg\":\"failed to load real EOS SDK\",\"gle\":" +
                      std::to_string(GetLastError()));
     } else {
-        shim_log("shim_loaded_real", "\"dll\":\"EOSSDK-Win64-Shipping-orig.dll\"");
+        shim_log("shim_loaded_real", "\"dll\":\"EOSSDK-Win64-Shipping-pointed-to-by-shim.dll\"");
     }
 }
 

@@ -1891,7 +1891,15 @@ RELAY_ASSERT_FILE = os.environ.get(
 
 _RPC_STREAM_ROUTES = ("stormancer.rpc.next", "stormancer.rpc.completed",
                       "stormancer.rpc.error", "stormancer.rpc.cancel")
-_MP_MAP_MARKERS = set(range(0x80, 0x90)) | {0xde, 0xdf}
+# Leading bytes that begin a top-level msgpack CONTAINER or STRING -- the only
+# shapes a Stormancer rpc/RESP payload ever carries. Bare scalars, bin and ext
+# are excluded so 16-byte clock/ping blobs (raw binary) are not mistaken for
+# msgpack. Covers fixmap/fixarray/fixstr (0x80..0xbf), str8/16/32, array16/32,
+# and map16/32.
+_MP_LEAD = (set(range(0x80, 0xc0))
+            | {0xd9, 0xda, 0xdb}      # str8/16/32
+            | {0xdc, 0xdd}            # array16/32
+            | {0xde, 0xdf})           # map16/32
 
 
 def _rd_u16le(b, i):
@@ -1911,6 +1919,10 @@ def _kind_of_routes(names):
     if any("amefinder" in n or "atchmak" in n or "Merger" in n
            or n.startswith("gf.") for n in s):
         return "matchmaking"
+    # Gamesession scenes never carry "gamesession" in a route name; they are
+    # identified by their gameplay routes (player presence + the dt p2p relay).
+    if "dt.p2p" in s or "players.allReady" in s or "player.update" in s:
+        return "gamesession"
     if any("amesession" in n or "GameSession" in n for n in s):
         return "gamesession"
     return "scene?"
@@ -1952,7 +1964,25 @@ class _RelayAssert:
 
     @staticmethod
     def _is_mp(raw):
-        return bool(raw) and raw[0] in _MP_MAP_MARKERS
+        return bool(raw) and raw[0] in _MP_LEAD
+
+    def _decodable(self, raw):
+        """True iff `raw` is cleanly-tiled msgpack: it begins with a container
+        or string marker and every byte decodes with no leftover and no ERR.
+        Full-consumption is what keeps a stray 16-byte clock/ping blob (whose
+        first byte may coincidentally land on a str/array marker) from being
+        mistaken for structured msgpack -- such blobs raise or leave a tail."""
+        if not self._is_mp(raw):
+            return False
+        try:
+            i, n = 0, len(raw)
+            while i < n:
+                v, i = self.jd.mp(raw, i)
+                if isinstance(v, (tuple, list)) and v and v[0] == "ERR":
+                    return False
+            return i == n
+        except Exception:
+            return False
 
     def _learn_routes(self, side, vals):
         """A scene-connect response carries {SceneHandle, RouteMappings}; record
@@ -2016,6 +2046,14 @@ class _RelayAssert:
             h = mid
             rh = _rd_u16le(payload, 1)
             body = payload[3:]
+            # A real scene data message's id byte IS a SceneHandle learned from
+            # an earlier connect result. If this side never learned `h`, the
+            # bytes are a misframed control/online message (or a fragment tail)
+            # that merely happens to land in the scene-handle range -- decoding
+            # it yields junk keys like ('SCN','scene?','r#28416'). Skip those so
+            # they don't masquerade as phantom one-sided diffs.
+            if h not in self.h2r[side]:
+                return None, None
             kind = self.h2k[side].get(h, "scene?")
             rname = self.h2r[side].get(h, {}).get(rh, "r#%d" % rh)
             if rname in _RPC_STREAM_ROUTES and len(body) >= 2:
@@ -2042,13 +2080,45 @@ class _RelayAssert:
         sentinel that differs per side. Treating any payload whose decode hits an
         ERR (or which lacks a msgpack marker) as binary keeps the two sides
         aligned and avoids false DIFFs."""
-        if not self._is_mp(raw):
+        if not self._decodable(raw):
             return "<binary:%d>" % len(raw)
         if vals is None:
             vals = self.jd.mp_all(raw)
         if any(isinstance(v, (tuple, list)) and v and v[0] == "ERR" for v in vals):
             return "<binary:%d>" % len(raw)
+        # The 16-byte connected-clock (ID_PING) response is two int64 timestamps;
+        # it is never structured msgpack but can tile as an int-keyed map/array on
+        # one side and stay binary on the other. No genuine structured RESP is
+        # exactly 16 bytes, so treat that length as binary outright.
+        if len(raw) == 16:
+            return "<binary:%d>" % len(raw)
+        # A real structured Stormancer payload always carries at least one string
+        # or map (route names, ids, metadata keys). A decode that is purely ints
+        # / nested int-arrays is a raw binary blob -- the 16-byte connected-clock
+        # (ID_PING) response is the classic case: it tiles cleanly as msgpack on
+        # whichever side's first byte lands on an array marker but is plain
+        # binary on the other, producing a phantom diff. Treat text-free decodes
+        # as binary so both sides agree.
+        if not self._has_text(vals):
+            return "<binary:%d>" % len(raw)
         return [self.jd.skel(v) for v in vals]
+
+    @staticmethod
+    def _has_text(v):
+        """True if the decoded msgpack value (or list of values) contains any
+        string or map anywhere -- the signature of a genuine structured payload
+        as opposed to a raw numeric blob (clock/ping/handshake bytes)."""
+        if isinstance(v, list):
+            return any(_RelayAssert._has_text(x) for x in v)
+        if isinstance(v, tuple):
+            tag = v[0]
+            if tag == "str":
+                return True
+            if tag == "map":
+                return True
+            if tag == "arr":
+                return any(_RelayAssert._has_text(x) for x in v[1])
+        return False
 
     def feed(self, side, datagram):
         """Decode one s2c datagram (real or predicted) and compare as keys land

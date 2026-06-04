@@ -131,12 +131,18 @@ def build_connection_data(scene_id: str = REAL_SCENE_ID,
 # ON the token parses and RakNet connects. So encryption stays ON.
 ENABLE_ENCRYPTION = True
 
-# Where the game should send RakNet UDP. Legacy flows pin this hostname to
-# 127.0.0.1 via partydeck's /etc/hosts (host_aliases) so it reaches our local
-# RakNet server. The winhttp_shim refactor retires /etc/hosts, so set
-# RAKNET_ENDPOINT=127.0.0.1:30100 in the environment to embed the loopback
-# address straight into the token envelope — no DNS pin needed.
-RAKNET_ENDPOINT = os.environ.get("RAKNET_ENDPOINT", "dt-live.passtechgames.com:30100")
+# Where the game should send RakNet UDP. Each game instance talks to ITS OWN
+# local broker (raknet.py) over loopback, so the offline default is
+# 127.0.0.1:30100 — embedding the loopback address straight into the token means
+# pure-emulator mode works with NO env var and NO DNS pin (the winhttp_shim
+# refactor retired /etc/hosts host_aliases). Override RAKNET_ENDPOINT only for
+# special topologies (e.g. a broker on another host). NOTE: this default was
+# previously the REAL hostname dt-live.passtechgames.com:30100, which silently
+# broke pure mode: the bootstrap auth token (dtlive_server) AND the gamesession
+# token (raknet.mint_scene_token) both pointed the client at the real cluster
+# instead of the local broker, so offline UDP never reached raknet.py. Relay mode
+# is unaffected (dtlive_server rewrites the endpoint to RELAY_LOCAL_RAKNET).
+RAKNET_ENDPOINT = os.environ.get("RAKNET_ENDPOINT", "127.0.0.1:30100")
 
 LAST_ENCRYPTION = {}  # token-id (b64) -> raw 32-byte key, for Phase B lookup
 

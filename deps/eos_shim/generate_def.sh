@@ -2,7 +2,7 @@
 # Generate eos_shim.def for the EOS proxy/shim DLL.
 #
 # The shim ships AS  EOSSDK-Win64-Shipping.dll  next to the game, and the genuine
-# Epic SDK is renamed to  EOSSDK-Win64-Shipping.orig.dll  (REAL_DLL below).
+# Epic SDK is copied to  EOSSDK-Win64-Shipping-pointed-to-by-shim.dll  (REAL_DLL below).
 #
 # Every symbol the game imports must be exported by the shim or the game won't
 # load. Functions we intercept (HOOKED) are exported from our own object code;
@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 IMPORTS="game_imports.txt"          # the 82 names the game's IAT binds
-REAL_DLL="EOSSDK-Win64-Shipping-orig"  # forward target module (no .dll suffix)
+REAL_DLL="EOSSDK-Win64-Shipping-pointed-to-by-shim"  # forward target module (no .dll suffix)
 # NOTE: must be DOT-FREE. The loader splits a forwarder string on the LAST '.'
 # to separate module from function, then appends '.dll' ONLY if the module name
 # has no extension. A name like 'EOSSDK-Win64-Shipping.orig' looks like it
@@ -33,6 +33,10 @@ EOS_LobbySearch_SetLobbyId
 EOS_LobbySearch_Find
 EOS_P2P_AddNotifyPeerConnectionClosed
 EOS_P2P_AddNotifyPeerConnectionRequest
+EOS_P2P_SendPacket
+EOS_P2P_ReceivePacket
+EOS_P2P_AcceptConnection
+EOS_P2P_CloseConnection
 EOS_Initialize
 EOS_Shutdown
 EOF

@@ -41,6 +41,34 @@ static const char* member_status_str(EOS_ELobbyMemberStatus s) {
     }
 }
 
+static const char* reliability_str(EOS_EPacketReliability r) {
+    switch (r) {
+        case EOS_EPacketReliability::EOS_PR_UnreliableUnordered: return "UU";
+        case EOS_EPacketReliability::EOS_PR_ReliableUnordered: return "RU";
+        case EOS_EPacketReliability::EOS_PR_ReliableOrdered: return "RO";
+        default: return "?";
+    }
+}
+
+// Hex-encode up to `cap` bytes of a buffer as a JSON string (with quotes). The
+// cap keeps the per-packet log line bounded while still exposing the message
+// header/opcode bytes needed to reverse the P2P wire protocol.
+static std::string shim_hex(const void* data, uint32_t len, uint32_t cap = 64) {
+    static const char H[] = "0123456789abcdef";
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    std::string s;
+    if (!p) return std::string("null");
+    uint32_t n = (len < cap) ? len : cap;
+    s.reserve(static_cast<size_t>(n) * 2 + 2);
+    s.push_back('"');
+    for (uint32_t i = 0; i < n; ++i) {
+        s.push_back(H[p[i] >> 4]);
+        s.push_back(H[p[i] & 0x0f]);
+    }
+    s.push_back('"');
+    return s;
+}
+
 // =====================================================================
 //  Connect
 // =====================================================================
@@ -334,6 +362,85 @@ EOS_P2P_AddNotifyPeerConnectionClosed(
         new OneShotCtx{reinterpret_cast<void*>(ConnectionClosedHandler), ClientData};
     return REAL(EOS_P2P_AddNotifyPeerConnectionClosed)(Handle, Options, ctx,
                                                       on_p2p_closed);
+}
+
+// =====================================================================
+//  P2P data plane (SendPacket / ReceivePacket / Accept / Close)
+// =====================================================================
+// These are synchronous forwarded-then-logged calls -- the genuine SDK does NOT
+// invoke a delegate, so we log inline. This is the wire data plane the emu must
+// reproduce byte-for-byte; we capture peer/socket/channel/reliability/length and
+// a capped hex prefix of every packet. ReceivePacket is logged ONLY on Success
+// to avoid flooding the log with the game's per-frame idle-poll misses.
+static unsigned long long g_send_seq = 0;
+static unsigned long long g_recv_seq = 0;
+
+EOS_DECLARE_FUNC(EOS_EResult)
+EOS_P2P_SendPacket(EOS_HP2P Handle, const EOS_P2P_SendPacketOptions* Options) {
+    if (Options) {
+        const char* sock =
+            (Options->SocketId ? Options->SocketId->SocketName : nullptr);
+        shim_log("call:EOS_P2P_SendPacket",
+                 "\"seq\":" + std::to_string(g_send_seq++) + ",\"local\":" +
+                     shim_puid(Options->LocalUserId) + ",\"remote\":" +
+                     shim_puid(Options->RemoteUserId) + ",\"socket\":" +
+                     shim_jstr(sock) + ",\"channel\":" +
+                     std::to_string(static_cast<int>(Options->Channel)) +
+                     ",\"rel\":\"" + reliability_str(Options->Reliability) +
+                     "\",\"len\":" + std::to_string(Options->DataLengthBytes) +
+                     ",\"data\":" + shim_hex(Options->Data, Options->DataLengthBytes));
+    }
+    return REAL(EOS_P2P_SendPacket)(Handle, Options);
+}
+
+EOS_DECLARE_FUNC(EOS_EResult)
+EOS_P2P_ReceivePacket(EOS_HP2P Handle, const EOS_P2P_ReceivePacketOptions* Options,
+                      EOS_ProductUserId* OutPeerId, EOS_P2P_SocketId* OutSocketId,
+                      uint8_t* OutChannel, void* OutData,
+                      uint32_t* OutBytesWritten) {
+    EOS_EResult r = REAL(EOS_P2P_ReceivePacket)(Handle, Options, OutPeerId,
+                                                OutSocketId, OutChannel, OutData,
+                                                OutBytesWritten);
+    if (r == EOS_EResult::EOS_Success) {
+        const char* sock = (OutSocketId ? OutSocketId->SocketName : nullptr);
+        uint32_t len = (OutBytesWritten ? *OutBytesWritten : 0);
+        shim_log("call:EOS_P2P_ReceivePacket",
+                 "\"seq\":" + std::to_string(g_recv_seq++) + ",\"remote\":" +
+                     shim_puid(OutPeerId ? *OutPeerId : nullptr) + ",\"socket\":" +
+                     shim_jstr(sock) + ",\"channel\":" +
+                     std::to_string(OutChannel ? static_cast<int>(*OutChannel) : -1) +
+                     ",\"len\":" + std::to_string(len) + ",\"data\":" +
+                     shim_hex(OutData, len));
+    }
+    return r;
+}
+
+EOS_DECLARE_FUNC(EOS_EResult)
+EOS_P2P_AcceptConnection(EOS_HP2P Handle,
+                         const EOS_P2P_AcceptConnectionOptions* Options) {
+    if (Options) {
+        const char* sock =
+            (Options->SocketId ? Options->SocketId->SocketName : nullptr);
+        shim_log("call:EOS_P2P_AcceptConnection",
+                 "\"local\":" + shim_puid(Options->LocalUserId) + ",\"remote\":" +
+                     shim_puid(Options->RemoteUserId) + ",\"socket\":" +
+                     shim_jstr(sock));
+    }
+    return REAL(EOS_P2P_AcceptConnection)(Handle, Options);
+}
+
+EOS_DECLARE_FUNC(EOS_EResult)
+EOS_P2P_CloseConnection(EOS_HP2P Handle,
+                        const EOS_P2P_CloseConnectionOptions* Options) {
+    if (Options) {
+        const char* sock =
+            (Options->SocketId ? Options->SocketId->SocketName : nullptr);
+        shim_log("call:EOS_P2P_CloseConnection",
+                 "\"local\":" + shim_puid(Options->LocalUserId) + ",\"remote\":" +
+                     shim_puid(Options->RemoteUserId) + ",\"socket\":" +
+                     shim_jstr(sock));
+    }
+    return REAL(EOS_P2P_CloseConnection)(Handle, Options);
 }
 
 // =====================================================================

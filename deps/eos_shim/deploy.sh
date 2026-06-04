@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 
 SHIM="$(pwd)/EOSSDK-Win64-Shipping.dll"
 NAME="EOSSDK-Win64-Shipping.dll"
-ORIG="EOSSDK-Win64-Shipping-orig.dll"
+ORIG="EOSSDK-Win64-Shipping-pointed-to-by-shim.dll"
 
 cmd="${1:-}"; dir="${2:-}"
 [ -z "$cmd" ] || [ -z "$dir" ] && { echo "usage: deploy.sh install|uninstall <game_dir>"; exit 2; }
