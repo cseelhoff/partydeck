@@ -48,6 +48,25 @@ def _log(*a):
         print("[predict]", *a, flush=True)
 
 
+# steam_friends.json: real captured friends.notification push bodies keyed by the
+# subscribing peer's SteamID64. The offline emulator has no live Steam friends
+# backend, so we replay these byte-exact when a known peer subscribes (see
+# _rpc_friends_subscribe). Pure captured DATA, not logic.
+def _load_steam_friends():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "steam_friends.json")
+    try:
+        with open(path, "r") as f:
+            doc = json.load(f)
+        return doc.get("friends", {})
+    except Exception as e:
+        _log("steam_friends.json load failed:", e)
+        return {}
+
+
+_STEAM_FRIENDS = _load_steam_friends()
+
+
 # =========================================================================
 # §A  msgpack encoders  (local, so this module shares no logic with raknet.py)
 # =========================================================================
@@ -449,6 +468,36 @@ def _adopt_party(conn, key, scene_id):
                 world["invites"][code] = key
         _log("adopted real party GUID %s (was %s)" % (key, own))
         return party
+    return None
+
+
+def _adopt_gamesession(conn, key, scene_id):
+    """Resolve the GameSession for a CONNECT_TO_SCENE on a gamesession scene.
+
+    Mirrors `_adopt_party`: in a relay / replay the client follows the REAL
+    backend's gamesession GUID (carried in the gamefinder.update match token),
+    which differs from the GUID our `_maybe_start_game` minted. Re-home our
+    freshly-created gamesession under the real `key` so the subsequent
+    GameSession.GetP2PToken resolves and player.update pushes fire to every
+    member. No-op when key is already known."""
+    world = conn["world"]
+    gs = world["gamesessions"].get(key)
+    if gs is not None:
+        return gs
+    party = None
+    for p in world["parties"].values():
+        if conn in p["members"] and p["gs_guid"] is not None:
+            party = p
+            break
+    pred_guid = party["gs_guid"] if party is not None else None
+    if pred_guid and pred_guid in world["gamesessions"] and pred_guid != key:
+        gs = world["gamesessions"].pop(pred_guid)
+        gs["guid"] = key
+        gs["scene_id"] = scene_id
+        world["gamesessions"][key] = gs
+        party["gs_guid"] = key
+        _log("adopted real gamesession %s (was %s)" % (key, pred_guid))
+        return gs
     return None
 
 
@@ -925,6 +974,22 @@ def _rpc_void(conn, binding, routes, rpc_req, rest):
     _rpc_respond(conn, routes, rpc_req, result=None)
 
 
+def _rpc_friends_subscribe(conn, binding, routes, rpc_req, rest):
+    """Friends.Subscribe is void, but the real server then pushes the peer's
+    friends list as friends.notification messages. Offline we have no Steam
+    friends backend, so replay the byte-exact captured notifications for this
+    SteamID64 from steam_friends.json (empty/absent -> no push, same as before)."""
+    _rpc_respond(conn, routes, rpc_req, result=None)
+    entry = _STEAM_FRIENDS.get(str(conn["steam_id"])) if conn["steam_id"] else None
+    if not entry:
+        return
+    route = routes["client_recv"].get("friends.notification")
+    if route is None:
+        return
+    for body_hex in entry.get("notifications", []):
+        _send_scene_msg(conn, routes["handle"], route, bytes.fromhex(body_hex))
+
+
 def _rpc_empty_array(conn, binding, routes, rpc_req, rest):
     _rpc_respond(conn, routes, rpc_req, b"\x90")
 
@@ -1056,7 +1121,7 @@ _RPC_HANDLERS = {
     "Authentication.Login": _rpc_login,
     "Locator.GetSceneConnectionToken": _rpc_get_scene_token,
     "UserSession.UpdateUserOptions": _rpc_void,
-    "Friends.Subscribe": _rpc_void,
+    "Friends.Subscribe": _rpc_friends_subscribe,
     "Friends.Get": _rpc_empty_array,
     "Friends.GetBlockedList": _rpc_empty_array,
     "partymanagement.createsession": _rpc_createsession,
@@ -1147,6 +1212,9 @@ def _sr_connect_to_scene(conn, req_id, data):
         blob = scenes.gamesession_connect(key, handle)
         routes = _sr_dict(scenes.SceneRoutes("gamesession", infos, blob))
         conn["bindings"][handle] = _new_binding("gamesession", scene_id, routes, key)
+        gs = _adopt_gamesession(conn, key, scene_id)
+        if gs is not None and conn not in gs["members"]:
+            gs["members"].append(conn)
     _send_response_msg(conn, req_id, blob)
     _send_response_complete(conn, req_id, has_values=True)
     if kind == "static" and key == "authenticator":

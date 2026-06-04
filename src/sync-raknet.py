@@ -2,19 +2,25 @@
 """sync-raknet.py — synchronous RakNet relay + per-request transaction logger.
 
 Unlike the async proxy in raknet.py (relay_main), this relay is REQUEST
-SYNCHRONOUS: for every client->server UDP datagram that carries real content
-(ACK/NAK and offline handshake datagrams are NOT recorded), it forwards the one
-datagram upstream, then waits RELAY_RESP_WAIT_MS milliseconds collecting EVERY
-server->client UDP datagram that comes back before moving on. The real burst and
-the emulator's predicted burst are both logged so the emulator can be made
-byte/semantics faithful.
+SYNCHRONOUS, and it works in terms of MESSAGES, not UDP packets. The encapsulated
+RakNet message -- reassembled from however many datagrams/fragments carried it --
+is the atomic unit. For every complete client->server message that carries real
+content (ACK/NAK and offline handshake datagrams are NOT recorded), it forwards
+the datagram(s) upstream, then waits RELAY_RESP_WAIT_MS milliseconds collecting
+EVERY server->client datagram that comes back, reassembling them into complete
+messages before moving on. A request split across two UDP packets is therefore a
+SINGLE transaction, and the '<split frag>' fragmentation concept never surfaces
+in the log. The real burst and the emulator's predicted burst -- both as lists
+of reassembled messages -- are logged so the emulator can be made byte/semantics
+faithful.
 
 Each recorded transaction is one pretty-printed JSON object (every field on its
 own line so the real vs predicted decode can be eyeballed). Records are written
 back-to-back separated by a blank line; the reader uses raw_decode so the
 multi-line objects stay machine-parseable. Field order is chosen for diffing --
 real_human_readable sits directly above pred_human_readable, and the bulky raw
-hex arrays come last:
+hex arrays come last. Every entry in sent/real/pred is one fully-reassembled
+MESSAGE payload (mid + body), never a raw UDP datagram:
   {
     "t":   ISO timestamp,
     "peer": "C1" | "C2" | ...,
@@ -24,12 +30,12 @@ hex arrays come last:
                                          #   authoritative verdict (the real server
                                          #   pipelines, so window match has false
                                          #   mismatches; the summary corrects for it).
-    "RAW_UDP_SENT": "<hex>",             # the single c2s datagram forwarded upstream
-    "udp_sent_human_readable": "<str>",  # full decode of that c2s datagram
+    "sent": ["<hex>", ...],              # the complete c2s message(s) forwarded upstream
+    "sent_human_readable": "<str>",      # full decode of that c2s message burst
     "real_human_readable": "<str>",      # full decode of the real burst
     "pred_human_readable": "<str>",      # full decode of the predicted burst
-    "real": ["<hex>", ...],              # every NON-ACK s2c datagram the real server sent
-    "pred": ["<hex>", ...]               # every NON-ACK s2c datagram the emulator predicted
+    "real": ["<hex>", ...],              # every NON-ACK s2c message the real server sent
+    "pred": ["<hex>", ...]               # every NON-ACK s2c message the emulator predicted
   }
 
 The *_human_readable strings are FULL literal decodes — nothing masked, nothing
@@ -69,6 +75,7 @@ import time
 import socket
 import select
 import datetime
+from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import raknet as R
@@ -172,6 +179,9 @@ def _hr_control_frame(mid, body):
       ID_CONNECTION_RESULT -> 'connres connid=<n>'       (one LE uint64 id, the
                               server-assigned connection id; see raknet.py
                               send path `struct.pack("<Q", connection_id)`)
+      ID_CONNECTION_REQUEST -> 'creq guid=<hex8> time=<ms> sec=<0/1>' (the client
+                              GUID(8) + RakNet::Time(8,BE) + useSecurity(1); see
+                              raknet.send_connection_accepted's payload layout)
       ID_CONNECTION_REQUEST_ACCEPTED -> 'cacc remote=.. sysidx=.. ip0=.. echo=..
                               srv=..' (see _hr_conn_accepted)."""
     if mid in (R.ID_CONNECTED_PING, R.ID_CONNECTED_PONG):
@@ -190,6 +200,12 @@ def _hr_control_frame(mid, body):
     if mid == R.ID_CONNECTION_RESULT and len(body) == 8:
         return "%s connid=%d" % (
             _online_abbr(mid), int.from_bytes(body, "little"))
+    if mid == R.ID_CONNECTION_REQUEST and len(body) >= 16:
+        guid = body[:8].hex()
+        ts = int.from_bytes(body[8:16], "big")
+        sec = body[16] if len(body) > 16 else 0
+        return "%s guid=%s time=%d sec=%d" % (
+            _online_abbr(mid), guid, ts, sec)
     if mid == R.ID_CONNECTION_REQUEST_ACCEPTED:
         return _hr_conn_accepted(body)
     if mid == R.ID_NEW_INCOMING_CONNECTION and len(body) >= 7 + 16:
@@ -204,6 +220,29 @@ def _hr_control_frame(mid, body):
         return "%s server=%s internal=%dB ping=%d pong=%d" % (
             _online_abbr(mid), server, junk, ping, pong)
     return None
+
+
+def _hr_clock_reply(key, lit):
+    """Decode a sping (SyncClock) system-request RPC reply into named clocks.
+
+    The reply body is one or two little-endian uint64 clocks (serverTime then the
+    echoed client clock); the matching c2s request renders as `clk=<ms>`. When a
+    RESP_MSG body is exactly 8 or 16 raw bytes that did not decode as msgpack,
+    `_skel_or_binary` hands back a `{hex,len}` bin dict that `_hr_bin` would
+    otherwise render as an opaque (and truncated) `bin16_<first8bytes>`. Render
+    the clocks by name instead. Returns None for anything that is not such a
+    reply, so the caller falls back to the normal literal render."""
+    if not (key[0] == "SYS" and key[1] == "RESP_MSG"):
+        return None
+    if not (isinstance(lit, dict) and "hex" in lit and "len" in lit
+            and lit["len"] in (8, 16)):
+        return None
+    raw = bytes.fromhex(lit["hex"])
+    srv = int.from_bytes(raw[:8], "little")
+    if len(raw) == 8:
+        return "srv=%d" % srv
+    echo = int.from_bytes(raw[8:16], "little")
+    return "srv=%d echo=%d" % (srv, echo)
 
 
 def _hr_key_prefix(key):
@@ -225,31 +264,68 @@ class TxnDecoder:
     """Wraps a raknet._RelayAssert (for route learning + real-handle/party
     adoption) and renders datagrams to full-literal human-readable strings.
 
-    One decoder per peer. Real s2c bursts are fed through `human_s2c(.., "real")`
-    and predicted bursts through `human_s2c(.., "pred")`; both drive the engine's
-    route tables so scene messages resolve their route names and the shadow can
-    adopt the real server's scene handles."""
+    One decoder per peer. Real s2c bursts are fed through `human_msgs("real", ..)`
+    and predicted bursts through `human_msgs("pred", ..)` (after `reassemble_msgs`
+    turns datagrams into complete messages); both drive the engine's route tables
+    so scene messages resolve their route names and the shadow can adopt the real
+    server's scene handles."""
 
     def __init__(self, label):
         self.label = label
         self.eng = R._RelayAssert(label, JD)
         self.eng.split["c2s"] = {}      # add a c2s split-reassembly bucket
 
-    # ---- client -> server ------------------------------------------------
-    def human_c2s(self, dg):
-        """Full decode of one client->server datagram."""
-        parts = []
+    # ---- decode helpers --------------------------------------------------
+    def _lenient_lit(self, body):
+        """Full-tile msgpack decode that, unlike _skel_or_binary, does NOT
+        require a container/string lead byte. Stormancer scene-route DTOs
+        legitimately begin with bare version fixints (e.g. the party
+        `[ver, 0, ver]` prefix before the member array), which the strict decoder
+        rejects to avoid mistaking raw clock blobs for msgpack. Scene messages are
+        addressed to LEARNED handles and are never clock blobs, so a lenient
+        decode is safe here. Returns a literal list when the body tiles cleanly
+        with no ERR and no leftover bytes, else None (caller keeps the hex)."""
+        jd = self.eng.jd
+        if not body:
+            return None
         try:
-            msgs = R.parse_messages_ex(dg, 4)
-        except Exception as e:
-            return f"<parse-exc {e}>"
-        for m in msgs:
-            pl = m["payload"]
-            if not pl:
-                continue
-            pl = self._reassemble("c2s", m, pl)
-            if pl is None:
-                continue
+            vals, i, n = [], 0, len(body)
+            while i < n:
+                v, i = jd.mp(body, i)
+                if isinstance(v, (tuple, list)) and v and v[0] == "ERR":
+                    return None
+                vals.append(v)
+            if i != n:
+                return None
+            return [self.eng._literal(v) for v in vals]
+        except Exception:
+            return None
+
+    def _hr_scene_body(self, body, route_abbr):
+        """Render a scene-route body, preferring a structural decode. Tries the
+        strict _skel_or_binary first; if that fell back to hex, re-attempts a
+        lenient full-tile decode (scene DTOs may lead with scalar version bytes).
+        Falls back to the hex literal so nothing is ever hidden."""
+        lit = self.eng._skel_or_binary(body)
+        if isinstance(lit, dict) and "hex" in lit:
+            alt = self._lenient_lit(body)
+            if alt is not None:
+                lit = alt
+        return H.hr_payload(lit, route_abbr)
+
+    # ---- client -> server ------------------------------------------------
+    def reassemble_c2s(self, dg):
+        """Reassemble one client->server datagram into the COMPLETE message
+        payloads it produced. Returns an empty list while a split request is
+        still only partially received, so a fragmented request is recorded as a
+        single atomic message rather than a packet bearing a '<split frag>'
+        placeholder. The message -- not the UDP datagram -- is the unit."""
+        return self._reassemble_datagrams("c2s", [dg])
+
+    def human_c2s_msgs(self, msgs):
+        """Full decode of a list of complete client->server message payloads."""
+        parts = []
+        for pl in msgs:
             s = self._human_c2s_message(pl)
             if s:
                 parts.append(s)
@@ -286,10 +362,9 @@ class TxnDecoder:
             if rname in R._RPC_STREAM_ROUTES and len(body) >= 2:
                 rid = R._rd_u16le(body, 0)
                 return "%s/%s#%d = %s" % (
-                    kabbr, rabbr, rid,
-                    H.hr_payload(eng._skel_or_binary(body[2:]), rabbr))
+                    kabbr, rabbr, rid, self._hr_scene_body(body[2:], rabbr))
             return "%s/%s = %s" % (
-                kabbr, rabbr, H.hr_payload(eng._skel_or_binary(body), rabbr))
+                kabbr, rabbr, self._hr_scene_body(body, rabbr))
         # Transport / connected-layer control frame (or any short id): render the
         # full literal body, never just a length -- nothing is masked.
         body = pl[1:]
@@ -302,44 +377,52 @@ class TxnDecoder:
             _online_abbr(mid), H.hr_payload(eng._skel_or_binary(body), None))
 
     # ---- server -> client ------------------------------------------------
-    def human_s2c(self, side, hexes):
-        """Full decode of a burst of server->client datagrams (a list of hex
-        strings). Drives the engine's route learning / handle adoption for
-        `side` ('real' or 'pred')."""
+    def reassemble_msgs(self, side, hexes):
+        """Convert raw s2c datagram hexes into the list of COMPLETE encapsulated
+        message payloads they carry, reassembling split fragments across
+        datagrams (and across response windows). The message -- not the UDP
+        datagram -- is the atomic unit logged for `side` ('real' or 'pred')."""
+        return self._reassemble_datagrams(
+            side, [bytes.fromhex(hx) for hx in hexes])
+
+    def human_msgs(self, side, msgs):
+        """Full decode of a list of complete s2c message payloads. Drives the
+        engine's route learning / handle adoption for `side`."""
         parts = []
-        for hx in hexes:
-            dg = bytes.fromhex(hx)
+        for pl in msgs:
             try:
-                msgs = R.parse_messages_ex(dg, 4)
+                key, lit = self.eng._classify(side, pl)
             except Exception as e:
-                parts.append(f"<parse-exc {e}>")
+                parts.append(f"<decode-exc {e}>")
                 continue
-            for m in msgs:
-                pl = m["payload"]
-                if not pl:
-                    continue
-                pl = self._reassemble(side, m, pl)
-                if pl is None:
-                    continue
-                try:
-                    key, lit = self.eng._classify(side, pl)
-                except Exception as e:
-                    parts.append(f"<decode-exc {e}>")
-                    continue
-                if key is None:
-                    # _classify only keys Stormancer sysreq responses and scene
-                    # messages on a LEARNED handle. Everything else (transport
-                    # control frames, scene msgs on a handle this side never
-                    # learned) must STILL be rendered -- skipping them would let
-                    # a predicted burst collapse to "" and falsely match. Render
-                    # the full literal so real vs predicted always compare.
-                    parts.append(self._render_other(side, pl))
-                    continue
-                prefix = _hr_key_prefix(key)
-                rabbr = key[2] if key[0] == "SCN" and len(key) > 2 else None
-                parts.append("%s = %s" % (
-                    prefix, H.hr_payload(lit, H.abbr_route(
-                        key[1], rabbr) if rabbr else None)))
+            if key is None:
+                # _classify only keys Stormancer sysreq responses and scene
+                # messages on a LEARNED handle. Everything else (transport
+                # control frames, scene msgs on a handle this side never
+                # learned) must STILL be rendered -- skipping them would let a
+                # predicted burst collapse to "" and falsely match. Render the
+                # full literal so real vs predicted always compare.
+                parts.append(self._render_other(side, pl))
+                continue
+            prefix = _hr_key_prefix(key)
+            rabbr = key[2] if key[0] == "SCN" and len(key) > 2 else None
+            clk = _hr_clock_reply(key, lit)
+            if clk is not None:
+                # A sping (SyncClock) RPC reply: render the two little-endian
+                # uint64 clocks by name instead of an opaque 16-byte blob (the
+                # matching c2s request already decodes as `clk=...`).
+                parts.append("%s = %s" % (prefix, clk))
+                continue
+            if (key[0] == "SCN" and isinstance(lit, dict)
+                    and "hex" in lit):
+                # Scene DTO that failed strict decode (leads with scalar version
+                # bytes): re-attempt a lenient structural decode.
+                alt = self._lenient_lit(bytes.fromhex(lit["hex"]))
+                if alt is not None:
+                    lit = alt
+            parts.append("%s = %s" % (
+                prefix, H.hr_payload(lit, H.abbr_route(
+                    key[1], rabbr) if rabbr else None)))
         return RT.HR_MSG_SEP.join(parts)
 
     def _render_other(self, side, pl):
@@ -355,7 +438,7 @@ class TxnDecoder:
             rh = R._rd_u16le(pl, 1)
             body = pl[3:]
             return "scn?/h%d/r#%d = %s" % (
-                mid, rh, H.hr_payload(eng._skel_or_binary(body), None))
+                mid, rh, self._hr_scene_body(body, None))
         abbr = _online_abbr(mid)
         body = pl[1:]
         if not body:
@@ -364,6 +447,27 @@ class TxnDecoder:
         if clk is not None:
             return clk
         return "%s = %s" % (abbr, H.hr_payload(eng._skel_or_binary(body), None))
+
+    def _reassemble_datagrams(self, side, dgs):
+        """Parse a sequence of datagrams for `side` and return the list of
+        complete encapsulated message payloads, reassembling split fragments.
+        Incomplete fragments are buffered (in self.eng.split[side]) and emitted
+        only once their final fragment arrives -- possibly on a later datagram or
+        a later call -- so splitting is invisible to callers."""
+        msgs = []
+        for dg in dgs:
+            try:
+                parsed = R.parse_messages_ex(dg, 4)
+            except Exception:
+                continue
+            for m in parsed:
+                pl = m["payload"]
+                if not pl:
+                    continue
+                full = self._reassemble(side, m, pl)
+                if full is not None:
+                    msgs.append(full)
+        return msgs
 
     def _reassemble(self, side, m, pl):
         """Reassemble split (fragmented) messages per side; return the complete
@@ -447,36 +551,48 @@ def _sync_handle_aliases(dec, caddr):
 
 
 def _predict(dec, caddr, c2s):
-    """Run the FRESH clean-room predictor (predict.py) for one c2s datagram;
-    return the list of predicted s2c datagrams (hex) addressed back to this
-    client. The predictor is fully independent of raknet.py -- this is what the
-    real-vs-predicted verdict now measures. `dec` is still used to RENDER the
-    predicted bytes (human_s2c) but no longer to produce them."""
+    """Run the FRESH clean-room predictor (predict.py) for one c2s datagram.
+    Returns (own, cross): `own` = predicted s2c datagrams (hex) addressed back
+    to the triggering client; `cross` = list of (addr, hex) for server-initiated
+    pushes the emulator addressed to OTHER peers (e.g. a party broadcast a peer's
+    update triggers to every member). The predictor is fully independent of
+    raknet.py. `dec` is still used to RENDER the bytes (human_msgs)."""
     out = P.predict(_WORLD, caddr, c2s)
-    return [dg.hex() for (addr, dg) in out
-            if addr == caddr and _is_content_datagram(dg)]
+    own, cross = [], []
+    for (addr, dg) in out:
+        if not _is_content_datagram(dg):
+            continue
+        if addr == caddr:
+            own.append(dg.hex())
+        else:
+            cross.append((addr, dg.hex()))
+    return own, cross
 
 
-def _finalize(dec, peer, t_iso, c2s_hex, c2s_human, reals_hex, preds_hex):
-    real_human = dec.human_s2c("real", reals_hex)
-    pred_human = dec.human_s2c("pred", preds_hex)
+def _finalize(dec, peer, t_iso, sent_msgs, sent_human, reals_hex, preds_hex):
+    real_msgs = dec.reassemble_msgs("real", reals_hex)
+    pred_msgs = dec.reassemble_msgs("pred", preds_hex)
+    real_human = dec.human_msgs("real", real_msgs)
+    pred_human = dec.human_msgs("pred", pred_msgs)
     # Field order is chosen for eyeball diffing: the three *_human_readable
     # strings sit together (real directly above pred) so a mismatch is obvious,
-    # and the bulky raw hex arrays go last.
+    # and the bulky raw hex arrays go last. Every entry in sent/real/pred is one
+    # fully-reassembled MESSAGE payload (the atomic protocol unit), never a raw
+    # UDP datagram -- splitting/fragmentation is resolved before logging.
     rec = {
         "t": t_iso,
         "peer": peer,
         "match": real_human == pred_human,
-        "RAW_UDP_SENT": c2s_hex,
-        "udp_sent_human_readable": c2s_human,
+        "sent": [m.hex() for m in sent_msgs],
+        "sent_human_readable": sent_human,
         "real_human_readable": real_human,
         "pred_human_readable": pred_human,
-        "real": reals_hex,
-        "pred": preds_hex,
+        "real": [m.hex() for m in real_msgs],
+        "pred": [m.hex() for m in pred_msgs],
     }
     _write(rec)
     if not rec["match"]:
-        R.log(f"  [sync {peer}] DIFF {c2s_human[:80]}")
+        R.log(f"  [sync {peer}] DIFF {sent_human[:80]}")
 
 
 # =========================================================================
@@ -500,7 +616,9 @@ def replay_main(path):
     decs = {}
     addrs = {}
     nidx = 1
-    active = {}     # peer -> dict(t,c2s_hex,c2s_human,preds,reals)
+    active = {}     # peer -> dict(t, sent_msgs, sent_human, preds, reals)
+    peer_by_addr = {}   # synthetic addr -> peer (for cross-peer push routing)
+    pending = {}        # peer -> [hex] cross-peer pushes awaiting that peer's next txn
 
     def ensure(peer):
         nonlocal nidx
@@ -508,15 +626,31 @@ def replay_main(path):
             decs[peer] = TxnDecoder(peer)
             addrs[peer] = ("10.0.0.%d" % nidx, nidx)
             R._RELAY_ENGINES[addrs[peer]] = decs[peer].eng
+            peer_by_addr[addrs[peer]] = peer
             nidx += 1
         return decs[peer], addrs[peer]
+
+    def route_cross(cross):
+        """Attribute server-initiated pushes the emulator sent to OTHER peers to
+        that peer's open transaction (or buffer for its next one). The emulator
+        really transmits these bytes; the single-stream filter used to drop them,
+        which understated server-push coverage."""
+        for taddr, hx in cross:
+            tpeer = peer_by_addr.get(taddr)
+            if tpeer is None:
+                continue
+            ta = active.get(tpeer)
+            if ta is not None:
+                ta["preds"].append(hx)
+            else:
+                pending.setdefault(tpeer, []).append(hx)
 
     def flush(peer):
         a = active.pop(peer, None)
         if a is None:
             return
         dec = decs[peer]
-        _finalize(dec, peer, a["t"], a["c2s_hex"], a["c2s_human"],
+        _finalize(dec, peer, a["t"], a["sent_msgs"], a["sent_human"],
                   a["reals"], a["preds"])
 
     for r in rows:
@@ -528,25 +662,51 @@ def replay_main(path):
                 # ACK/NAK/handshake: still let the predictor process the
                 # handshake so a connection exists, but do not start a recorded
                 # transaction. (dec.eng still learns routes from the real s2c.)
-                P.predict(_WORLD, caddr, dg)
+                _, cross = _predict(dec, caddr, dg)
+                route_cross(cross)
                 continue
-            # A new client request finalizes the previous one (lock-step client).
+            msgs = dec.reassemble_c2s(dg)
+            if not msgs:
+                # A pure split-fragment carrier: no complete client message yet,
+                # so this is NOT its own transaction. Advance the predictor and
+                # carry any (rare) predictions onto the transaction the
+                # completing fragment will open.
+                own, cross = _predict(dec, caddr, dg)
+                if own:
+                    pending.setdefault(peer, []).extend(own)
+                route_cross(cross)
+                continue
+            # A complete client message finalizes the previous transaction
+            # (lock-step client) and opens a new one keyed on this atomic message.
             flush(peer)
             _sync_handle_aliases(dec, caddr)
-            preds = _predict(dec, caddr, dg)
+            own, cross = _predict(dec, caddr, dg)
             active[peer] = {
                 "t": r["t"],
-                "c2s_hex": r["hex"],
-                "c2s_human": dec.human_c2s(dg),
-                "preds": preds,
+                "sent_msgs": msgs,
+                "sent_human": dec.human_c2s_msgs(msgs),
+                "preds": pending.pop(peer, []) + own,
                 "reals": [],
             }
+            route_cross(cross)
         else:  # s2c
             if not _is_content_datagram(dg):
                 continue
             a = active.get(peer)
             if a is not None:
                 a["reals"].append(r["hex"])
+    # Drain any cross-peer pushes still buffered for a peer that never opened
+    # another transaction into a trailing record so they are counted.
+    for peer, hxs in list(pending.items()):
+        if not hxs:
+            continue
+        if peer in active:
+            active[peer]["preds"].extend(hxs)
+        else:
+            decs[peer]  # ensure exists
+            _finalize(decs[peer], peer, rows[-1]["t"] if rows else "",
+                      [], "(trailing cross-peer pushes)", [], list(hxs))
+        pending[peer] = []
     for peer in list(active):
         flush(peer)
     R.log(f"sync replay written -> {SYNC_ASSERT_FILE}")
@@ -573,6 +733,9 @@ def live_main():
     client_by_fd = {}       # upstream fileno -> caddr
     decs = {}               # peer label -> TxnDecoder
     active = {}             # peer label -> transaction dict (with deadline)
+    sendq = {}              # peer label -> queued content c2s datagrams
+    peer_by_addr = {}       # client addr -> peer label
+    pending = {}            # peer label -> predicted cross-peer pushes
 
     def ensure_dec(label):
         if label not in decs:
@@ -583,8 +746,52 @@ def live_main():
         a = active.pop(label, None)
         if a is None:
             return
-        _finalize(decs[label], label, a["t"], a["c2s_hex"], a["c2s_human"],
+        _finalize(decs[label], label, a["t"], a["sent_msgs"], a["sent_human"],
                   a["reals"], a["preds"])
+
+    def route_cross(cross):
+        for taddr, hx in cross:
+            tlabel = peer_by_addr.get(taddr)
+            if tlabel is None:
+                continue
+            ta = active.get(tlabel)
+            if ta is not None:
+                ta["preds"].append(hx)
+            else:
+                pending.setdefault(tlabel, []).append(hx)
+
+    def start_next(label):
+        if label in active:
+            return
+        q = sendq.get(label)
+        if not q:
+            return
+        data, caddr, us = q.popleft()
+        dec = ensure_dec(label)
+        msgs = dec.reassemble_c2s(data)
+        try:
+            us.send(data)
+        except OSError as e:
+            R.log(f"  !! upstream send failed: {e}")
+        own, cross = _predict(dec, caddr, data)
+        route_cross(cross)
+        if not msgs:
+            # A pure split-fragment carrier: forwarded upstream and fed to the
+            # predictor (which buffers it), but it is NOT its own transaction.
+            # Carry any rare predictions onto the next one and process the next
+            # queued datagram -- the completing fragment -- immediately.
+            if own:
+                pending.setdefault(label, []).extend(own)
+            start_next(label)
+            return
+        active[label] = {
+            "t": datetime.datetime.now().isoformat(),
+            "sent_msgs": msgs,
+            "sent_human": dec.human_c2s_msgs(msgs),
+            "preds": pending.pop(label, []) + own,
+            "reals": [],
+            "deadline": time.monotonic() + wait_s,
+        }
 
     try:
         while True:
@@ -602,6 +809,7 @@ def live_main():
                     if not data:
                         continue
                     label = R.set_peer(caddr)
+                    peer_by_addr[caddr] = label
                     if upstream is None:
                         upstream, ulabel = R._relay_resolve_upstream()
                         R.log(f"sync upstream = {ulabel} {upstream}")
@@ -612,27 +820,19 @@ def live_main():
                         up_by_client[caddr] = us
                         client_by_fd[us.fileno()] = caddr
                         R.log(f"-> new client {caddr[0]}:{caddr[1]}")
-                    dec = ensure_dec(label)
-                    # Always forward the client's datagram upstream promptly.
-                    try:
-                        us.send(data)
-                    except OSError as e:
-                        R.log(f"  !! upstream send failed: {e}")
                     if not _is_content_datagram(data):
-                        # Handshake/ACK: let the predictor process it, don't record.
-                        P.predict(_WORLD, caddr, data)
+                        # Handshake/ACK: forward promptly and let the predictor
+                        # process it, but don't pace or record it.
+                        try:
+                            us.send(data)
+                        except OSError as e:
+                            R.log(f"  !! upstream send failed: {e}")
+                        out = P.predict(_WORLD, caddr, data)
+                        route_cross([(addr, dg.hex()) for addr, dg in out
+                                     if _is_content_datagram(dg) and addr != caddr])
                         continue
-                    # A new request closes the prior transaction (lock-step).
-                    finalize(label)
-                    preds = _predict(dec, caddr, data)
-                    active[label] = {
-                        "t": datetime.datetime.now().isoformat(),
-                        "c2s_hex": data.hex(),
-                        "c2s_human": dec.human_c2s(data),
-                        "preds": preds,
-                        "reals": [],
-                        "deadline": time.monotonic() + wait_s,
-                    }
+                    sendq.setdefault(label, deque()).append((data, caddr, us))
+                    start_next(label)
                 else:
                     caddr = client_by_fd.get(s.fileno())
                     if caddr is None:
@@ -657,7 +857,11 @@ def live_main():
             now = time.monotonic()
             for label in [l for l, a in active.items() if now >= a["deadline"]]:
                 finalize(label)
+                start_next(label)
     finally:
+        for label, hxs in list(pending.items()):
+            if label in active:
+                active[label]["preds"].extend(hxs)
         for label in list(active):
             finalize(label)
         R.log(f"sync-raknet asserts written -> {SYNC_ASSERT_FILE}")
@@ -721,6 +925,10 @@ def _classify_diff(req_kind, rv, pv):
     """
     if rv.startswith("bin16_") and pv.startswith("bin16_"):
         return "clock"
+    # Decoded sping/SyncClock reply: 'srv=<ms> echo=<ms>'. The absolute server
+    # clock is environment-relative; the echoed client clock matches by design.
+    if rv.startswith("srv=") and pv.startswith("srv="):
+        return "clock"
     # Auth-token response: a decoded JWT (header/payload claims) plus the bare
     # Stormancer session id. The session id, nbf/exp/iat and signature are all
     # per-session identity/clock values that differ every run by design -- not a
@@ -747,7 +955,7 @@ def summarize_records(records):
             # Bucket each window-mismatched transaction by the c2s route that
             # triggered it, so the (large) per-record mismatch count is broken
             # down into something actionable rather than just a raw total.
-            c2s = r.get("udp_sent_human_readable", "") or "(none)"
+            c2s = r.get("sent_human_readable", "") or "(none)"
             route = c2s.split(" = ", 1)[0].split(RT.HR_MSG_SEP)[0]
             txn_mismatch_routes[route] = txn_mismatch_routes.get(route, 0) + 1
         _index_responses(r.get("real_human_readable"), real_by)
