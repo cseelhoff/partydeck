@@ -322,6 +322,13 @@ HR_FORBIDDEN_SYMBOLS = "{}[]\":,"   # must never appear in an hr string
 HR_OPAQUE_MAX = 64          # strings longer than this are truncated...
 HR_OPAQUE_TRUNC = 16        # ...to first N chars, rendered '<first16>~<len>'
 HR_WILDCARD = "*"           # noise-key normalized value
+# A msgpack array often carries an embedded UTF-8/JSON blob flattened into a run
+# of byte-valued fixints (e.g. 110 100 111 109 ... = "ndom..."). A run of >=
+# HR_BYTES_MIN consecutive ints in 0..255 that is >= HR_BYTES_PRINT_FRAC
+# printable ASCII is coalesced into a single 'txt<len>_<ascii>' token instead of
+# dozens of bare integers. Purely numeric runs (counts, zero padding) stay int.
+HR_BYTES_MIN = 6
+HR_BYTES_PRINT_FRAC = 0.75
 
 HR_BOOL_TRUE = "t"
 HR_BOOL_FALSE = "f"

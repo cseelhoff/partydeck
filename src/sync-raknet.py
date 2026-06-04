@@ -9,7 +9,12 @@ server->client UDP datagram that comes back before moving on. The real burst and
 the emulator's predicted burst are both logged so the emulator can be made
 byte/semantics faithful.
 
-Each recorded transaction is one JSON line:
+Each recorded transaction is one pretty-printed JSON object (every field on its
+own line so the real vs predicted decode can be eyeballed). Records are written
+back-to-back separated by a blank line; the reader uses raw_decode so the
+multi-line objects stay machine-parseable. Field order is chosen for diffing --
+real_human_readable sits directly above pred_human_readable, and the bulky raw
+hex arrays come last:
   {
     "t":   ISO timestamp,
     "peer": "C1" | "C2" | ...,
@@ -21,10 +26,10 @@ Each recorded transaction is one JSON line:
                                          #   mismatches; the summary corrects for it).
     "RAW_UDP_SENT": "<hex>",             # the single c2s datagram forwarded upstream
     "udp_sent_human_readable": "<str>",  # full decode of that c2s datagram
-    "real": ["<hex>", ...],              # every NON-ACK s2c datagram the real server sent
     "real_human_readable": "<str>",      # full decode of the real burst
-    "pred": ["<hex>", ...],              # every NON-ACK s2c datagram the emulator predicted
-    "pred_human_readable": "<str>"       # full decode of the predicted burst
+    "pred_human_readable": "<str>",      # full decode of the predicted burst
+    "real": ["<hex>", ...],              # every NON-ACK s2c datagram the real server sent
+    "pred": ["<hex>", ...]               # every NON-ACK s2c datagram the emulator predicted
   }
 
 The *_human_readable strings are FULL literal decodes — nothing masked, nothing
@@ -40,16 +45,22 @@ per-run-identity differences are labelled as noise; server-initiated pushes (no
 reqId) are reported as route coverage (real vs pred counts).
 
 Modes:
-  live   (default): bind UDP HOST:PORT, proxy to the real dt-live cluster.
+  serve  (default): bind UDP HOST:PORT and answer clients DIRECTLY from the
+         data-oriented predictor (predict.py) — a pure offline Stormancer
+         broker with no upstream. This is the drop-in replacement for
+         raknet.py's main() that partydeck points the game at.
+  relay  (RAKNET_RELAY=1): bind UDP HOST:PORT, proxy to the real dt-live
+         cluster, and shadow-predict each response for a faithfulness verdict.
   replay (SYNC_REPLAY=/path/to/relay_capture.jsonl): reconstruct transactions
          from an existing capture (no live game needed) — handy for iterating on
-         the output format.
+         the emulator / output format.
 
 Env:
-  RELAY_RESP_WAIT_MS   response-collection window in ms (default 100)
-  SYNC_ASSERT_FILE     output JSONL (default /tmp/pdlog/probe/sync_assert.jsonl)
+  RAKNET_RELAY         if truthy, run live relay + shadow-predict (else: serve)
   SYNC_REPLAY          if set, run offline replay against this capture file
-  (plus all of raknet.py's relay env: RAKNET_RELAY upstream resolution, etc.)
+  RELAY_RESP_WAIT_MS   response-collection window in ms (default 100)
+  SYNC_ASSERT_FILE     output JSON (default /tmp/pdlog/probe/sync_assert.json)
+  (plus all of raknet.py's relay env: RAKNET_RELAY_UPSTREAM, etc.)
 """
 import os
 import sys
@@ -73,7 +84,7 @@ _WORLD = P.new_world()
 
 RESP_WAIT_MS = int(os.environ.get("RELAY_RESP_WAIT_MS", "100"))
 SYNC_ASSERT_FILE = os.environ.get(
-    "SYNC_ASSERT_FILE", "/tmp/pdlog/probe/sync_assert.jsonl")
+    "SYNC_ASSERT_FILE", "/tmp/pdlog/probe/sync_assert.json")
 
 # Online connected-layer message id -> name, for rendering non-Stormancer frames.
 _ONLINE_NAMES = {
@@ -108,6 +119,91 @@ def _online_abbr(mid):
     return (RT.ONLINE_IDS.get(mid)
             or RT.TRANSPORT_IDS.get(mid)
             or "id0x%02x" % mid)
+
+
+def _decode_raknet_addr(b):
+    """Decode a 7-byte RakNet IPv4 SystemAddress (version(1) + complemented
+    IPv4(4) + port(2,BE)) into 'a.b.c.d:port'. See raknet.encode_address."""
+    if len(b) < 7:
+        return None
+    ip = ".".join(str((~x) & 0xFF) for x in b[1:5])
+    port = int.from_bytes(b[5:7], "big")
+    return "%s:%d" % (ip, port)
+
+
+def _hr_conn_accepted(body):
+    """Decode an ID_CONNECTION_REQUEST_ACCEPTED body (249B for the Stormancer
+    32-internal-id RakNet build) into named fields rather than opaque hex:
+
+      cacc remote=<ip:port> sysidx=<n> ip0=<ip:port> ... echo=<ms> srv=<ms>
+
+    Layout: remoteSystemAddress(7) + systemIndex(2,BE) + 32*internalAddr(7) +
+    echoedClientTime(8,BE) + serverTime(8,BE). Only non-UNASSIGNED internal
+    addresses are listed (the rest are 0.0.0.0:0 padding). Returns None when the
+    body is not this fixed size, so the caller falls back to hex (nothing hidden)."""
+    expect = 7 + 2 + R.MAX_INTERNAL_IDS * 7 + 8 + 8
+    if len(body) != expect:
+        return None
+    off = 0
+    remote = _decode_raknet_addr(body[off:off + 7]); off += 7
+    sysidx = int.from_bytes(body[off:off + 2], "big"); off += 2
+    ips = []
+    for k in range(R.MAX_INTERNAL_IDS):
+        a = body[off:off + 7]; off += 7
+        if a != R.UNASSIGNED_ADDR:
+            ips.append("ip%d=%s" % (k, _decode_raknet_addr(a)))
+    echo = int.from_bytes(body[off:off + 8], "big"); off += 8
+    srv = int.from_bytes(body[off:off + 8], "big"); off += 8
+    parts = ["%s remote=%s sysidx=%d" % (
+        RT.ONLINE_IDS.get(R.ID_CONNECTION_REQUEST_ACCEPTED, "cacc"),
+        remote, sysidx)]
+    parts.extend(ips)
+    parts.append("echo=%d srv=%d" % (echo, srv))
+    return " ".join(parts)
+
+
+def _hr_control_frame(mid, body):
+    """Decode a connected-layer / transport control frame body into named
+    fields instead of leaving it as opaque hex. Returns None when this id has no
+    structured body (so the caller falls back to literal hex -- nothing hidden).
+
+      ID_CONNECTED_PING  -> 'ping clk=<ms>'              (one BE uint64 clock)
+      ID_CONNECTED_PONG  -> 'pong echo=<ms> clk=<ms>'    (two BE uint64 clocks)
+      ID_CONNECTION_RESULT -> 'connres connid=<n>'       (one LE uint64 id, the
+                              server-assigned connection id; see raknet.py
+                              send path `struct.pack("<Q", connection_id)`)
+      ID_CONNECTION_REQUEST_ACCEPTED -> 'cacc remote=.. sysidx=.. ip0=.. echo=..
+                              srv=..' (see _hr_conn_accepted)."""
+    if mid in (R.ID_CONNECTED_PING, R.ID_CONNECTED_PONG):
+        if not body or len(body) % 8 != 0:
+            return None
+        clocks = [int.from_bytes(body[i:i + 8], "big")
+                  for i in range(0, len(body), 8)]
+        abbr = _online_abbr(mid)
+        if mid == R.ID_CONNECTED_PING:
+            return "%s clk=%d" % (abbr, clocks[0])
+        labels = ["echo", "clk"]
+        fields = " ".join(
+            "%s=%d" % (labels[i] if i < len(labels) else "c%d" % i, c)
+            for i, c in enumerate(clocks))
+        return "%s %s" % (abbr, fields)
+    if mid == R.ID_CONNECTION_RESULT and len(body) == 8:
+        return "%s connid=%d" % (
+            _online_abbr(mid), int.from_bytes(body, "little"))
+    if mid == R.ID_CONNECTION_REQUEST_ACCEPTED:
+        return _hr_conn_accepted(body)
+    if mid == R.ID_NEW_INCOMING_CONNECTION and len(body) >= 7 + 16:
+        # ID_NEW_INCOMING_CONNECTION = serverAddress(7) + N internal addresses
+        # (UNINITIALIZED RakNet stack junk -- not meaningful) + sendPingTime(8) +
+        # sendPongTime(8). Only the leading address and the trailing two clocks
+        # carry information; the middle is shown as an opaque byte count.
+        server = _decode_raknet_addr(body[:7])
+        ping = int.from_bytes(body[-16:-8], "big")
+        pong = int.from_bytes(body[-8:], "big")
+        junk = len(body) - 7 - 16
+        return "%s server=%s internal=%dB ping=%d pong=%d" % (
+            _online_abbr(mid), server, junk, ping, pong)
+    return None
 
 
 def _hr_key_prefix(key):
@@ -167,11 +263,17 @@ class TxnDecoder:
             req = R._rd_u16le(pl, 2)
             data = pl[4:]
             name = RT.SYSREQ_IDS.get(msg_id, "sr0x%02x" % msg_id)
+            if name == "sping" and len(data) >= 8:
+                # ID_PING request body is the client's clock (uint64 LE). Render
+                # it as a clock rather than letting _skel_or_binary mis-parse the
+                # 8 raw bytes as a stray msgpack array.
+                return "sysreq sping#%d = clk=%d" % (
+                    req, int.from_bytes(data[:8], "little"))
             return "sysreq %s#%d = %s" % (
                 name, req, H.hr_payload(eng._skel_or_binary(data), name))
         if mid in _ONLINE_NAMES and len(pl) <= 2:
             return _online_abbr(mid)
-        if len(pl) >= 3:
+        if mid >= RT.SCENE_HANDLE_MIN and len(pl) >= 3:
             h = mid
             rh = R._rd_u16le(pl, 1)
             body = pl[3:]
@@ -188,7 +290,16 @@ class TxnDecoder:
                     H.hr_payload(eng._skel_or_binary(body[2:]), rabbr))
             return "%s/%s = %s" % (
                 kabbr, rabbr, H.hr_payload(eng._skel_or_binary(body), rabbr))
-        return "id0x%02x %dB" % (mid, len(pl))
+        # Transport / connected-layer control frame (or any short id): render the
+        # full literal body, never just a length -- nothing is masked.
+        body = pl[1:]
+        if not body:
+            return _online_abbr(mid)
+        clk = _hr_control_frame(mid, body)
+        if clk is not None:
+            return clk
+        return "%s = %s" % (
+            _online_abbr(mid), H.hr_payload(eng._skel_or_binary(body), None))
 
     # ---- server -> client ------------------------------------------------
     def human_s2c(self, side, hexes):
@@ -216,6 +327,13 @@ class TxnDecoder:
                     parts.append(f"<decode-exc {e}>")
                     continue
                 if key is None:
+                    # _classify only keys Stormancer sysreq responses and scene
+                    # messages on a LEARNED handle. Everything else (transport
+                    # control frames, scene msgs on a handle this side never
+                    # learned) must STILL be rendered -- skipping them would let
+                    # a predicted burst collapse to "" and falsely match. Render
+                    # the full literal so real vs predicted always compare.
+                    parts.append(self._render_other(side, pl))
                     continue
                 prefix = _hr_key_prefix(key)
                 rabbr = key[2] if key[0] == "SCN" and len(key) > 2 else None
@@ -223,6 +341,29 @@ class TxnDecoder:
                     prefix, H.hr_payload(lit, H.abbr_route(
                         key[1], rabbr) if rabbr else None)))
         return RT.HR_MSG_SEP.join(parts)
+
+    def _render_other(self, side, pl):
+        """Full-literal render of a message `_classify` could not key -- nothing
+        masked, nothing dropped. Transport/connected-layer control frames render
+        as `<abbr> = <literal>`; a scene message addressed to a handle this side
+        never learned renders as `scn?/h<handle>/r#<route> = <literal>`. The body
+        goes through the same _skel_or_binary path as everything else, so msgpack
+        decodes structurally and raw bytes show as `bin<N>_<hex>`."""
+        eng = self.eng
+        mid = pl[0]
+        if mid >= RT.SCENE_HANDLE_MIN and len(pl) >= 3:
+            rh = R._rd_u16le(pl, 1)
+            body = pl[3:]
+            return "scn?/h%d/r#%d = %s" % (
+                mid, rh, H.hr_payload(eng._skel_or_binary(body), None))
+        abbr = _online_abbr(mid)
+        body = pl[1:]
+        if not body:
+            return abbr
+        clk = _hr_control_frame(mid, body)
+        if clk is not None:
+            return clk
+        return "%s = %s" % (abbr, H.hr_payload(eng._skel_or_binary(body), None))
 
     def _reassemble(self, side, m, pl):
         """Reassemble split (fragmented) messages per side; return the complete
@@ -246,7 +387,45 @@ def _write(rec):
     if _assert_fh is None:
         os.makedirs(os.path.dirname(SYNC_ASSERT_FILE), exist_ok=True)
         _assert_fh = open(SYNC_ASSERT_FILE, "a", buffering=1)
-    _assert_fh.write(json.dumps(rec, default=str) + "\n")
+    # Each record is a pretty-printed JSON object (one field per line) so real
+    # vs predicted bursts can be eyeballed and diffed. Records are concatenated
+    # (blank line between) and the long `real`/`pred` hex lists are kept on a
+    # single line each to stay scannable; the reader uses raw_decode so the
+    # multi-line objects remain machine-parseable.
+    text = _format_record(rec)
+    _assert_fh.write(text + "\n\n")
+
+
+def _format_record(rec):
+    """Render one transaction as a readable multi-line JSON object: every field
+    on its own line (so the *_human_readable strings sit real-above-pred for easy
+    diffing), with each value kept on a single line."""
+    keys = list(rec.keys())
+    lines = ["{"]
+    for i, k in enumerate(keys):
+        comma = "," if i < len(keys) - 1 else ""
+        lines.append("  %s: %s%s" % (
+            json.dumps(k), json.dumps(rec[k], default=str), comma))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _read_records(path):
+    """Parse the multi-line concatenated-JSON assert file back into records."""
+    with open(path) as fh:
+        text = fh.read()
+    dec = json.JSONDecoder()
+    records = []
+    i, n = 0, len(text)
+    while i < n:
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            break
+        obj, end = dec.raw_decode(text, i)
+        records.append(obj)
+        i = end
+    return records
 
 
 def _sync_handle_aliases(dec, caddr):
@@ -281,16 +460,19 @@ def _predict(dec, caddr, c2s):
 def _finalize(dec, peer, t_iso, c2s_hex, c2s_human, reals_hex, preds_hex):
     real_human = dec.human_s2c("real", reals_hex)
     pred_human = dec.human_s2c("pred", preds_hex)
+    # Field order is chosen for eyeball diffing: the three *_human_readable
+    # strings sit together (real directly above pred) so a mismatch is obvious,
+    # and the bulky raw hex arrays go last.
     rec = {
         "t": t_iso,
         "peer": peer,
         "match": real_human == pred_human,
         "RAW_UDP_SENT": c2s_hex,
         "udp_sent_human_readable": c2s_human,
-        "real": reals_hex,
         "real_human_readable": real_human,
-        "pred": preds_hex,
         "pred_human_readable": pred_human,
+        "real": reals_hex,
+        "pred": preds_hex,
     }
     _write(rec)
     if not rec["match"]:
@@ -539,6 +721,12 @@ def _classify_diff(req_kind, rv, pv):
     """
     if rv.startswith("bin16_") and pv.startswith("bin16_"):
         return "clock"
+    # Auth-token response: a decoded JWT (header/payload claims) plus the bare
+    # Stormancer session id. The session id, nbf/exp/iat and signature are all
+    # per-session identity/clock values that differ every run by design -- not a
+    # protocol divergence. Same JWT skeleton on both sides => identity noise.
+    if "jwt " in rv and "jwt " in pv:
+        return "identity"
     # Same shape, differing only in an opaque/truncated id token => identity.
     if ("~" in rv and "~" in pv) and rv.split()[:1] == pv.split()[:1]:
         return "identity"
@@ -549,7 +737,19 @@ def summarize_records(records):
     """Compute the honest reqId-correlated verdict from logged transactions."""
     real_by, pred_by = {}, {}
     real_push, pred_push = {}, {}
+    txn_total = txn_match = 0
+    txn_mismatch_routes = {}
     for r in records:
+        txn_total += 1
+        if r.get("match"):
+            txn_match += 1
+        else:
+            # Bucket each window-mismatched transaction by the c2s route that
+            # triggered it, so the (large) per-record mismatch count is broken
+            # down into something actionable rather than just a raw total.
+            c2s = r.get("udp_sent_human_readable", "") or "(none)"
+            route = c2s.split(" = ", 1)[0].split(RT.HR_MSG_SEP)[0]
+            txn_mismatch_routes[route] = txn_mismatch_routes.get(route, 0) + 1
         _index_responses(r.get("real_human_readable"), real_by)
         _index_responses(r.get("pred_human_readable"), pred_by)
         for rt, _b in _push_routes(r.get("real_human_readable")):
@@ -580,6 +780,13 @@ def summarize_records(records):
                  for rt in push_routes
                  if real_push.get(rt, 0) != pred_push.get(rt, 0)]
     return {
+        "transactions": {
+            "total": txn_total,
+            "match": txn_match,
+            "mismatch": txn_total - txn_match,
+            "mismatch_routes": sorted(
+                txn_mismatch_routes.items(), key=lambda kv: -kv[1]),
+        },
         "responses": {"same": same, "diff": diffs,
                       "real_only": real_only, "pred_only": pred_only},
         "genuine": genuine, "clock": clock, "identity": identity,
@@ -591,11 +798,20 @@ def summarize_records(records):
 
 def _print_summary(s):
     R.log("")
-    R.log("=== HONEST reqId-correlated verdict ===")
+    R.log("=== sync-raknet verdict ===")
+    tx = s["transactions"]
+    R.log("  transactions: %d total  %d match  %d MISMATCH (window-based)"
+          % (tx["total"], tx["match"], tx["mismatch"]))
+    if tx["mismatch_routes"]:
+        R.log("  --- window-mismatches by c2s route (route: count) ---")
+        for route, cnt in tx["mismatch_routes"]:
+            R.log("    %4d  %s" % (cnt, route))
+    R.log("")
+    R.log("  reqId-correlated (pipelining-corrected, the authoritative verdict):")
     rr = s["responses"]
-    R.log("  responses: same=%d  diff=%d  real_only=%d  pred_only=%d"
+    R.log("    responses: same=%d  diff=%d  real_only=%d  pred_only=%d"
           % (rr["same"], rr["diff"], rr["real_only"], rr["pred_only"]))
-    R.log("  diff breakdown: genuine=%d  clock-noise=%d  identity-noise=%d"
+    R.log("    diff breakdown: genuine=%d  clock-noise=%d  identity-noise=%d"
           % (len(s["genuine"]), len(s["clock"]), len(s["identity"])))
     if s["genuine"]:
         R.log("  --- GENUINE response divergences (investigate) ---")
@@ -607,29 +823,61 @@ def _print_summary(s):
         R.log("  --- SERVER-PUSH coverage gaps (route: real/pred) ---")
         for rt, rc, pc in s["push_gaps"]:
             R.log("    %3d / %3d  %s" % (rc, pc, rt))
-    R.log("=======================================")
+    R.log("===========================")
 
 
 def summarize_file(path):
-    """Read a sync_assert.jsonl and print + return the honest verdict."""
-    records = []
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
+    """Read a sync_assert file and print + return the honest verdict."""
+    records = _read_records(path)
     s = summarize_records(records)
     _print_summary(s)
     return s
 
 
+# =========================================================================
+# PURE EMULATOR BACKEND — drop-in replacement for raknet.py main()
+# -------------------------------------------------------------------------
+# Bind HOST:PORT and answer clients DIRECTLY from the data-oriented predictor
+# (predict.py). No upstream, no real dt-live cluster: this IS the offline
+# Stormancer broker partydeck points the game at. Every client datagram is fed
+# to P.predict(); the returned outbox is sent straight back (addressed per
+# connection, so cross-peer pushes — memberConnected, settingsUpdated, etc. —
+# reach the other connected clients too).
+# =========================================================================
+
+def serve_main():
+    global _WORLD
+    _WORLD = P.new_world()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((R.HOST, R.PORT))
+    R.log(f"sync-raknet emulator listening on {R.HOST}:{R.PORT} "
+          f"(data-oriented predict.py backend)")
+    try:
+        while True:
+            data, addr = sock.recvfrom(65535)
+            if not data:
+                continue
+            R.set_peer(addr)
+            for out_addr, dg in P.predict(_WORLD, addr, data):
+                try:
+                    sock.sendto(dg, out_addr)
+                except OSError as e:
+                    R.log(f"  !! send to {out_addr} failed: {e}")
+    finally:
+        sock.close()
+
+
 if __name__ == "__main__":
     replay = os.environ.get("SYNC_REPLAY")
+    relay = os.environ.get("RAKNET_RELAY", "0") not in ("0", "", "false", "no")
     try:
         if replay:
-            replay_main(replay)
+            replay_main(replay)        # offline capture replay + verdict
+        elif relay:
+            live_main()                # live relay + shadow-predict + verdict
         else:
-            live_main()
+            serve_main()               # pure emulator backend (default)
     except KeyboardInterrupt:
         R.log("sync-raknet stopped")
         sys.exit(0)

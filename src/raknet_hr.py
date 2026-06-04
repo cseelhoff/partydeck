@@ -20,6 +20,8 @@ The same functions render both the real and the predicted side, so the
 comparison stays apples-to-apples.
 """
 import raknet_tables as T
+import base64 as _b64
+import json as _json
 
 
 # Characters that must never appear in hr output; replaced by a space in any
@@ -39,6 +41,54 @@ def _opaque(s):
     if len(s) > T.HR_OPAQUE_MAX:
         return "%s~%d" % (_clean(s[:T.HR_OPAQUE_TRUNC]), len(s))
     return _clean(s)
+
+
+def _b64url(seg):
+    """Decode a base64url JWT segment (padding-agnostic). None on failure."""
+    try:
+        seg += "=" * (-len(seg) % 4)
+        return _b64.urlsafe_b64decode(seg.encode("ascii"))
+    except Exception:
+        return None
+
+
+def _try_jwt(s):
+    """If `s` is a JWT (eyJ... header, two+ dot-separated base64url parts whose
+    first two decode to JSON objects), return (header, payload, sig_segment).
+    Otherwise None. Decodes nothing destructively -- purely structural."""
+    if not s.startswith("eyJ") or "." not in s:
+        return None
+    parts = s.split(".")
+    if len(parts) < 2:
+        return None
+    objs = []
+    for seg in parts[:2]:
+        raw = _b64url(seg)
+        if raw is None:
+            return None
+        try:
+            obj = _json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        objs.append(obj)
+    return objs[0], objs[1], (parts[2] if len(parts) > 2 else "")
+
+
+def _hr_jwt(s):
+    """Render a JWT as decoded claims instead of an opaque base64 blob. Header
+    and payload are rendered via hr_map (key-sorted, symbol-free, noise-masked);
+    a non-empty signature segment is shown opaque so its presence/length surface.
+    Returns None when `s` is not a JWT (caller falls back to _opaque)."""
+    parsed = _try_jwt(s)
+    if parsed is None:
+        return None
+    hdr, pl, sig = parsed
+    out = "jwt %s %s" % (hr_map(hdr), hr_map(pl))
+    if sig:
+        out += " sig=%s" % _opaque(sig)
+    return out
 
 
 def abbr_kind(kind):
@@ -91,6 +141,9 @@ def hr_value(v):
     if isinstance(v, float):
         return repr(v)
     if isinstance(v, str):
+        j = _hr_jwt(v)
+        if j is not None:
+            return j
         return _opaque(v)
     if isinstance(v, dict):
         if _is_bin(v):
@@ -122,7 +175,37 @@ def hr_list(seq):
     """Render an array as 'l<n> v0 v1 ...' in order."""
     if not seq:
         return "l0"
-    return "l%d %s" % (len(seq), " ".join(hr_value(x) for x in seq))
+    return "l%d %s" % (len(seq), " ".join(_hr_list_items(seq)))
+
+
+def _hr_list_items(seq):
+    """Render array elements, coalescing long runs of printable byte-valued ints
+    into a single 'txt<len>_<ascii>' token (msgpack arrays often carry an
+    embedded UTF-8/JSON blob flattened into per-byte fixints). The l<n> length in
+    hr_list still reflects the true element count, so structure is preserved."""
+    out = []
+    i, n = 0, len(seq)
+    while i < n:
+        j = i
+        while (j < n and isinstance(seq[j], int)
+               and not isinstance(seq[j], bool) and 0 <= seq[j] <= 255):
+            j += 1
+        run = seq[i:j]
+        if len(run) >= T.HR_BYTES_MIN:
+            raw = bytes(run)
+            printable = sum(1 for b in raw if 32 <= b <= 126)
+            if printable >= len(raw) * T.HR_BYTES_PRINT_FRAC:
+                out.append("txt%d_%s" % (
+                    len(raw), _clean(raw.decode("latin1"))))
+                i = j
+                continue
+        if j > i:
+            out.extend(hr_value(x) for x in run)
+            i = j
+        else:
+            out.append(hr_value(seq[i]))
+            i += 1
+    return out
 
 
 # =========================================================================
