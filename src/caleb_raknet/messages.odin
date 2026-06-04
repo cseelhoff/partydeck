@@ -9,6 +9,7 @@ package caleb_raknet
 
 import "core:fmt"
 import "core:net"
+import "core:strings"
 import "core:time"
 
 MAX_INTERNAL_PACKETS :: 512   // internal packets unframed from one datagram
@@ -28,13 +29,13 @@ Reliability :: enum u8 {
 // "InternalPacket". When has_split is set it is fragment split_index of
 // split_count total, belonging to the split packet identified by split_id.
 RakNet_Internal_Packet :: struct {
-	reliability:  Reliability,
-	reliable_num: u32,
-	has_split:    bool,
-	split_count:  u32,
-	split_id:     u16,
-	split_index:  u32,
-	payload:      []byte, // slice into the datagram store's pool
+	reliability:             Reliability,
+	reliable_message_number: u32,
+	has_split:               bool,
+	split_count:             u32,
+	split_id:                u16,
+	split_index:             u32,
+	payload:                 []byte, // slice into the datagram store's pool
 }
 
 // Struct-of-Arrays store of reassembled application messages: complete RakNet
@@ -128,7 +129,7 @@ parse_internal_packets :: proc(datagram_bytes: []byte, raknet_packets: []RakNet_
 
 		if is_reliable {
 			if header_offset + 3 > datagram_bytes_count do break
-			raknet_packet.reliable_num = read_u24_le(datagram_bytes, header_offset); header_offset += 3
+			raknet_packet.reliable_message_number = read_u24_le(datagram_bytes, header_offset); header_offset += 3
 		}
 		if is_sequenced {
 			if header_offset + 3 > datagram_bytes_count do break
@@ -227,21 +228,31 @@ raknet_message_bytes :: proc(s: ^RakNet_Message_Store, i: int) -> []byte {
 }
 
 // Dump every reassembled message in the store: sender, receive time, reliability,
-// fragment count, byte length, and the decoded RakNet_Frame.
+// fragment count, byte length, and the Decoded_Message.
 print_all_messages :: proc(s: ^RakNet_Message_Store) {
 	fmt.printfln("=== %d RakNet messages ===", s.count)
+	// One line buffer reused for every message; reset (not freed) each iteration so
+	// no per-message summary string is allocated.
+	line := strings.builder_make()
+	defer strings.builder_destroy(&line)
 	for i in 0 ..< s.count {
 		payload := raknet_message_bytes(s, i)
-		fmt.printf(
-			"[%d] from=%v recv=%v reliability=%v fragments=%d len=%d -> ",
-			i,
-			s.froms[i],
-			s.recv_times[i],
-			s.reliabilities[i],
-			s.n_fragments[i],
-			s.lengths[i],
-		)
-		print_frame(decode_frame(payload))
-		fmt.println()
+		// Per-message scratch: the decoded msgpack trees and address strings live in
+		// temp and are reclaimed after the line prints.
+		decoded := decode_message(payload, context.temp_allocator)
+		strings.builder_reset(&line)
+		// fmt.sbprintf(
+		// 	&line,
+		// 	"[%d] from=%v recv=%v reliability=%v fragments=%d len=%d -> ",
+		// 	i,
+		// 	s.froms[i],
+		// 	s.recv_times[i],
+		// 	s.reliabilities[i],
+		// 	s.n_fragments[i],
+		// 	s.lengths[i],
+		// )
+		write_decoded_message(&line, decoded)
+		fmt.println(strings.to_string(line))
+		free_all(context.temp_allocator)
 	}
 }

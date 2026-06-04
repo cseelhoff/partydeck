@@ -1,13 +1,12 @@
 package caleb_raknet
 
-// Layer 4: decode a reassembled RakNet_Message byte array into a RakNet_Frame --
-// a typed, structured value describing what the message actually is.
+// Layer 4: decode a reassembled RakNet_Message byte array into a Decoded_Message
+// -- a typed, structured value describing what the message actually is.
 //
 // A RakNet_Message (messages.odin) is still opaque bytes: a leading message-id
 // byte followed by an id-specific body. This layer interprets that body. The
-// result is a RakNet_Frame: a tagged union over every message kind the
-// Ravenswatch / Stormancer flow can carry (see src/raknet-dictionary.md). The
-// wire dictionary calls these typed units "frames", hence the name.
+// result is a Decoded_Message: a tagged union over every message kind the
+// Ravenswatch / Stormancer flow can carry (see src/raknet-dictionary.md).
 //
 // Decoding is zero-copy: variable-length bodies (msgpack blobs, scene payloads)
 // are kept as slices into the message store's pool, never copied. Fields that are
@@ -17,24 +16,30 @@ package caleb_raknet
 
 import "core:fmt"
 import "core:net"
+import "core:strings"
 
-// Message-id bytes (first byte of a connected-layer / transport message). Values
-// < 0x80 are RakNet system ids; >= 0x86 are Stormancer transport ids; >= 0x8D is
-// a dynamically-assigned scene handle, not a fixed id. See raknet-dictionary §3-4.
-ID_CONNECTED_PING              :: 0x00
-ID_CONNECTED_PONG              :: 0x03
-ID_CONNECTION_REQUEST          :: 0x09
-ID_CONNECTION_REQUEST_ACCEPTED :: 0x10
-ID_NEW_INCOMING_CONNECTION     :: 0x13
-ID_DISCONNECTION_NOTIFICATION  :: 0x15
-ID_SYSTEM_REQUEST              :: 134 // 0x86
-ID_REQUEST_RESPONSE_MSG        :: 137 // 0x89
-ID_REQUEST_RESPONSE_COMPLETE   :: 138 // 0x8A
-ID_REQUEST_RESPONSE_ERROR      :: 139 // 0x8B
-ID_CONNECTION_RESULT           :: 140 // 0x8C
-SCENE_HANDLE_MIN               :: 141 // 0x8D; payload[0] >= this => scene message
+// Message_Id is the first byte of a connected-layer / transport message: the id
+// the application switches on (mirrors RakNet's `MessageID` / enum
+// DefaultMessageIDTypes). Values < 0x80 are RakNet system ids; >= 0x86 are
+// Stormancer transport ids; a byte >= SCENE_HANDLE_MIN is a dynamically-assigned
+// scene handle, not a fixed id. See raknet-dictionary §3-4.
+Message_Id :: enum u8 {
+	Connected_Ping              = 0x00,
+	Connected_Pong              = 0x03,
+	Connection_Request          = 0x09,
+	Connection_Request_Accepted = 0x10,
+	New_Incoming_Connection     = 0x13,
+	Disconnection_Notification  = 0x15,
+	System_Request              = 134, // 0x86
+	Response_Msg                = 137, // 0x89
+	Response_Complete           = 138, // 0x8A
+	Response_Error              = 139, // 0x8B
+	Connection_Result           = 140, // 0x8C
+}
 
-MAX_INTERNAL_IDS :: 32 // internal addresses in an ID_CONNECTION_REQUEST_ACCEPTED
+SCENE_HANDLE_MIN :: 141 // 0x8D; payload[0] >= this => scene message
+
+MAX_INTERNAL_IDS :: 32 // internal addresses in a Connection_Request_Accepted
 
 // A RakNet IPv4 SystemAddress: version(1) + complemented IPv4(4) + port(2 BE).
 // `ip` holds the de-complemented octets; the all-zero address (0.0.0.0:0) is the
@@ -47,25 +52,25 @@ System_Address :: struct {
 
 // --- RakNet system frames (connected layer, id < 0x80) ----------------------
 
-// ID_CONNECTED_PING: one RakNetTime clock (uint64 BE).
+// Connected_Ping: one RakNetTime clock (uint64 BE).
 Connected_Ping :: struct {
 	clock: u64,
 }
 
-// ID_CONNECTED_PONG: the echoed ping clock plus the responder's clock (two BE).
+// Connected_Pong: the echoed ping clock plus the responder's clock (two BE).
 Connected_Pong :: struct {
 	echo_clock: u64,
 	clock:      u64,
 }
 
-// ID_CONNECTION_REQUEST (c->s): client GUID(8) + RakNet::Time(8 BE) + useSecurity.
+// Connection_Request (c->s): client GUID(8) + RakNet::Time(8 BE) + useSecurity.
 Connection_Request :: struct {
 	guid:         u64,
 	time:         u64,
 	use_security: bool,
 }
 
-// ID_CONNECTION_REQUEST_ACCEPTED (s->c): the server's reply binding the client's
+// Connection_Request_Accepted (s->c): the server's reply binding the client's
 // external address, its system index, the server's internal address list, and the
 // ping/pong clocks. `internal_count` is how many of `internal` are non-UNASSIGNED.
 Connection_Request_Accepted :: struct {
@@ -77,49 +82,70 @@ Connection_Request_Accepted :: struct {
 	server_time:    u64,
 }
 
-// ID_NEW_INCOMING_CONNECTION (c->s): server address + ping/pong clocks. The middle
-// of the body is uninitialized RakNet stack memory (junk_bytes long), not data.
+// New_Incoming_Connection (c->s): server address + the sender's internal address
+// list + ping/pong clocks. The middle is the sender's own ipList -- up to
+// MAXIMUM_NUMBER_OF_INTERNAL_IDS RakNet SystemAddresses (mostly UNASSIGNED
+// 0.0.0.0:0 padding), the same data as Connection_Request_Accepted.internal. It is
+// kept as an unparsed byte span (internal_list_bytes) because entries may be IPv4
+// or IPv6, so the stride is not fixed; decoding each address is left to a caller.
 New_Incoming_Connection :: struct {
-	server:     System_Address,
-	junk_bytes: int,
-	ping_time:  u64,
-	pong_time:  u64,
+	server:             System_Address,
+	internal_list_bytes: int,
+	ping_time:          u64,
+	pong_time:          u64,
 }
 
-// ID_DISCONNECTION_NOTIFICATION: no body.
+// Disconnection_Notification: no body.
 Disconnection_Notification :: struct {}
 
 // --- Stormancer transport frames (id >= 0x86) -------------------------------
 
-// ID_SYSTEM_REQUEST (c->s): a system RPC. `msg_id` selects the request (see
-// raknet-dictionary §5), `req_id` correlates the reply, `data` is the msgpack
-// argument blob (kept as a slice; decoding msgpack is a higher layer).
-System_Request :: struct {
-	msg_id: u8,
-	req_id: u16,
-	data:   []byte,
+// System_Request_Id is the sub-id (second byte of an ID_SYSTEM_REQUEST frame):
+// which system RPC is being invoked. Mirrors Stormancer SystemRequestIDTypes
+// (stormancer-sdk-js). 0/1/2/134/135/136 are the stock SDK ids; 14 and 16 are
+// Ravenswatch-specific extensions observed in capture (see predict.py SR_*).
+System_Request_Id :: enum u8 {
+	Set_Metadata          = 0,
+	Scene_Ready           = 1,
+	Ping                  = 2,
+	Get_Session_Token     = 14,
+	Scene_Ready2          = 16,
+	Connect_To_Scene      = 134,
+	Disconnect_From_Scene = 135,
+	Get_Scene_Infos       = 136,
 }
 
-// ID_REQUEST_RESPONSE_MSG (s->c): one streamed RPC value / result for `req_id`.
+// System_Request (c->s): a Stormancer system RPC. `msg_id` selects the request,
+// `req_id` correlates the reply, `args` is the typed argument shape for that
+// request (see system_request.odin). Wire layout from stormancer-sdk-js
+// RequestProcessor.sendSystemRequest: [msgId:1][reqId:2 LE][msgpack args].
+// RakNet has no analog -- it hands the whole payload up opaque.
+System_Request :: struct {
+	msg_id: System_Request_Id,
+	req_id: u16,
+	args:   System_Request_Args,
+}
+
+// Response_Msg (s->c): one streamed RPC value / result for `req_id`.
 Response_Msg :: struct {
 	req_id: u16,
-	data:   []byte, // msgpack value
+	data:   Msgpack, // decoded msgpack value
 }
 
-// ID_REQUEST_RESPONSE_COMPLETE (s->c): RPC `req_id` finished; has_values flags
+// Response_Complete (s->c): RPC `req_id` finished; has_values flags
 // whether any Response_Msg values preceded it.
 Response_Complete :: struct {
 	req_id:     u16,
 	has_values: bool,
 }
 
-// ID_REQUEST_RESPONSE_ERROR (s->c): RPC `req_id` failed; data is the msgpack error.
+// Response_Error (s->c): RPC `req_id` failed; data is the decoded msgpack error.
 Response_Error :: struct {
 	req_id: u16,
-	data:   []byte,
+	data:   Msgpack,
 }
 
-// ID_CONNECTION_RESULT (s->c): the server-assigned connection id (uint64 LE).
+// Connection_Result (s->c): the server-assigned connection id (uint64 LE).
 Connection_Result :: struct {
 	connection_id: u64,
 }
@@ -134,15 +160,25 @@ Scene_Message :: struct {
 	body:         []byte,
 }
 
+// A known message id whose body was too short / wrong length to decode. Surfaced
+// as an explicit value -- NOT collapsed into Unknown_Message -- so a malformed
+// known message is distinguishable from a genuinely unknown id. `expected` is the
+// body length the decoder required; `body_len` is what actually arrived.
+Malformed_Message :: struct {
+	id:       u8,
+	body_len: int,
+	expected: int,
+}
+
 // Any message-id this layer does not model (reserved transport ids, future ids).
 // `id` is the leading byte; `body` is everything after it. Nothing is hidden.
-Unknown_Frame :: struct {
+Unknown_Message :: struct {
 	id:   u8,
 	body: []byte,
 }
 
-// The decoded form of one RakNet_Message: exactly one of the frame kinds above.
-RakNet_Frame :: union {
+// The decoded form of one RakNet_Message: exactly one of the message kinds above.
+Decoded_Message :: union {
 	Connected_Ping,
 	Connected_Pong,
 	Connection_Request,
@@ -155,37 +191,39 @@ RakNet_Frame :: union {
 	Response_Error,
 	Connection_Result,
 	Scene_Message,
-	Unknown_Frame,
+	Malformed_Message,
+	Unknown_Message,
 }
 
-// Decode one complete message payload into its RakNet_Frame. Slices in the result
-// alias `msg`, so `msg` must outlive the frame. A truncated or unmodeled message
-// falls back to Unknown_Frame rather than failing -- nothing is dropped silently.
-decode_frame :: proc(msg: []byte) -> RakNet_Frame {
-	if len(msg) == 0 do return Unknown_Frame{}
+// Decode one complete message payload into its Decoded_Message. Slices in the
+// result alias `msg`, so `msg` must outlive the result. A known id whose body is
+// too short returns Malformed_Message; an unmodeled id returns Unknown_Message.
+// Either way nothing is dropped, and a decode failure is an explicit value.
+decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_Message {
+	if len(msg) == 0 do return Malformed_Message{id = 0, body_len = 0, expected = 1}
 	id := msg[0]
 	body := msg[1:]
 
-	switch int(id) {
-	case ID_CONNECTED_PING:
-		if len(body) < 8 do break
+	#partial switch Message_Id(id) {
+	case .Connected_Ping:
+		if len(body) < 8 do return Malformed_Message{id, len(body), 8}
 		return Connected_Ping{clock = read_u64_be(body, 0)}
 
-	case ID_CONNECTED_PONG:
-		if len(body) < 16 do break
+	case .Connected_Pong:
+		if len(body) < 16 do return Malformed_Message{id, len(body), 16}
 		return Connected_Pong{echo_clock = read_u64_be(body, 0), clock = read_u64_be(body, 8)}
 
-	case ID_CONNECTION_REQUEST:
-		if len(body) < 16 do break
+	case .Connection_Request:
+		if len(body) < 16 do return Malformed_Message{id, len(body), 16}
 		return Connection_Request {
 			guid         = read_u64_be(body, 0),
 			time         = read_u64_be(body, 8),
 			use_security = len(body) > 16 && body[16] != 0,
 		}
 
-	case ID_CONNECTION_REQUEST_ACCEPTED:
+	case .Connection_Request_Accepted:
 		expect := 7 + 2 + MAX_INTERNAL_IDS * 7 + 8 + 8
-		if len(body) != expect do break
+		if len(body) != expect do return Malformed_Message{id, len(body), expect}
 		f: Connection_Request_Accepted
 		off := 0
 		f.remote = decode_system_address(body[off:]); off += 7
@@ -199,43 +237,50 @@ decode_frame :: proc(msg: []byte) -> RakNet_Frame {
 		f.server_time = read_u64_be(body, off)
 		return f
 
-	case ID_NEW_INCOMING_CONNECTION:
-		if len(body) < 7 + 16 do break
+	case .New_Incoming_Connection:
+		if len(body) < 7 + 16 do return Malformed_Message{id, len(body), 7 + 16}
 		return New_Incoming_Connection {
-			server     = decode_system_address(body[:7]),
-			junk_bytes = len(body) - 7 - 16,
-			ping_time  = read_u64_be(body, len(body) - 16),
-			pong_time  = read_u64_be(body, len(body) - 8),
+			server              = decode_system_address(body[:7]),
+			internal_list_bytes = len(body) - 7 - 16,
+			ping_time           = read_u64_be(body, len(body) - 16),
+			pong_time           = read_u64_be(body, len(body) - 8),
 		}
 
-	case ID_DISCONNECTION_NOTIFICATION:
+	case .Disconnection_Notification:
 		return Disconnection_Notification{}
 
-	case ID_SYSTEM_REQUEST:
-		if len(body) < 3 do break
-		return System_Request{msg_id = body[0], req_id = read_u16_le(body, 1), data = body[3:]}
+	case .System_Request:
+		if len(body) < 3 do return Malformed_Message{id, len(body), 3}
+		msg_id := System_Request_Id(body[0])
+		decoded := decode_msgpack_field(body[3:], allocator)
+		return System_Request {
+			msg_id = msg_id,
+			req_id = read_u16_le(body, 1),
+			args   = parse_system_request_args(msg_id, decoded, allocator),
+		}
 
-	case ID_REQUEST_RESPONSE_MSG:
-		if len(body) < 2 do break
-		return Response_Msg{req_id = read_u16_le(body, 0), data = body[2:]}
+	case .Response_Msg:
+		if len(body) < 2 do return Malformed_Message{id, len(body), 2}
+		return Response_Msg{req_id = read_u16_le(body, 0), data = decode_msgpack_field(body[2:], allocator)}
 
-	case ID_REQUEST_RESPONSE_COMPLETE:
-		if len(body) < 3 do break
+	case .Response_Complete:
+		if len(body) < 3 do return Malformed_Message{id, len(body), 3}
 		return Response_Complete{req_id = read_u16_le(body, 0), has_values = body[2] != 0}
 
-	case ID_REQUEST_RESPONSE_ERROR:
-		if len(body) < 2 do break
-		return Response_Error{req_id = read_u16_le(body, 0), data = body[2:]}
+	case .Response_Error:
+		if len(body) < 2 do return Malformed_Message{id, len(body), 2}
+		return Response_Error{req_id = read_u16_le(body, 0), data = decode_msgpack_field(body[2:], allocator)}
 
-	case ID_CONNECTION_RESULT:
-		if len(body) < 8 do break
+	case .Connection_Result:
+		if len(body) < 8 do return Malformed_Message{id, len(body), 8}
 		return Connection_Result{connection_id = read_u64_le(body, 0)}
 	}
 
-	if int(id) >= SCENE_HANDLE_MIN && len(body) >= 2 {
+	if int(id) >= SCENE_HANDLE_MIN {
+		if len(body) < 2 do return Malformed_Message{id, len(body), 2}
 		return Scene_Message{scene_handle = id, route_handle = read_u16_le(body, 0), body = body[2:]}
 	}
-	return Unknown_Frame{id = id, body = body}
+	return Unknown_Message{id = id, body = body}
 }
 
 // Decode a 7-byte RakNet SystemAddress: version(1) + complemented IPv4(4) +
@@ -283,43 +328,48 @@ read_u64_le :: proc(b: []byte, off: int) -> u64 {
 	)
 }
 
-// One-line summary of a decoded frame, for debug output.
-print_frame :: proc(frame: RakNet_Frame) {
-	switch f in frame {
+// Write a one-line summary of a decoded message into `sb`, for debug output. The
+// caller owns `sb` and can reset and reuse it across many messages, so no per-call
+// string is allocated.
+write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message) {
+	switch f in message {
 	case Connected_Ping:
-		fmt.printf("Connected_Ping clk=%d", f.clock)
+		fmt.sbprintf(sb, "Connected_Ping clk=%d", f.clock)
 	case Connected_Pong:
-		fmt.printf("Connected_Pong echo=%d clk=%d", f.echo_clock, f.clock)
+		fmt.sbprintf(sb, "Connected_Pong echo=%d clk=%d", f.echo_clock, f.clock)
 	case Connection_Request:
-		fmt.printf("Connection_Request guid=%016x time=%d sec=%v", f.guid, f.time, f.use_security)
+		fmt.sbprintf(sb, "Connection_Request guid=%016x time=%d sec=%v", f.guid, f.time, f.use_security)
 	case Connection_Request_Accepted:
-		fmt.printf(
-			"Connection_Request_Accepted remote=%s sysidx=%d internal=%d echo=%d srv=%d",
+		fmt.sbprintf(
+			sb, "Connection_Request_Accepted remote=%s sysidx=%d internal=%d echo=%d srv=%d",
 			address_to_string(f.remote), f.system_index, f.internal_count, f.echo_time, f.server_time,
 		)
 	case New_Incoming_Connection:
-		fmt.printf(
-			"New_Incoming_Connection server=%s junk=%dB ping=%d pong=%d",
-			address_to_string(f.server), f.junk_bytes, f.ping_time, f.pong_time,
+		fmt.sbprintf(
+			sb, "New_Incoming_Connection server=%s internal_list=%dB ping=%d pong=%d",
+			address_to_string(f.server), f.internal_list_bytes, f.ping_time, f.pong_time,
 		)
 	case Disconnection_Notification:
-		fmt.printf("Disconnection_Notification")
+		fmt.sbprintf(sb, "Disconnection_Notification")
 	case System_Request:
-		fmt.printf("System_Request msg_id=%d req=%d data=%dB", f.msg_id, f.req_id, len(f.data))
+		fmt.sbprintf(sb, "System_Request msg_id=%v req=%d args=", f.msg_id, f.req_id)
+		write_system_request_args(sb, f.args)
 	case Response_Msg:
-		fmt.printf("Response_Msg req=%d data=%dB", f.req_id, len(f.data))
+		fmt.sbprintf(sb, "Response_Msg req=%d data=%s", f.req_id, msgpack_field_string(f.data))
 	case Response_Complete:
-		fmt.printf("Response_Complete req=%d has_values=%v", f.req_id, f.has_values)
+		fmt.sbprintf(sb, "Response_Complete req=%d has_values=%v", f.req_id, f.has_values)
 	case Response_Error:
-		fmt.printf("Response_Error req=%d data=%dB", f.req_id, len(f.data))
+		fmt.sbprintf(sb, "Response_Error req=%d data=%s", f.req_id, msgpack_field_string(f.data))
 	case Connection_Result:
-		fmt.printf("Connection_Result connid=%d", f.connection_id)
+		fmt.sbprintf(sb, "Connection_Result connid=%d", f.connection_id)
 	case Scene_Message:
-		fmt.printf("Scene_Message handle=%d route=%d body=%dB", f.scene_handle, f.route_handle, len(f.body))
-	case Unknown_Frame:
-		fmt.printf("Unknown_Frame id=0x%02x body=%dB", f.id, len(f.body))
+		fmt.sbprintf(sb, "Scene_Message handle=%d route=%d body=%dB", f.scene_handle, f.route_handle, len(f.body))
+	case Malformed_Message:
+		fmt.sbprintf(sb, "Malformed_Message id=0x%02x body=%dB expected>=%dB", f.id, f.body_len, f.expected)
+	case Unknown_Message:
+		fmt.sbprintf(sb, "Unknown_Message id=0x%02x body=%dB", f.id, len(f.body))
 	case:
-		fmt.printf("nil")
+		fmt.sbprintf(sb, "nil")
 	}
 }
 
