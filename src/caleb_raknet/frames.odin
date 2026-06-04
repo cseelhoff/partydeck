@@ -126,10 +126,12 @@ System_Request :: struct {
 	args:   System_Request_Args,
 }
 
-// Response_Msg (s->c): one streamed RPC value / result for `req_id`.
+// Response_Msg (s->c): one streamed RPC value / result for `req_id`. `data` is the
+// typed reply shape (see response.odin), chosen by the structure of the payload
+// since the originating RPC type is not known from a req_id alone.
 Response_Msg :: struct {
 	req_id: u16,
-	data:   Msgpack, // decoded msgpack value
+	data:   Response_Data,
 }
 
 // Response_Complete (s->c): RPC `req_id` finished; has_values flags
@@ -152,12 +154,14 @@ Connection_Result :: struct {
 
 // Scene data message (payload[0] >= SCENE_HANDLE_MIN): addressed to a scene by its
 // runtime-assigned handle and to a route within that scene. `body` is the route
-// payload (often [rpcReqId:2 LE] + msgpack); resolving handle->scene/route names
-// requires the learned route tables, a higher layer.
+// payload (often [rpcReqId:2 LE] + msgpack); `decoded` is that payload parsed into
+// its rpc id + msgpack value list (scene_message.odin). Resolving handle->scene/
+// route names requires the learned route tables, a higher layer.
 Scene_Message :: struct {
 	scene_handle: u8,
 	route_handle: u16,
 	body:         []byte,
+	decoded:      Scene_Body,
 }
 
 // A known message id whose body was too short / wrong length to decode. Surfaced
@@ -261,7 +265,10 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 
 	case .Response_Msg:
 		if len(body) < 2 do return Malformed_Message{id, len(body), 2}
-		return Response_Msg{req_id = read_u16_le(body, 0), data = decode_msgpack_field(body[2:], allocator)}
+		return Response_Msg {
+			req_id = read_u16_le(body, 0),
+			data   = parse_response_data(decode_msgpack_field(body[2:], allocator), allocator),
+		}
 
 	case .Response_Complete:
 		if len(body) < 3 do return Malformed_Message{id, len(body), 3}
@@ -278,7 +285,13 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 
 	if int(id) >= SCENE_HANDLE_MIN {
 		if len(body) < 2 do return Malformed_Message{id, len(body), 2}
-		return Scene_Message{scene_handle = id, route_handle = read_u16_le(body, 0), body = body[2:]}
+		route_payload := body[2:]
+		return Scene_Message {
+			scene_handle = id,
+			route_handle = read_u16_le(body, 0),
+			body         = route_payload,
+			decoded      = decode_scene_body(route_payload, allocator),
+		}
 	}
 	return Unknown_Message{id = id, body = body}
 }
@@ -355,7 +368,8 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message) {
 		fmt.sbprintf(sb, "System_Request msg_id=%v req=%d args=", f.msg_id, f.req_id)
 		write_system_request_args(sb, f.args)
 	case Response_Msg:
-		fmt.sbprintf(sb, "Response_Msg req=%d data=%s", f.req_id, msgpack_field_string(f.data))
+		fmt.sbprintf(sb, "Response_Msg req=%d data=", f.req_id)
+		write_response_data(sb, f.data)
 	case Response_Complete:
 		fmt.sbprintf(sb, "Response_Complete req=%d has_values=%v", f.req_id, f.has_values)
 	case Response_Error:
@@ -363,7 +377,8 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message) {
 	case Connection_Result:
 		fmt.sbprintf(sb, "Connection_Result connid=%d", f.connection_id)
 	case Scene_Message:
-		fmt.sbprintf(sb, "Scene_Message handle=%d route=%d body=%dB", f.scene_handle, f.route_handle, len(f.body))
+		fmt.sbprintf(sb, "Scene_Message handle=%d route=%d body=%dB ", f.scene_handle, f.route_handle, len(f.body))
+		write_scene_body(sb, f.decoded)
 	case Malformed_Message:
 		fmt.sbprintf(sb, "Malformed_Message id=0x%02x body=%dB expected>=%dB", f.id, f.body_len, f.expected)
 	case Unknown_Message:

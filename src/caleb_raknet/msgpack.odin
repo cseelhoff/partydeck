@@ -15,6 +15,7 @@ package caleb_raknet
 // ext (fix + 8/16/32, incl. timestamp ext -1). That is the full set seen on the
 // wire plus the rest of the common spec, since it costs little extra.
 
+import "core:encoding/base64"
 import "core:fmt"
 import "core:strings"
 
@@ -306,6 +307,30 @@ Msgpack :: struct {
 	ok:    bool,
 }
 
+// A sequence of concatenated top-level msgpack values. Stormancer's serializer
+// writes several values back-to-back (no wrapping array), so a scene-message body
+// is a forest, not one tree. `roots` holds each value's root index into the shared
+// `nodes` pool; `ok` is true only if every byte decoded into a clean value.
+Msgpack_Seq :: struct {
+	nodes: []Msgpack_Node,
+	roots: []int,
+	raw:   []byte,
+	ok:    bool,
+}
+
+// Decode `src` as zero or more concatenated msgpack values. Stops at the first
+// malformed value but returns every value decoded so far; ok=false then signals
+// the bytes were not a clean value sequence. Pool and roots use `allocator`.
+msgpack_decode_seq :: proc(src: []byte, allocator := context.allocator) -> Msgpack_Seq {
+	pool := make([dynamic]Msgpack_Node, allocator)
+	roots := make([dynamic]int, allocator)
+	d := Msgpack_Decoder{src = src, pool = &pool, ok = true}
+	for d.pos < len(d.src) && d.ok {
+		append(&roots, mp_value(&d))
+	}
+	return Msgpack_Seq{nodes = pool[:], roots = roots[:], raw = src, ok = d.ok && d.pos == len(src)}
+}
+
 // Decode a msgpack blob carried by a frame into a Msgpack value. An empty or
 // non-msgpack blob yields ok=false with `raw` retained (no error -- some bodies
 // are raw clocks, not msgpack). `nodes` is allocated with `allocator`.
@@ -352,7 +377,9 @@ mp_write :: proc(b: ^strings.Builder, nodes: []Msgpack_Node, i: int) -> int {
 		fmt.sbprintf(b, "%g", n.f)
 		return i + 1
 	case .Str:
-		fmt.sbprintf(b, "%q", n.str)
+		if !mp_write_jwt(b, n.str) {
+			fmt.sbprintf(b, "%q", n.str)
+		}
 		return i + 1
 	case .Bin:
 		fmt.sbprintf(b, "bin<%d>", n.count)
@@ -386,3 +413,48 @@ mp_write :: proc(b: ^strings.Builder, nodes: []Msgpack_Node, i: int) -> int {
 	}
 	return i + 1
 }
+
+// If `s` is a JSON Web Token (base64url(header).base64url(payload).sig), expand
+// it into the decoded header + payload JSON text so no opaque encoded string is
+// left in the output; return false (leave it to the caller to quote) otherwise.
+// Stormancer mints these as the get-session-token reply value. Conservative: a
+// JWT always starts with "eyJ" (base64url of `{"`) and both segments must
+// base64url-decode to JSON objects.
+mp_write_jwt :: proc(b: ^strings.Builder, s: string) -> bool {
+	if !strings.has_prefix(s, "eyJ") do return false
+	dot := strings.index_byte(s, '.')
+	if dot <= 0 do return false
+	rest := s[dot + 1:]
+	dot2 := strings.index_byte(rest, '.')
+	payload_seg := rest
+	sig_len := 0
+	if dot2 >= 0 {
+		payload_seg = rest[:dot2]
+		sig_len = len(rest) - dot2 - 1
+	}
+
+	header, hok := b64url_to_json(s[:dot], context.temp_allocator)
+	if !hok do return false
+	payload, pok := b64url_to_json(payload_seg, context.temp_allocator)
+	if !pok do return false
+
+	fmt.sbprintf(b, "JWT{{header=%s payload=%s sig=%dB}}", header, payload, sig_len)
+	return true
+}
+
+// base64url-decode `seg` (JWT segments are unpadded) and return the bytes as a
+// string iff they look like a JSON object ('{' ... '}'). ok=false on a decode
+// failure or non-JSON payload, so mp_write_jwt only fires on a genuine token.
+b64url_to_json :: proc(seg: string, allocator := context.allocator) -> (string, bool) {
+	padded := seg
+	if rem := len(seg) % 4; rem != 0 {
+		pb := strings.builder_make(allocator)
+		strings.write_string(&pb, seg)
+		for _ in 0 ..< (4 - rem) do strings.write_byte(&pb, '=')
+		padded = strings.to_string(pb)
+	}
+	decoded, err := base64.decode(padded, base64.DEC_URL_TABLE, allocator)
+	if err != nil || len(decoded) == 0 || decoded[0] != '{' do return "", false
+	return string(decoded), true
+}
+

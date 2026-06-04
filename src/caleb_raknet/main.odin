@@ -115,7 +115,7 @@ net_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, rea
 		}
 		log_datagram(log, scratch, remote, now, buf[:n])
 		process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
-		fmt.printfln("stored %d bytes from %v (datagrams %d, messages %d)", n, remote, dgrams.count, msgs.count)
+		// fmt.printfln("stored %d bytes from %v (datagrams %d, messages %d)", n, remote, dgrams.count, msgs.count)
 	}
 	return nil
 }
@@ -197,7 +197,7 @@ replay :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, reasm: 
 			break
 		}
 		process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
-		fmt.printfln("ingested %d bytes from %v (datagrams %d, messages %d)", len(decoded), from, dgrams.count, msgs.count)
+		// fmt.printfln("ingested %d bytes from %v (datagrams %d, messages %d)", len(decoded), from, dgrams.count, msgs.count)
 	}
 	print_all_messages(msgs)
 	return nil
