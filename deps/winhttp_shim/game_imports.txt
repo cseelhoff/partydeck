@@ -1,49 +1,49 @@
-DllCanUnloadNow
-DllGetClassObject
-DllRegisterServer
-DllUnregisterServer
-WinHttpAddRequestHeaders
-WinHttpCheckPlatform
-WinHttpCloseHandle
-WinHttpConnect
-WinHttpCrackUrl
-WinHttpCreateProxyResolver
-WinHttpCreateUrl
-WinHttpDetectAutoProxyConfigUrl
-WinHttpFreeProxyResult
-WinHttpFreeProxyResultEx
-WinHttpFreeProxySettings
-WinHttpGetDefaultProxyConfiguration
-WinHttpGetIEProxyConfigForCurrentUser
-WinHttpGetProxyForUrl
-WinHttpGetProxyForUrlEx
-WinHttpGetProxyForUrlEx2
-WinHttpGetProxyResult
-WinHttpGetProxyResultEx
-WinHttpGetProxySettingsVersion
-WinHttpOpen
-WinHttpOpenRequest
-WinHttpQueryAuthSchemes
-WinHttpQueryDataAvailable
-WinHttpQueryHeaders
-WinHttpQueryOption
-WinHttpReadData
-WinHttpReadProxySettings
-WinHttpReceiveResponse
-WinHttpResetAutoProxy
-WinHttpSendRequest
-WinHttpSetCredentials
-WinHttpSetDefaultProxyConfiguration
-WinHttpSetOption
-WinHttpSetStatusCallback
-WinHttpSetTimeouts
-WinHttpTimeFromSystemTime
-WinHttpTimeToSystemTime
-WinHttpWebSocketClose
-WinHttpWebSocketCompleteUpgrade
-WinHttpWebSocketQueryCloseStatus
-WinHttpWebSocketReceive
-WinHttpWebSocketSend
-WinHttpWebSocketShutdown
-WinHttpWriteData
-WinHttpWriteProxySettings
+1 DllCanUnloadNow
+2 DllGetClassObject
+3 DllRegisterServer
+4 DllUnregisterServer
+5 WinHttpAddRequestHeaders
+6 WinHttpCheckPlatform
+7 WinHttpCloseHandle
+8 WinHttpConnect
+9 WinHttpCrackUrl
+10 WinHttpCreateProxyResolver
+11 WinHttpCreateUrl
+12 WinHttpDetectAutoProxyConfigUrl
+13 WinHttpFreeProxyResult
+14 WinHttpFreeProxyResultEx
+15 WinHttpFreeProxySettings
+16 WinHttpGetDefaultProxyConfiguration
+17 WinHttpGetIEProxyConfigForCurrentUser
+18 WinHttpGetProxyForUrl
+19 WinHttpGetProxyForUrlEx
+20 WinHttpGetProxyForUrlEx2
+21 WinHttpGetProxyResult
+22 WinHttpGetProxyResultEx
+23 WinHttpGetProxySettingsVersion
+24 WinHttpOpen
+25 WinHttpOpenRequest
+26 WinHttpQueryAuthSchemes
+27 WinHttpQueryDataAvailable
+28 WinHttpQueryHeaders
+29 WinHttpQueryOption
+30 WinHttpReadData
+31 WinHttpReadProxySettings
+32 WinHttpReceiveResponse
+33 WinHttpResetAutoProxy
+34 WinHttpSendRequest
+35 WinHttpSetCredentials
+36 WinHttpSetDefaultProxyConfiguration
+37 WinHttpSetOption
+38 WinHttpSetStatusCallback
+39 WinHttpSetTimeouts
+40 WinHttpTimeFromSystemTime
+41 WinHttpTimeToSystemTime
+42 WinHttpWebSocketClose
+43 WinHttpWebSocketCompleteUpgrade
+44 WinHttpWebSocketQueryCloseStatus
+45 WinHttpWebSocketReceive
+46 WinHttpWebSocketSend
+47 WinHttpWebSocketShutdown
+48 WinHttpWriteData
+49 WinHttpWriteProxySettings
