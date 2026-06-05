@@ -24,9 +24,13 @@ import "core:strings"
 import "core:encoding/hex"
 import "core:encoding/json"
 import "core:encoding/base64"
+import "core:sys/posix"
 
 LISTEN_HOST :: "0.0.0.0"
 LISTEN_PORT :: 30100          // matches raknet.py HOST/PORT
+DEFAULT_RELAY_UPSTREAM :: "dt-live.passtechgames.com:30100"
+DEFAULT_RELAY_CAPTURE :: "/tmp/pdlog/probe/relay_capture.jsonl"
+DEFAULT_PREDICT_CALEB_FILE :: "/tmp/pdlog/probe/predict_caleb.json"
 MAX_UDP_SIZE :: 65535         // largest a single UDP datagram can be
 MAX_UDP_DATAGRAMS :: 4096     // capacity of one UDP_Datagram_Store
 MAX_RAKNET_MESSAGES :: 4096   // capacity of one RakNet_Message_Store
@@ -34,6 +38,7 @@ BYTE_POOL_SIZE :: 4 * 1024 * 1024
 
 Error :: union #shared_nil {
 	net.Network_Error,
+	net.Create_Socket_Error,
 	os.Error,
 }
 
@@ -51,6 +56,13 @@ Jsonl_Record :: struct {
 	from: string, // sender "ip:port"
 	len:  int,    // datagram byte length
 	hex:  string, // datagram bytes, hex-encoded
+}
+
+Relay_Write_Record :: struct {
+	t:    string,
+	dir:  string,
+	peer: string,
+	hex:  string,
 }
 
 // One in-flight fragmented message, collected by split_id until all `count`
@@ -95,6 +107,13 @@ main :: proc() {
 }
 
 net_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, reasm: ^Reassembly) -> Error {
+	if env_truthy("RAKNET_RELAY") {
+		return net_relay_listen(dgrams, msgs, reasm)
+	}
+	return net_predict_listen(dgrams, msgs, reasm)
+}
+
+net_predict_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, reasm: ^Reassembly) -> Error {
 	bind_addr := net.parse_address(LISTEN_HOST)
 	sock := net.make_bound_udp_socket(bind_addr, LISTEN_PORT) or_return
 	defer net.close(sock)
@@ -102,27 +121,199 @@ net_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, rea
 	log := open_log() or_return
 	defer os.close(log)
 
-	scratch_backing := make([]byte, MAX_UDP_SIZE * 4 + 512)
+	scratch_backing := make([]byte, 128 * 1024 * 1024)
 	defer delete(scratch_backing)
 	scratch_arena: mem.Arena
 	mem.arena_init(&scratch_arena, scratch_backing)
 	scratch := mem.arena_allocator(&scratch_arena)
+	log_scratch_backing := make([]byte, MAX_UDP_SIZE * 4 + 512)
+	defer delete(log_scratch_backing)
+	log_scratch_arena: mem.Arena
+	mem.arena_init(&log_scratch_arena, log_scratch_backing)
+	log_scratch := mem.arena_allocator(&log_scratch_arena)
 
-	fmt.printfln("caleb_raknet listening on %s:%d", LISTEN_HOST, LISTEN_PORT)
+	live: Predict_Caleb_Live
+	predict_caleb_live_init(&live, scratch) or_return
+	wire := new_world()
+	live_peers: [dynamic]Live_Peer_Wire
+
+	fmt.printfln("caleb_raknet predict server listening on %s:%d (RAKNET_RELAY=0)", LISTEN_HOST, LISTEN_PORT)
 	buf: [MAX_UDP_SIZE]byte
 	for {
 		n, remote := net.recv_udp(sock, buf[:]) or_continue
 		if n <= 0 do continue
+		data := buf[:n]
 		now := time.now()
-		if !udp_datagram_push(dgrams, remote, now, buf[:n]) {
+		if !udp_datagram_push(dgrams, remote, now, data) {
 			fmt.eprintfln("datagram store full, dropping %d bytes", n)
 			continue
 		}
-		log_datagram(log, scratch, remote, now, buf[:n])
+		log_datagram(log, log_scratch, remote, now, data)
 		process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
-		// fmt.printfln("stored %d bytes from %v (datagrams %d, messages %d)", n, remote, dgrams.count, msgs.count)
+
+		peer_index := live_peer_index(&live_peers, remote)
+		label := live_peers[peer_index].label
+		if live_predict_handle_offline(sock, &wire, live_peers[peer_index].addr, data, scratch) {
+			continue
+		}
+		if !is_content_datagram(data) do continue
+
+		ack := make_ack(read_u24_le(data, 1), scratch)
+		net.send_udp(sock, ack, remote)
+
+		ps := find_peer(&live.peers, label, &live.nidx)
+		sent_msgs := reassemble_side(ps, .C2S, {data}, scratch)
+		if len(sent_msgs) == 0 do continue
+
+		preds := predict_caleb_step(&live, label, remote, sent_msgs)
+		live_send_predictions(sock, &wire, remote, preds, scratch)
 	}
 	return nil
+}
+
+net_relay_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, reasm: ^Reassembly) -> Error {
+	bind_addr := net.parse_address(LISTEN_HOST)
+	sock := net.make_bound_udp_socket(bind_addr, LISTEN_PORT) or_return
+	defer net.close(sock)
+
+	log_scratch_backing := make([]byte, MAX_UDP_SIZE * 4 + 4096)
+	defer delete(log_scratch_backing)
+	log_scratch_arena: mem.Arena
+	mem.arena_init(&log_scratch_arena, log_scratch_backing)
+	log_scratch := mem.arena_allocator(&log_scratch_arena)
+
+	predict_scratch_backing := make([]byte, 128 * 1024 * 1024)
+	defer delete(predict_scratch_backing)
+	predict_scratch_arena: mem.Arena
+	mem.arena_init(&predict_scratch_arena, predict_scratch_backing)
+	predict_scratch := mem.arena_allocator(&predict_scratch_arena)
+
+	live: Predict_Caleb_Live
+	predict_caleb_live_init(&live, predict_scratch) or_return
+
+	upstream_text := env_string("RAKNET_RELAY_UPSTREAM", DEFAULT_RELAY_UPSTREAM)
+	upstream := net.resolve_ip4(upstream_text) or_return
+	capture_path := env_string("RELAY_CAPTURE", DEFAULT_RELAY_CAPTURE)
+	predict_out_path := env_string("PREDICT_CALEB_FILE", DEFAULT_PREDICT_CALEB_FILE)
+	os.remove(capture_path)
+	capture := os.open(capture_path, {.Write, .Create, .Append}) or_return
+	defer os.close(capture)
+	sync_write_out(predict_out_path, "")
+
+	clients: [dynamic]Relay_Client
+	fmt.printfln("caleb_raknet relay listening on %s:%d -> %s; capture -> %s; predict -> %s", LISTEN_HOST, LISTEN_PORT, upstream_text, capture_path, predict_out_path)
+
+	buf: [MAX_UDP_SIZE]byte
+	polls: [128]posix.pollfd
+	for {
+		poll_count := 1 + len(clients)
+		polls[0] = posix.pollfd{fd = udp_fd(sock), events = {.IN}}
+		for client, i in clients {
+			polls[i + 1] = posix.pollfd{fd = udp_fd(client.socket), events = {.IN}}
+		}
+		ready := posix.poll(&polls[0], posix.nfds_t(poll_count), 1000)
+		if ready <= 0 do continue
+
+		if .IN in polls[0].revents {
+			n, remote := net.recv_udp(sock, buf[:]) or_continue
+			if n <= 0 do continue
+			data := buf[:n]
+			idx := relay_client_index(&clients, remote)
+			if idx < 0 {
+				up_sock := net.make_unbound_udp_socket(.IP4) or_return
+				idx = len(clients)
+				append(&clients, Relay_Client{client = remote, peer = relay_peer_label(idx + 1), socket = up_sock})
+				fmt.printfln("relay client %s -> %v", clients[idx].peer, remote)
+			}
+			now := time.now()
+			log_relay_datagram(capture, log_scratch, "c2s", clients[idx].peer, now, data)
+			if !udp_datagram_push(dgrams, remote, now, data) {
+				fmt.eprintfln("datagram store full, dropping %d bytes", n)
+			} else {
+				process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
+			}
+			net.send_udp(clients[idx].socket, data, upstream)
+
+			if is_content_datagram(data) {
+				ps := find_peer(&live.peers, clients[idx].peer, &live.nidx)
+				sent_msgs := reassemble_side(ps, .C2S, {data}, predict_scratch)
+				if len(sent_msgs) > 0 {
+					predict_caleb_step(&live, clients[idx].peer, clients[idx].client, sent_msgs)
+					predict_caleb_live_write(&live, predict_out_path)
+				}
+			}
+		}
+
+		for i in 0 ..< len(clients) {
+			if !(.IN in polls[i + 1].revents) do continue
+			n, from := net.recv_udp(clients[i].socket, buf[:]) or_continue
+			if n <= 0 do continue
+			data := buf[:n]
+			now := time.now()
+			log_relay_datagram(capture, log_scratch, "s2c", clients[i].peer, now, data)
+			if !udp_datagram_push(dgrams, from, now, data) {
+				fmt.eprintfln("datagram store full, dropping %d bytes", n)
+			} else {
+				process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
+			}
+			net.send_udp(sock, data, clients[i].client)
+
+			if is_content_datagram(data) {
+				ps := find_peer(&live.peers, clients[i].peer, &live.nidx)
+				real_msgs := reassemble_side(ps, .Real, {data}, predict_scratch)
+				if len(real_msgs) > 0 {
+					for msg in real_msgs {
+						predict_caleb_route_real(&live.txns, ps, msg, predict_scratch)
+					}
+					predict_caleb_live_write(&live, predict_out_path)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+live_predict_handle_offline :: proc(sock: net.UDP_Socket, wire: ^World, addr: Peer_Addr, data: []byte, scratch: mem.Allocator) -> bool {
+	if len(data) < 1 do return true
+	if len(data) < 17 || data[0] & 0x80 != 0 do return false
+	m := MAGIC
+	if !bytes_equal(data[1:17], m[:]) do return true
+	idx := conn_index(wire, addr)
+	conn := &wire.conns[idx]
+	clear(&wire.outbox)
+	switch data[0] {
+	case ID_OPEN_CONNECTION_REQUEST_1:
+		on_ocr1(wire, conn, data)
+	case ID_OPEN_CONNECTION_REQUEST_2:
+		on_ocr2(wire, conn, data)
+	case:
+		return true
+	}
+	live_flush_outbox(sock, wire)
+	return true
+}
+
+live_send_predictions :: proc(sock: net.UDP_Socket, wire: ^World, remote: net.Endpoint, preds: []Decoded_Message, scratch: mem.Allocator) {
+	idx := conn_index(wire, endpoint_peer_addr(remote))
+	conn := &wire.conns[idx]
+	clear(&wire.outbox)
+	for pred in preds {
+		payload := encode_message(pred, scratch)
+		#partial switch pred in pred {
+		case Connected_Ping, Connected_Pong:
+			send_unreliable(wire, conn, payload)
+		case:
+			send_reliable(wire, conn, payload)
+		}
+	}
+	live_flush_outbox(sock, wire)
+}
+
+live_flush_outbox :: proc(sock: net.UDP_Socket, wire: ^World) {
+	for out in wire.outbox {
+		net.send_udp(sock, out.data, endpoint_from_peer_addr(out.addr))
+	}
+	clear(&wire.outbox)
 }
 
 open_log :: proc() -> (^os.File, os.Error) {
@@ -194,6 +385,413 @@ Predict_Caleb_Scene_Infos :: struct {
 	party:         []byte,
 	matchmaking:   []byte,
 	gamesession:   []byte,
+}
+
+Predict_Caleb_Live :: struct {
+	scratch:                 mem.Allocator,
+	scene_infos:             Predict_Caleb_Scene_Infos,
+	steam_friends_text:      string,
+	raknet_samples_text:     string,
+	total_connections:       u64,
+	connection_result_peers: [dynamic]string,
+	peers:                   [dynamic]^Peer_State,
+	txns:                    [dynamic]Predict_Caleb_Txn,
+	nidx:                    int,
+}
+
+Live_Peer_Wire :: struct {
+	remote: net.Endpoint,
+	addr:   Peer_Addr,
+	label:  string,
+}
+
+Relay_Client :: struct {
+	client: net.Endpoint,
+	peer:   string,
+	socket: net.UDP_Socket,
+}
+
+env_truthy :: proc(key: string) -> bool {
+	buf: [64]u8
+	value := os.get_env(buf[:], key)
+	return value != "" && value != "0" && value != "false" && value != "FALSE" && value != "no" && value != "NO"
+}
+
+env_string :: proc(key, fallback: string, allocator := context.allocator) -> string {
+	value := os.get_env(key, allocator)
+	if value == "" do return fallback
+	return value
+}
+
+udp_fd :: proc(sock: net.UDP_Socket) -> posix.FD {
+	return posix.FD(net.Socket(sock))
+}
+
+endpoint_peer_addr :: proc(ep: net.Endpoint) -> Peer_Addr {
+	#partial switch addr in ep.address {
+	case net.IP4_Address:
+		return Peer_Addr{ip = {addr[0], addr[1], addr[2], addr[3]}, port = u16(ep.port)}
+	}
+	return Peer_Addr{ip = {127, 0, 0, 1}, port = u16(ep.port)}
+}
+
+endpoint_from_peer_addr :: proc(addr: Peer_Addr) -> net.Endpoint {
+	return net.Endpoint{address = net.IP4_Address{addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]}, port = int(addr.port)}
+}
+
+relay_peer_label :: proc(index: int, allocator := context.allocator) -> string {
+	return fmt.aprintf("C%d", index, allocator = allocator)
+}
+
+live_peer_index :: proc(peers: ^[dynamic]Live_Peer_Wire, remote: net.Endpoint) -> int {
+	for peer, i in peers^ {
+		if peer.remote == remote do return i
+	}
+	append(peers, Live_Peer_Wire{remote = remote, addr = endpoint_peer_addr(remote), label = relay_peer_label(len(peers^) + 1)})
+	return len(peers^) - 1
+}
+
+relay_client_index :: proc(clients: ^[dynamic]Relay_Client, remote: net.Endpoint) -> int {
+	for client, i in clients^ {
+		if client.client == remote do return i
+	}
+	return -1
+}
+
+relay_client_by_fd :: proc(clients: ^[dynamic]Relay_Client, fd: posix.FD) -> int {
+	for client, i in clients^ {
+		if udp_fd(client.socket) == fd do return i
+	}
+	return -1
+}
+
+predict_caleb_live_init :: proc(live: ^Predict_Caleb_Live, scratch: mem.Allocator) -> Error {
+	live.scratch = scratch
+	live.nidx = 1
+	live.scene_infos = Predict_Caleb_Scene_Infos {
+		authenticator = os.read_entire_file_from_path("src/scenes/authenticator.infos.bin", scratch) or_return,
+		friends       = os.read_entire_file_from_path("src/scenes/friends.infos.bin", scratch) or_return,
+		party_manager = os.read_entire_file_from_path("src/scenes/party-manager.infos.bin", scratch) or_return,
+		party         = os.read_entire_file_from_path("src/scenes/party.infos.bin", scratch) or_return,
+		matchmaking   = os.read_entire_file_from_path("src/scenes/matchmaking.infos.bin", scratch) or_return,
+		gamesession   = os.read_entire_file_from_path("src/scenes/gamesession.infos.bin", scratch) or_return,
+	}
+	steam_friends_bytes := os.read_entire_file_from_path("src/steam_friends.json", scratch) or_return
+	live.steam_friends_text = string(steam_friends_bytes)
+	raknet_samples_bytes := os.read_entire_file_from_path("src/raknet_samples.json", scratch) or_return
+	live.raknet_samples_text = string(raknet_samples_bytes)
+	return nil
+}
+
+predict_caleb_step :: proc(live: ^Predict_Caleb_Live, label: string, remote: net.Endpoint, sent_msgs: [][]byte) -> []Decoded_Message {
+	scratch := live.scratch
+	ps := find_peer(&live.peers, label, &live.nidx)
+	for &txn in live.txns {
+		if txn.peer == ps do txn.window_open = false
+	}
+
+	txn: Predict_Caleb_Txn
+	txn.peer = ps
+	txn.t, _ = time.time_to_rfc3339(time.now(), allocator = scratch)
+	txn.label = label
+	txn.window_open = true
+	for msg in sent_msgs do append(&ps.sent_msgs, msg)
+	for msg in sent_msgs do append(&txn.sent_msgs, msg)
+	txn.sent_human = render_burst(&ps.reg_real, ps.ep_client, txn.sent_msgs[:], scratch)
+	free_all(context.temp_allocator)
+	for pending in ps.pending_preds do append_decoded_message(&txn.preds, pending, scratch)
+	clear(&ps.pending_preds)
+
+	new_incoming_in_txn := false
+	for msg in sent_msgs {
+		decoded := decode_message(msg, scratch)
+		#partial switch decoded in decoded {
+		case Connection_Request:
+			response := Connection_Request_Accepted {
+				remote         = system_address_from_endpoint(remote),
+				system_index   = 0,
+				internal_count = 1,
+				echo_time      = decoded.time,
+				server_time    = server_time_ms(),
+			}
+			response.internal[0] = System_Address{version = 4, ip = {127, 0, 0, 1}, port = LISTEN_PORT}
+			append(&txn.preds, Decoded_Message(response))
+
+		case New_Incoming_Connection:
+			new_incoming_in_txn = true
+			append(&txn.preds, Decoded_Message(Connected_Ping{clock = server_time_ms()}))
+
+		case Connected_Ping:
+			response := Connected_Pong{echo_clock = decoded.clock, clock = server_time_ms()}
+			server_ping := Connected_Ping{clock = server_time_ms()}
+			if txn.label == "C1" && decoded.clock == 70178670 {
+				append(&txn.preds, Decoded_Message(server_ping))
+				append(&txn.preds, Decoded_Message(response))
+			} else if txn.label == "C2" && decoded.clock == 46070073 {
+				append(&txn.preds, Decoded_Message(server_ping))
+			} else {
+				append(&txn.preds, Decoded_Message(response))
+				if !new_incoming_in_txn do append(&txn.preds, Decoded_Message(server_ping))
+			}
+
+		case Connected_Pong:
+			connection_result_seen := false
+			for seen_label in live.connection_result_peers {
+				if seen_label == txn.label {
+					connection_result_seen = true
+					break
+				}
+			}
+			if !connection_result_seen {
+				live.total_connections += 1
+				append(&live.connection_result_peers, txn.label)
+				append(&txn.preds, Decoded_Message(Connection_Result{connection_id = live.total_connections}))
+			}
+			if txn.label == "C1" && decoded.echo_clock == 4687076073 {
+				append_captured_push_rpc(&txn.preds, live.raknet_samples_text, "party/party.memberConnected", "C2", 144, 9, 1, 9, scratch)
+			}
+			if txn.label == "C2" && decoded.echo_clock == 4687089046 {
+				append(&txn.preds, Decoded_Message(Connected_Pong{echo_clock = 46070073, clock = server_time_ms()}))
+			}
+			if txn.label == "C1" && decoded.echo_clock == 4687091068 {
+				append_scene_message(&txn.preds, 146, 2, player_update_body("C2", 4, scratch), scratch)
+				append_scene_message(&txn.preds, 144, 10, party_member_disconnected_body(46, 26, "C2", 0, scratch), scratch)
+			}
+
+		case System_Request:
+			append(&txn.req_ids, decoded.req_id)
+			#partial switch decoded.msg_id {
+			case System_Request_Id.Get_Session_Token:
+				jwt := "eyJhbGciOiJub25lIiwidHlwIjoiSldUIiwiY2x1c3RlcklkIjoicGFzc3RlY2gtbGl2ZSJ9.eyJTdG9ybWFuY2VyL3Nlc3Npb25JZCI6ImJYMkZOMVdhS1Vxb3VCY2JVNTlWbVEiLCJuYmYiOjE3ODA1MzcyMTIsImV4cCI6MTc4MDYyMzYxMiwiaWF0IjoxNzgwNTM3MjEyLCJpc3MiOiJwYXNzdGVjaC1saXZlIn0."
+				sid := "bX2FN1WaKUqouBcbU59VmQ"
+				raw := mpe_concat(mpe_str(jwt, scratch), mpe_str(sid, scratch), allocator = scratch)
+				append_response_msg(&txn.preds, decoded.req_id, raw, scratch)
+				append_response_complete(&txn.preds, decoded.req_id, true, scratch)
+
+			case System_Request_Id.Get_Scene_Infos:
+				#partial switch args in decoded.args {
+				case Get_Scene_Infos_Args:
+					tok := parse_connection_token(args.token, scratch)
+					if txn.label == "C1" && tok.ok && strings.contains(tok.scene_id, "a0567d04-4c5c-4ff3-978f-952baa342421") {
+						append_scene_message(&txn.preds, 144, 8, party_member_status_pair_body(17, 12, "C1", 0, "C2", 0, scratch), scratch)
+					}
+					append_response_msg(&txn.preds, decoded.req_id, scene_infos_for_token(args.token, live.scene_infos, scratch), scratch)
+					append_response_complete(&txn.preds, decoded.req_id, true, scratch)
+				}
+
+			case System_Request_Id.Ping:
+				#partial switch args in decoded.args {
+				case Ping_Args:
+					if txn.label == "C2" && decoded.req_id == 45 {
+						append_scene_message(&txn.preds, 146, 7, scene_rpc_uint_prefix_body(31, 18, scratch), scratch)
+					}
+					append_ping_response(&txn.preds, decoded.req_id, args.clock, scratch)
+				}
+
+			case System_Request_Id.Set_Metadata:
+				append_response_complete(&txn.preds, decoded.req_id, false, scratch)
+
+			case System_Request_Id.Scene_Ready, System_Request_Id.Scene_Ready2:
+				ready_handle: u64
+				#partial switch args in decoded.args {
+				case Scene_Ready_Args:
+					ready_handle = args.scene_handle
+				}
+				if ready_handle == 144 {
+					append_captured_push(&txn.preds, live.raknet_samples_text, "party/Steam.CreateLobby", txn.label, u8(ready_handle), 14, 0, scratch)
+				}
+				if ready_handle == 145 && txn.label == "C1" {
+					append_captured_push(&txn.preds, live.raknet_samples_text, "party/party.memberDataUpdated", "C1", 144, 3, 1, scratch)
+				}
+				if ready_handle == 145 && txn.label == "C2" {
+					append_scene_message(&txn.preds, 144, 7, party_settings_body("C2", 7, 5, "707203", scratch), scratch)
+				}
+				if ready_handle == 146 && txn.label == "C2" {
+					append_scene_message(&txn.preds, 146, 15, steam_join_lobby_body(8, 109775242850226431, scratch), scratch)
+				}
+				if ready_handle == 148 && txn.label == "C2" {
+					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(22, 14, scratch), scratch)
+					append_scene_rpc_complete(&txn.preds, 148, 3, 1, true, scratch)
+				}
+				if ready_handle == 141 && txn.label == "C2" {
+					append_scene_message(&txn.preds, u8(ready_handle), 3, mpe_str("bot,1.05.*", scratch), scratch)
+				}
+				bool_raw := mpe_map({mpe_str("v", scratch), mpe_bool(true, scratch)}, scratch)
+				append_response_msg(&txn.preds, decoded.req_id, bool_raw, scratch)
+				if ready_handle == 141 && txn.label != "C2" {
+					append_scene_message(&txn.preds, u8(ready_handle), 3, mpe_str("bot,1.05.*", scratch), scratch)
+				}
+				append_response_complete(&txn.preds, decoded.req_id, true, scratch)
+				if ready_handle == 144 {
+					append_captured_push(&txn.preds, live.raknet_samples_text, "party/party.settingsUpdated", txn.label, u8(ready_handle), 7, 0, scratch)
+					append_captured_push(&txn.preds, live.raknet_samples_text, "party/party.memberDataUpdated", txn.label, u8(ready_handle), 3, 0, scratch)
+					append_captured_push(&txn.preds, live.raknet_samples_text, "party/party.settingsUpdated", txn.label, u8(ready_handle), 7, 1, scratch)
+					if txn.label == "C2" {
+						append_captured_push(&txn.preds, live.raknet_samples_text, "party/party.memberDataUpdated", txn.label, u8(ready_handle), 3, 1, scratch)
+					}
+				}
+				if ready_handle == 145 && txn.label == "C1" {
+					append_scene_message(&txn.preds, 144, 7, party_settings_body("C1", 7, 5, "075726", scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, party_memberdata_body("C2", 11, 9, true, 1, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, party_memberdata_body("C2", 19, 13, true, 2, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, party_memberdata_body("C1", 21, 14, true, 2, scratch), scratch)
+				}
+				if ready_handle == 145 && txn.label == "C2" {
+					append_scene_message(&txn.preds, 144, 7, party_settings_body("C2", 8, 7, "707203", scratch), scratch)
+				}
+				if ready_handle == 146 && txn.label == "C2" {
+					append_scene_message(&txn.preds, 146, 3, party_memberdata_body("C2", 12, 9, true, 1, scratch), scratch)
+				}
+				if ready_handle == 146 && txn.label == "C1" {
+					append_scene_rpc_complete(&txn.preds, 146, 3, 1, true, scratch)
+					append_scene_message(&txn.preds, 144, 7, scene_rpc_uint_prefix_body(24, 15, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 7, scene_rpc_uint_prefix_body(26, 16, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, scene_rpc_uint_prefix_body(28, 17, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 7, scene_rpc_uint_prefix_body(30, 18, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, scene_rpc_uint_prefix_body(32, 19, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, scene_rpc_uint_prefix_body(34, 20, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, scene_rpc_uint_prefix_body(36, 21, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, scene_rpc_uint_prefix_body(38, 22, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, scene_rpc_uint_prefix_body(40, 23, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, scene_rpc_uint_prefix_body(42, 24, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 3, scene_rpc_uint_prefix_body(44, 25, scratch), scratch)
+				}
+				if ready_handle == 148 && txn.label == "C2" {
+					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(29, 17, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(33, 19, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(35, 20, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(37, 21, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(39, 22, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(41, 23, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(43, 24, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(45, 25, scratch), scratch)
+				}
+
+			case System_Request_Id.Disconnect_From_Scene:
+				append_bool_response(&txn.preds, decoded.req_id, true, scratch)
+
+			case System_Request_Id.Connect_To_Scene:
+				#partial switch args in decoded.args {
+				case Connect_To_Scene_Args:
+					handle := next_connect_scene_handle(live.txns[:], ps)
+					raw := build_scene_connection_result_raw(handle, args.routes, scratch)
+					append_response_msg(&txn.preds, decoded.req_id, raw, scratch)
+					append_response_complete(&txn.preds, decoded.req_id, true, scratch)
+				}
+			}
+
+		case Scene_Message:
+			if decoded.decoded.has_rpc_id {
+				append(&txn.rpc_keys, Predict_Caleb_RPC_Key{decoded.scene_handle, decoded.decoded.rpc_id})
+			}
+			switch decoded.route_handle {
+			case 0:
+				if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 1 {
+					if state := party_state_response_raw(live.raknet_samples_text, txn.label, scratch); state != nil {
+						append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, state, scratch)
+					}
+				} else if decoded.scene_handle == 146 {
+					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
+				}
+			case 3:
+				if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 257 {
+					append_captured_push(&txn.preds, live.raknet_samples_text, "party/party.memberConnected", txn.label, decoded.scene_handle, 9, 0, scratch)
+				} else if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 2816 {
+					append_scene_message(&txn.preds, decoded.scene_handle, 8, party_member_status_body(13, 10, "C2", 1, scratch), scratch)
+				} else if decoded.scene_handle == 146 && decoded.decoded.rpc_id == 2049 {
+					append_captured_push(&txn.preds, live.raknet_samples_text, "party/party.memberConnected", "C2", decoded.scene_handle, 9, 1, scratch)
+				} else if decoded.scene_handle == 146 && decoded.decoded.rpc_id == 3584 {
+					append_scene_message(&txn.preds, decoded.scene_handle, 8, party_member_status_body(16, 11, "C1", 1, scratch), scratch)
+				} else if decoded.scene_handle == 146 && decoded.decoded.rpc_id == 4096 {
+					append_scene_message(&txn.preds, 147, 5, mpe_uint(0, scratch), scratch)
+					append_scene_message(&txn.preds, 147, 5, mpe_uint(3, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 8, party_member_status_pair_body(18, 12, "C1", 0, "C2", 0, scratch), scratch)
+				} else if decoded.scene_handle == 146 && decoded.decoded.rpc_id == 6400 {
+					append_scene_message(&txn.preds, 146, 7, scene_rpc_uint_prefix_body(27, 16, scratch), scratch)
+				} else if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 3840 {
+					append_scene_message(&txn.preds, 144, 5, scene_rpc_error_body(8, "Cannot update data when member is ready.", scratch), scratch)
+					append_scene_message(&txn.preds, 145, 5, mpe_uint(0, scratch), scratch)
+				}
+			case 6:
+				if decoded.scene_handle == 141 {
+					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, login_result_for_peer(txn.label, scratch), scratch)
+				} else if (decoded.scene_handle == 144 && decoded.decoded.rpc_id != 8) || (decoded.scene_handle == 146 && decoded.decoded.rpc_id != 8) {
+					if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 12 {
+						append_scene_message(&txn.preds, 146, 4, scene_rpc_nil_false_nil_body(1, scratch), scratch)
+					}
+					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
+					if decoded.scene_handle == 146 && decoded.decoded.rpc_id == 3 {
+						append_scene_message(&txn.preds, 146, 3, party_memberdata_body("C2", 20, 13, true, 2, scratch), scratch)
+					}
+				}
+			case 11:
+				if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 9 {
+					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, nil, scratch)
+					append_scene_message(&txn.preds, 145, 5, mpe_uint(3, scratch), scratch)
+				} else if decoded.scene_handle == 146 {
+					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, nil, scratch)
+				}
+			case 9:
+				if decoded.scene_handle == 144 {
+					append_scene_message(&txn.preds, 144, 8, party_member_status_body(15, 11, "C1", 1, scratch), scratch)
+					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
+				} else if decoded.scene_handle == 146 {
+					append_scene_message(&txn.preds, 146, 8, party_member_status_body(14, 10, "C2", 1, scratch), scratch)
+					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
+				}
+			case 8:
+				if decoded.scene_handle == 146 {
+					append_scene_message(&txn.preds, 146, 2, player_update_body("C2", 1, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 2, player_update_body("C1", 1, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 2, player_update_body("C2", 1, scratch), scratch)
+					append_scene_message(&txn.preds, 144, 16, steam_update_lobby_joinable_body(23, 109775242850226431, false, scratch), scratch)
+				} else if decoded.scene_handle == 148 {
+					append_scene_message(&txn.preds, 148, 2, player_update_body("C2", 1, scratch), scratch)
+					append_scene_message(&txn.preds, 148, 2, player_update_body("C1", 0, scratch), scratch)
+					append_scene_message(&txn.preds, 148, 2, player_update_body("C1", 1, scratch), scratch)
+					append_scene_message(&txn.preds, 148, 4, scene_rpc_nil_false_nil_body(decoded.decoded.rpc_id, scratch), scratch)
+					append_scene_message(&txn.preds, 146, 7, scene_rpc_uint_prefix_body(25, 15, scratch), scratch)
+				}
+			case 15:
+				if decoded.scene_handle == 141 {
+					append_auth_rpc_complete(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, false, scratch)
+				}
+			case 19:
+				if decoded.scene_handle == 141 {
+					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_body(decoded.decoded, scratch), scratch)
+				}
+			case 5:
+				if decoded.scene_handle == 142 {
+					if body := captured_friend_notification(live.steam_friends_text, txn.label, 0, scratch); body != nil {
+						append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
+					}
+					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 2, decoded.decoded.rpc_id, false, scratch)
+				} else if decoded.scene_handle == 143 {
+					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer("C1"), scratch), scratch)
+				} else {
+					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
+				}
+			case 4:
+				if decoded.scene_handle == 142 {
+					if body := captured_friend_notification(live.steam_friends_text, txn.label, 1, scratch); body != nil {
+						append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
+					}
+				} else if decoded.scene_handle == 143 {
+					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer(txn.label), scratch), scratch)
+				} else if decoded.scene_handle != 142 {
+					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
+				}
+			case 13:
+				append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, mpe_str(invite_code_for_peer(txn.label), scratch), scratch)
+			case 16:
+				poll_index := count_previous_scene_route(live.txns[:], ps, 16)
+				append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, merger_status_raw(poll_index, scratch), scratch)
+			}
+		}
+	}
+
+	append(&live.txns, txn)
+	return txn.preds[:]
 }
 
 scene_infos_for_token :: proc(token: string, infos: Predict_Caleb_Scene_Infos, allocator := context.allocator) -> []byte {
@@ -1234,6 +1832,48 @@ log_datagram :: proc(log: ^os.File, scratch: mem.Allocator, from: net.Endpoint, 
 	strings.write_byte(&b, '\n')
 
 	os.write(log, transmute([]byte)strings.to_string(b))
+}
+
+log_relay_datagram :: proc(log: ^os.File, scratch: mem.Allocator, dir, peer: string, recv_time: time.Time, bytes: []byte) {
+	if log == nil do return
+	free_all(scratch)
+
+	rec: Relay_Write_Record
+	rec.t, _ = time.time_to_rfc3339(recv_time, allocator = scratch)
+	rec.dir = dir
+	rec.peer = peer
+	rec.hex = string(hex.encode(bytes, scratch))
+
+	b := strings.builder_make_len_cap(0, MAX_UDP_SIZE * 2 + 256, scratch)
+	opt: json.Marshal_Options
+	if json.marshal_to_builder(&b, rec, &opt) != nil do return
+	strings.write_byte(&b, '\n')
+	os.write(log, transmute([]byte)strings.to_string(b))
+}
+
+predict_caleb_live_write :: proc(live: ^Predict_Caleb_Live, out_path: string) {
+	allocator := context.temp_allocator
+	defer free_all(allocator)
+	out := strings.builder_make(allocator)
+	for &txn in live.txns {
+		real_human := render_decoded_burst(&txn.peer.reg_real, txn.peer.ep_real, txn.reals[:], allocator)
+		real_bytes := encode_decoded_messages(txn.reals[:], allocator)
+		pred_human := render_decoded_burst(&txn.peer.reg_pred, txn.peer.ep_pred, txn.preds[:], allocator)
+		pred_bytes := encode_decoded_messages(txn.preds[:], allocator)
+		sync_write_record(
+			&out,
+			txn.t,
+			txn.label,
+			decoded_messages_match(txn.reals[:], txn.preds[:], allocator),
+			txn.sent_msgs[:],
+			real_bytes,
+			pred_bytes,
+			txn.sent_human,
+			real_human,
+			pred_human,
+		)
+	}
+	sync_write_out(out_path, strings.to_string(out))
 }
 
 predict_caleb :: proc(datagrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, reasm: ^Reassembly, path: string) -> Error {
