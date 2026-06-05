@@ -311,24 +311,65 @@ Msgpack :: struct {
 // writes several values back-to-back (no wrapping array), so a scene-message body
 // is a forest, not one tree. `roots` holds each value's root index into the shared
 // `nodes` pool; `ok` is true only if every byte decoded into a clean value.
+// `consumed` is how many source bytes the roots span; src[consumed:] is whatever
+// was left undecoded (the loose/opaque tail of a body that is not pure msgpack).
 Msgpack_Seq :: struct {
-	nodes: []Msgpack_Node,
-	roots: []int,
-	raw:   []byte,
-	ok:    bool,
+	nodes:    []Msgpack_Node,
+	roots:    []int,
+	raw:      []byte,
+	consumed: int,
+	ok:       bool,
 }
 
 // Decode `src` as zero or more concatenated msgpack values. Stops at the first
 // malformed value but returns every value decoded so far; ok=false then signals
 // the bytes were not a clean value sequence. Pool and roots use `allocator`.
-msgpack_decode_seq :: proc(src: []byte, allocator := context.allocator) -> Msgpack_Seq {
+//
+// `stop_at_loose_tail` guards against a body that is a msgpack value (or two)
+// followed by a non-msgpack blob -- e.g. an RPC reply whose payload is a JSON
+// string trailed by a game struct full of raw pointers. Without it the trailing
+// bytes decode one-by-one into a flood of bare fixints; with it the walk stops at
+// the first top-level scalar that follows an already-emitted structured value
+// (Str/Bin/Array/Map), leaving src[consumed:] as the opaque tail.
+msgpack_decode_seq :: proc(src: []byte, stop_at_loose_tail := false, allocator := context.allocator) -> Msgpack_Seq {
 	pool := make([dynamic]Msgpack_Node, allocator)
 	roots := make([dynamic]int, allocator)
 	d := Msgpack_Decoder{src = src, pool = &pool, ok = true}
+	saw_structured := false
 	for d.pos < len(d.src) && d.ok {
-		append(&roots, mp_value(&d))
+		if stop_at_loose_tail && saw_structured && mp_is_scalar_lead(d.src[d.pos]) do break
+		root := mp_value(&d)
+		#partial switch pool[root].kind {
+		case .Str, .Bin, .Array, .Map:
+			saw_structured = true
+		}
+		append(&roots, root)
 	}
-	return Msgpack_Seq{nodes = pool[:], roots = roots[:], raw = src, ok = d.ok && d.pos == len(src)}
+	return Msgpack_Seq {
+		nodes = pool[:],
+		roots = roots[:],
+		raw = src,
+		consumed = d.pos,
+		ok = d.ok && d.pos == len(src),
+	}
+}
+
+// True when a msgpack lead byte begins a self-contained scalar (no length-prefixed
+// payload and no child values): fixints, nil, bool, the int/uint/float families,
+// and fixext/ext (fixed-size tagged scalars). Str/Bin/Array/Map are NOT scalars.
+mp_is_scalar_lead :: proc(c: byte) -> bool {
+	if c <= 0x7f || c >= 0xe0 do return true // fixint (positive / negative)
+	switch c {
+	case 0xc0, 0xc2, 0xc3: // nil, false, true
+		return true
+	case 0xca, 0xcb: // float32/64
+		return true
+	case 0xcc ..= 0xd3: // uint8..64, int8..64
+		return true
+	case 0xd4 ..= 0xd8: // fixext1..16
+		return true
+	}
+	return false
 }
 
 // Decode a msgpack blob carried by a frame into a Msgpack value. An empty or

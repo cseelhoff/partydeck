@@ -12,6 +12,7 @@ package caleb_raknet
 //   Get_Scene_Infos reply   map {ShardId, SceneId, Metadata, Routes[], SelectedSerializer}
 //   Connect_To_Scene reply  map {SceneHandle, RouteMappings: map<str,uint>}
 //   Get_Session_Token reply  two concatenated msgpack strings: [jwt, sessionId]
+//   Ping reply               16 raw bytes: server_clock(u64 LE) + echoed client clock(u64 LE)
 //   bool acknowledgement     map {v: bool}
 // Anything else (token blobs, raw clocks, future shapes) is kept whole as
 // Other_Response -- nothing is dropped, a parse miss is an explicit value.
@@ -62,6 +63,14 @@ Session_Token :: struct {
 	session_id: string,
 }
 
+// Ping_Response: the reply to a Ping system request (msg_id 2). 16 raw bytes (NOT
+// msgpack): the responder's clock followed by the client's echoed clock, both
+// little-endian u64. `echo_clock` should match the originating Ping's clock.
+Ping_Response :: struct {
+	server_clock: u64,
+	echo_clock:   u64,
+}
+
 // Other_Response: any reply this layer does not model -- non-msgpack token/clock
 // blobs and unrecognized maps. The full Msgpack is retained so nothing is lost and
 // the debug renderer can still show the decoded tree or the raw byte length.
@@ -75,6 +84,7 @@ Response_Data :: union {
 	Scene_Connection_Result,
 	Bool_Result,
 	Session_Token,
+	Ping_Response,
 	Other_Response,
 }
 
@@ -87,6 +97,13 @@ parse_response_data :: proc(data: Msgpack, allocator := context.allocator) -> Re
 		// A Get_Session_Token reply is two concatenated msgpack strings, which the
 		// single-value decoder leaves as !ok -- recover it from the raw bytes.
 		if st, ok := parse_session_token(data.raw); ok do return st
+		// A Ping reply is a bare 16-byte clock pair, not msgpack.
+		if len(data.raw) == 16 {
+			return Ping_Response {
+				server_clock = read_u64_le(data.raw, 0),
+				echo_clock   = read_u64_le(data.raw, 8),
+			}
+		}
 		return Other_Response{data}
 	}
 
@@ -199,6 +216,8 @@ write_response_data :: proc(sb: ^strings.Builder, data: Response_Data) {
 		if !mp_write_jwt(sb, d.jwt) {
 			fmt.sbprintf(sb, "%dB", len(d.jwt))
 		}
+	case Ping_Response:
+		fmt.sbprintf(sb, "Ping_Response server=%d echo=%d", d.server_clock, d.echo_clock)
 	case Other_Response:
 		strings.write_string(sb, msgpack_field_string(d.data))
 	case:

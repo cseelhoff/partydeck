@@ -64,10 +64,14 @@ Connected_Pong :: struct {
 }
 
 // Connection_Request (c->s): client GUID(8) + RakNet::Time(8 BE) + useSecurity.
+// `trailer` is every byte after the 16-byte guid+time (the security byte and any
+// padding) kept verbatim so the message re-encodes exactly -- a present-but-zero
+// security byte is not the same wire as an absent one.
 Connection_Request :: struct {
 	guid:         u64,
 	time:         u64,
 	use_security: bool,
+	trailer:      []byte,
 }
 
 // Connection_Request_Accepted (s->c): the server's reply binding the client's
@@ -86,10 +90,12 @@ Connection_Request_Accepted :: struct {
 // list + ping/pong clocks. The middle is the sender's own ipList -- up to
 // MAXIMUM_NUMBER_OF_INTERNAL_IDS RakNet SystemAddresses (mostly UNASSIGNED
 // 0.0.0.0:0 padding), the same data as Connection_Request_Accepted.internal. It is
-// kept as an unparsed byte span (internal_list_bytes) because entries may be IPv4
-// or IPv6, so the stride is not fixed; decoding each address is left to a caller.
+// kept as an unparsed byte span (internal_list) because entries may be IPv4 or
+// IPv6, so the stride is not fixed; decoding each address is left to a caller.
+// internal_list_bytes is len(internal_list), retained for the existing renderer.
 New_Incoming_Connection :: struct {
 	server:             System_Address,
+	internal_list:      []byte,
 	internal_list_bytes: int,
 	ping_time:          u64,
 	pong_time:          u64,
@@ -117,21 +123,27 @@ System_Request_Id :: enum u8 {
 
 // System_Request (c->s): a Stormancer system RPC. `msg_id` selects the request,
 // `req_id` correlates the reply, `args` is the typed argument shape for that
-// request (see system_request.odin). Wire layout from stormancer-sdk-js
+// request (see system_request.odin). `raw_args` is the undecoded msgpack args blob
+// (body after the 3-byte header), kept so the message re-encodes byte-exact -- the
+// typed `args` reorders/normalizes and cannot reproduce the original map order.
 // RequestProcessor.sendSystemRequest: [msgId:1][reqId:2 LE][msgpack args].
 // RakNet has no analog -- it hands the whole payload up opaque.
 System_Request :: struct {
-	msg_id: System_Request_Id,
-	req_id: u16,
-	args:   System_Request_Args,
+	msg_id:   System_Request_Id,
+	req_id:   u16,
+	args:     System_Request_Args,
+	raw_args: []byte,
 }
 
 // Response_Msg (s->c): one streamed RPC value / result for `req_id`. `data` is the
 // typed reply shape (see response.odin), chosen by the structure of the payload
-// since the originating RPC type is not known from a req_id alone.
+// since the originating RPC type is not known from a req_id alone. `raw` is the
+// undecoded payload after the 2-byte req_id, kept so the message re-encodes
+// byte-exact (the typed `data` does not retain every blob).
 Response_Msg :: struct {
 	req_id: u16,
 	data:   Response_Data,
+	raw:    []byte,
 }
 
 // Response_Complete (s->c): RPC `req_id` finished; has_values flags
@@ -167,11 +179,13 @@ Scene_Message :: struct {
 // A known message id whose body was too short / wrong length to decode. Surfaced
 // as an explicit value -- NOT collapsed into Unknown_Message -- so a malformed
 // known message is distinguishable from a genuinely unknown id. `expected` is the
-// body length the decoder required; `body_len` is what actually arrived.
+// body length the decoder required; `body_len` is what actually arrived. `raw` is
+// the full original message bytes (id included) so it still re-encodes exactly.
 Malformed_Message :: struct {
 	id:       u8,
 	body_len: int,
 	expected: int,
+	raw:      []byte,
 }
 
 // Any message-id this layer does not model (reserved transport ids, future ids).
@@ -204,30 +218,31 @@ Decoded_Message :: union {
 // too short returns Malformed_Message; an unmodeled id returns Unknown_Message.
 // Either way nothing is dropped, and a decode failure is an explicit value.
 decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_Message {
-	if len(msg) == 0 do return Malformed_Message{id = 0, body_len = 0, expected = 1}
+	if len(msg) == 0 do return Malformed_Message{id = 0, body_len = 0, expected = 1, raw = msg}
 	id := msg[0]
 	body := msg[1:]
 
 	#partial switch Message_Id(id) {
 	case .Connected_Ping:
-		if len(body) < 8 do return Malformed_Message{id, len(body), 8}
+		if len(body) < 8 do return Malformed_Message{id, len(body), 8, msg}
 		return Connected_Ping{clock = read_u64_be(body, 0)}
 
 	case .Connected_Pong:
-		if len(body) < 16 do return Malformed_Message{id, len(body), 16}
+		if len(body) < 16 do return Malformed_Message{id, len(body), 16, msg}
 		return Connected_Pong{echo_clock = read_u64_be(body, 0), clock = read_u64_be(body, 8)}
 
 	case .Connection_Request:
-		if len(body) < 16 do return Malformed_Message{id, len(body), 16}
+		if len(body) < 16 do return Malformed_Message{id, len(body), 16, msg}
 		return Connection_Request {
 			guid         = read_u64_be(body, 0),
 			time         = read_u64_be(body, 8),
 			use_security = len(body) > 16 && body[16] != 0,
+			trailer      = body[16:],
 		}
 
 	case .Connection_Request_Accepted:
 		expect := 7 + 2 + MAX_INTERNAL_IDS * 7 + 8 + 8
-		if len(body) != expect do return Malformed_Message{id, len(body), expect}
+		if len(body) != expect do return Malformed_Message{id, len(body), expect, msg}
 		f: Connection_Request_Accepted
 		off := 0
 		f.remote = decode_system_address(body[off:]); off += 7
@@ -242,9 +257,10 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 		return f
 
 	case .New_Incoming_Connection:
-		if len(body) < 7 + 16 do return Malformed_Message{id, len(body), 7 + 16}
+		if len(body) < 7 + 16 do return Malformed_Message{id, len(body), 7 + 16, msg}
 		return New_Incoming_Connection {
 			server              = decode_system_address(body[:7]),
+			internal_list       = body[7:len(body) - 16],
 			internal_list_bytes = len(body) - 7 - 16,
 			ping_time           = read_u64_be(body, len(body) - 16),
 			pong_time           = read_u64_be(body, len(body) - 8),
@@ -254,37 +270,39 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 		return Disconnection_Notification{}
 
 	case .System_Request:
-		if len(body) < 3 do return Malformed_Message{id, len(body), 3}
+		if len(body) < 3 do return Malformed_Message{id, len(body), 3, msg}
 		msg_id := System_Request_Id(body[0])
 		decoded := decode_msgpack_field(body[3:], allocator)
 		return System_Request {
-			msg_id = msg_id,
-			req_id = read_u16_le(body, 1),
-			args   = parse_system_request_args(msg_id, decoded, allocator),
+			msg_id   = msg_id,
+			req_id   = read_u16_le(body, 1),
+			args     = parse_system_request_args(msg_id, decoded, allocator),
+			raw_args = body[3:],
 		}
 
 	case .Response_Msg:
-		if len(body) < 2 do return Malformed_Message{id, len(body), 2}
+		if len(body) < 2 do return Malformed_Message{id, len(body), 2, msg}
 		return Response_Msg {
 			req_id = read_u16_le(body, 0),
 			data   = parse_response_data(decode_msgpack_field(body[2:], allocator), allocator),
+			raw    = body[2:],
 		}
 
 	case .Response_Complete:
-		if len(body) < 3 do return Malformed_Message{id, len(body), 3}
+		if len(body) < 3 do return Malformed_Message{id, len(body), 3, msg}
 		return Response_Complete{req_id = read_u16_le(body, 0), has_values = body[2] != 0}
 
 	case .Response_Error:
-		if len(body) < 2 do return Malformed_Message{id, len(body), 2}
+		if len(body) < 2 do return Malformed_Message{id, len(body), 2, msg}
 		return Response_Error{req_id = read_u16_le(body, 0), data = decode_msgpack_field(body[2:], allocator)}
 
 	case .Connection_Result:
-		if len(body) < 8 do return Malformed_Message{id, len(body), 8}
+		if len(body) < 8 do return Malformed_Message{id, len(body), 8, msg}
 		return Connection_Result{connection_id = read_u64_le(body, 0)}
 	}
 
 	if int(id) >= SCENE_HANDLE_MIN {
-		if len(body) < 2 do return Malformed_Message{id, len(body), 2}
+		if len(body) < 2 do return Malformed_Message{id, len(body), 2, msg}
 		route_payload := body[2:]
 		return Scene_Message {
 			scene_handle = id,
@@ -343,8 +361,9 @@ read_u64_le :: proc(b: []byte, off: int) -> u64 {
 
 // Write a one-line summary of a decoded message into `sb`, for debug output. The
 // caller owns `sb` and can reset and reuse it across many messages, so no per-call
-// string is allocated.
-write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message) {
+// string is allocated. `route_name` is the resolved name for a Scene_Message's
+// route handle (route_table.odin), or "" when unknown / not a scene message.
+write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message, route_name := "") {
 	switch f in message {
 	case Connected_Ping:
 		fmt.sbprintf(sb, "Connected_Ping clk=%d", f.clock)
@@ -377,7 +396,12 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message) {
 	case Connection_Result:
 		fmt.sbprintf(sb, "Connection_Result connid=%d", f.connection_id)
 	case Scene_Message:
-		fmt.sbprintf(sb, "Scene_Message handle=%d route=%d body=%dB ", f.scene_handle, f.route_handle, len(f.body))
+		fmt.sbprintf(sb, "Scene_Message handle=%d route=%d", f.scene_handle, f.route_handle)
+		if route_name != "" do fmt.sbprintf(sb, "(%s)", route_name)
+		// Show the raw byte length only when the body did not decode cleanly --
+		// otherwise the decoded value list already accounts for every byte.
+		if f.decoded.values.ok do strings.write_byte(sb, ' ')
+		else do fmt.sbprintf(sb, " body=%dB ", len(f.body))
 		write_scene_body(sb, f.decoded)
 	case Malformed_Message:
 		fmt.sbprintf(sb, "Malformed_Message id=0x%02x body=%dB expected>=%dB", f.id, f.body_len, f.expected)

@@ -30,10 +30,14 @@ import "core:strings"
 // The decoded form of a Scene_Message body: an optional leading RPC request id
 // plus the trailing list of msgpack values. `values.ok` is false when the bytes
 // were not a clean value sequence (a control frame or an unmodeled push shape).
+// `raw_tail` holds the bytes past the structured value list when the body is a
+// msgpack prefix followed by a non-msgpack blob (an RPC reply whose payload is a
+// game struct of raw pointers, say); it is empty for a clean body.
 Scene_Body :: struct {
 	rpc_id:     u16,
 	has_rpc_id: bool,
 	values:     Msgpack_Seq,
+	raw_tail:   []byte,
 }
 
 // Decode a scene route payload. Both readings are tried -- rpc-framed ([reqId:2] +
@@ -42,12 +46,38 @@ Scene_Body :: struct {
 // wrong framing splits one value's bytes into a run of stray fixints, so the right
 // one is almost always the shorter list. Ties favour the rpc-framed reading, which
 // is the common case. A reading is only eligible if it consumed every byte cleanly.
+//
+// A body that is a clean msgpack prefix trailed by a non-msgpack blob (e.g. the
+// Authentication.Login reply: a session-token JSON string followed by a game
+// struct full of raw pointers) decodes neither way -- the trailing bytes turn into
+// a flood of bare fixints. When the winning reading did not consume cleanly we
+// re-decode it with the loose-tail guard, which stops the value list at the opaque
+// blob and surfaces that blob as `raw_tail` instead of hundreds of stray scalars.
 decode_scene_body :: proc(body: []byte, allocator := context.allocator) -> Scene_Body {
-	whole := msgpack_decode_seq(body, allocator)
+	whole := msgpack_decode_seq(body, allocator = allocator)
 	if len(body) >= 2 {
-		framed := msgpack_decode_seq(body[2:], allocator)
+		framed := msgpack_decode_seq(body[2:], allocator = allocator)
 		if framed.ok && (!whole.ok || len(framed.roots) <= len(whole.roots)) {
 			return Scene_Body{rpc_id = read_u16_le(body, 0), has_rpc_id = true, values = framed}
+		}
+		// Neither reading was clean: prefer the rpc framing (strip the request id)
+		// when its structured prefix is no longer fragmented than the whole-body one
+		// AND, allowing for the 2-byte id it dropped, it explained essentially the
+		// same span. The second test rejects a non-rpc push (no leading id) whose
+		// 2-byte shift would shatter msgpack alignment and stop consuming far short
+		// of the whole-body reading. The opaque remainder becomes raw_tail.
+		if !framed.ok && !whole.ok {
+			fp := msgpack_decode_seq(body[2:], stop_at_loose_tail = true, allocator = allocator)
+			wp := msgpack_decode_seq(body, stop_at_loose_tail = true, allocator = allocator)
+			if len(fp.roots) <= len(wp.roots) && fp.consumed + 2 >= wp.consumed {
+				return Scene_Body {
+					rpc_id = read_u16_le(body, 0),
+					has_rpc_id = true,
+					values = fp,
+					raw_tail = body[2:][fp.consumed:],
+				}
+			}
+			return Scene_Body{values = wp, raw_tail = body[wp.consumed:]}
 		}
 	}
 	return Scene_Body{values = whole}
@@ -57,8 +87,9 @@ decode_scene_body :: proc(body: []byte, allocator := context.allocator) -> Scene
 
 // Write a one-line summary of a decoded scene body into `sb`: the rpc id (when the
 // rpc-framed reading held) and the bracketed value list, with embedded JSON/base64
-// strings expanded. A trailing-garbage body is flagged so nothing looks complete
-// that was not.
+// strings expanded. A non-empty `raw_tail` (a msgpack prefix trailed by an opaque
+// blob) is reported as its byte length plus a short hex preview rather than decoded;
+// a body that simply ran out mid-value is flagged `<trailing>`.
 write_scene_body :: proc(sb: ^strings.Builder, body: Scene_Body) {
 	if body.has_rpc_id do fmt.sbprintf(sb, "rpc=%d ", body.rpc_id)
 	strings.write_byte(sb, '[')
@@ -67,7 +98,22 @@ write_scene_body :: proc(sb: ^strings.Builder, body: Scene_Body) {
 		write_scene_value(sb, body.values.nodes, root)
 	}
 	strings.write_byte(sb, ']')
-	if !body.values.ok do strings.write_string(sb, " <trailing>")
+	if len(body.raw_tail) > 0 {
+		write_raw_tail(sb, body.raw_tail)
+	} else if !body.values.ok {
+		strings.write_string(sb, " <trailing>")
+	}
+}
+
+// Append the opaque trailing blob as `+<n>B raw <hex...>`: its length plus the
+// first few bytes in hex, enough to recognise it without dumping the whole struct.
+write_raw_tail :: proc(sb: ^strings.Builder, tail: []byte) {
+	preview := min(len(tail), 16)
+	fmt.sbprintf(sb, " +%dB raw ", len(tail))
+	for k in 0 ..< preview {
+		fmt.sbprintf(sb, "%02x", tail[k])
+	}
+	if len(tail) > preview do strings.write_string(sb, "...")
 }
 
 // Render one msgpack value, recursing through arrays/maps so embedded strings are
@@ -82,6 +128,9 @@ write_scene_value :: proc(b: ^strings.Builder, nodes: []Msgpack_Node, i: int) ->
 	#partial switch n.kind {
 	case .Str:
 		write_scene_string(b, n.str)
+		return i + 1
+	case .Bin:
+		write_scene_bin(b, n.bin)
 		return i + 1
 	case .Array:
 		strings.write_byte(b, '[')
@@ -123,6 +172,19 @@ write_scene_string :: proc(b: ^strings.Builder, s: string) {
 		return
 	}
 	fmt.sbprintf(b, "%q", s)
+}
+
+// Render a msgpack `bin` payload, decoding it one layer deeper when it carries
+// text. Stormancer wraps a PartyMember's userdata JSON document in a `bin` just as
+// often as it carries a random 16-byte session id or a binary P2P token, so a
+// printable payload is shown like a string (json:/b64:/quoted) while anything
+// genuinely binary stays summarized as bin<n>.
+write_scene_bin :: proc(b: ^strings.Builder, data: []byte) {
+	if is_printable_text(data) {
+		write_scene_string(b, string(data))
+		return
+	}
+	fmt.sbprintf(b, "bin<%d>", len(data))
 }
 
 // A string is JSON-like when it is a non-trivial object or array literal -- enough

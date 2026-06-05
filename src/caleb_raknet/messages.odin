@@ -231,6 +231,11 @@ raknet_message_bytes :: proc(s: ^RakNet_Message_Store, i: int) -> []byte {
 // fragment count, byte length, and the Decoded_Message.
 print_all_messages :: proc(s: ^RakNet_Message_Store) {
 	fmt.printfln("=== %d RakNet messages ===", s.count)
+	// Route names are learned across the stream (route_table.odin), so the registry
+	// persists for the whole loop -- allocated outside temp, which is reset per message.
+	reg: Route_Registry
+	route_registry_init(&reg)
+	defer route_registry_destroy(&reg)
 	// One line buffer reused for every message; reset (not freed) each iteration so
 	// no per-message summary string is allocated.
 	line := strings.builder_make()
@@ -240,6 +245,12 @@ print_all_messages :: proc(s: ^RakNet_Message_Store) {
 		// Per-message scratch: the decoded msgpack trees and address strings live in
 		// temp and are reclaimed after the line prints.
 		decoded := decode_message(payload, context.temp_allocator)
+		from := s.froms[i]
+		route_registry_observe(&reg, from, decoded)
+		route_name := ""
+		if sm, ok := decoded.(Scene_Message); ok {
+			route_name = route_registry_resolve(&reg, from, sm.scene_handle, sm.route_handle)
+		}
 		strings.builder_reset(&line)
 		// fmt.sbprintf(
 		// 	&line,
@@ -251,7 +262,7 @@ print_all_messages :: proc(s: ^RakNet_Message_Store) {
 		// 	s.n_fragments[i],
 		// 	s.lengths[i],
 		// )
-		write_decoded_message(&line, decoded)
+		write_decoded_message(&line, decoded, route_name)
 		fmt.println(strings.to_string(line))
 		free_all(context.temp_allocator)
 	}
