@@ -90,6 +90,91 @@ is_content_datagram :: proc(dg: []byte) -> bool {
 	return (f & 0x80) != 0 && (f & 0x40) == 0 && (f & 0x20) == 0
 }
 
+message_is_health_channel :: proc(msg: []byte) -> bool {
+	if len(msg) == 0 do return false
+	switch msg[0] {
+	case u8(Message_Id.Connected_Ping), u8(Message_Id.Connected_Pong), u8(Message_Id.New_Incoming_Connection), u8(Message_Id.Connection_Result):
+		return true
+	}
+	if message_is_system_ping(msg) do return true
+	if _, ok := message_ping_response_req_id(msg); ok do return true
+	return false
+}
+
+message_is_system_ping :: proc(msg: []byte) -> bool {
+	return len(msg) >= 2 && msg[0] == u8(Message_Id.System_Request) && msg[1] == u8(System_Request_Id.Ping)
+}
+
+message_ping_response_req_id :: proc(msg: []byte) -> (u16, bool) {
+	if len(msg) != 19 || msg[0] != u8(Message_Id.Response_Msg) do return 0, false
+	return read_u16_le(msg, 1), true
+}
+
+message_response_complete_req_id :: proc(msg: []byte) -> (u16, bool) {
+	if len(msg) != 4 || msg[0] != u8(Message_Id.Response_Complete) do return 0, false
+	return read_u16_le(msg, 1), true
+}
+
+datagram_is_health_channel :: proc(dg: []byte) -> bool {
+	if !is_content_datagram(dg) do return false
+	packets: [MAX_INTERNAL_PACKETS]RakNet_Internal_Packet
+	n := parse_internal_packets(dg, packets[:])
+	if n == 0 do return false
+	ping_reqs: [MAX_INTERNAL_PACKETS]u16
+	ping_req_count := 0
+	for i in 0 ..< n {
+		pk := packets[i]
+		if len(pk.payload) == 0 || pk.has_split do continue
+		if req, ok := message_ping_response_req_id(pk.payload); ok {
+			ping_reqs[ping_req_count] = req
+			ping_req_count += 1
+		}
+	}
+	seen := false
+	for i in 0 ..< n {
+		pk := packets[i]
+		if len(pk.payload) == 0 do continue
+		if pk.has_split do return false
+		if !message_is_health_channel(pk.payload) {
+			if req, ok := message_response_complete_req_id(pk.payload); ok && u16_in(ping_reqs[:ping_req_count], req) {
+				seen = true
+				continue
+			}
+			return false
+		}
+		seen = true
+	}
+	return seen
+}
+
+messages_are_health_channel :: proc(msgs: [][]byte) -> bool {
+	if len(msgs) == 0 do return false
+	for msg in msgs {
+		if !message_is_health_channel(msg) do return false
+	}
+	return true
+}
+
+filter_health_messages :: proc(msgs: [][]byte, allocator := context.allocator) -> [][]byte {
+	out := make([dynamic][]byte, allocator)
+	ping_reqs := make([dynamic]u16, allocator)
+	for msg in msgs {
+		if req, ok := message_ping_response_req_id(msg); ok do append(&ping_reqs, req)
+	}
+	for msg in msgs {
+		if req, ok := message_response_complete_req_id(msg); ok && u16_in(ping_reqs[:], req) do continue
+		if !message_is_health_channel(msg) do append(&out, msg)
+	}
+	return out[:]
+}
+
+u16_in :: proc(values: []u16, value: u16) -> bool {
+	for v in values {
+		if v == value do return true
+	}
+	return false
+}
+
 // Feed one split fragment; return the complete message once the last fragment of
 // its split id has arrived, else ("", false).
 split_feed :: proc(sr: ^Side_Reasm, pk: RakNet_Internal_Packet, allocator := context.allocator) -> ([]byte, bool) {
@@ -183,6 +268,7 @@ sync_predict :: proc(world: ^World, caddr: Peer_Addr, dg: []byte, own: ^[dynamic
 	out := predict(world, caddr, dg)
 	for od in out {
 		if !is_content_datagram(od.data) do continue
+		if datagram_is_health_channel(od.data) do continue
 		if od.addr == caddr {
 			append(own, od.data)
 		} else {
@@ -242,8 +328,8 @@ sync_write_record :: proc(
 // Reassemble + render + write the peer's open transaction, then reset it.
 finalize_txn :: proc(ps: ^Peer_State, out_sb: ^strings.Builder, stats: ^Sync_Stats) {
 	if !ps.active do return
-	real_msgs := reassemble_side(ps, .Real, ps.reals[:])
-	pred_msgs := reassemble_side(ps, .Pred, ps.preds[:])
+	real_msgs := filter_health_messages(reassemble_side(ps, .Real, ps.reals[:]))
+	pred_msgs := filter_health_messages(reassemble_side(ps, .Pred, ps.preds[:]))
 	real_human := render_burst(&ps.reg_real, ps.ep_real, real_msgs)
 	pred_human := render_burst(&ps.reg_pred, ps.ep_pred, pred_msgs)
 	free_all(context.temp_allocator)
@@ -330,6 +416,7 @@ sync_replay :: proc(path: string, out_path := SYNC_ASSERT_FILE) -> Error {
 		ps := find_peer(&peers, rec.peer, &nidx)
 
 		if rec.dir == "c2s" {
+			if datagram_is_health_channel(dg) do continue
 			clear(&own)
 			clear(&cross)
 			if !is_content_datagram(dg) {
@@ -339,7 +426,7 @@ sync_replay :: proc(path: string, out_path := SYNC_ASSERT_FILE) -> Error {
 				route_cross(&peers, cross)
 				continue
 			}
-			msgs := reassemble_side(ps, .C2S, {dg})
+			msgs := filter_health_messages(reassemble_side(ps, .C2S, {dg}))
 			if len(msgs) == 0 {
 				// a pure split-fragment carrier: no complete client message yet, so
 				// this is not its own transaction. Carry predictions to the txn the
@@ -366,6 +453,7 @@ sync_replay :: proc(path: string, out_path := SYNC_ASSERT_FILE) -> Error {
 			for d in own do append(&ps.preds, d)
 			route_cross(&peers, cross)
 		} else { 	// s2c
+			if datagram_is_health_channel(dg) do continue
 			if !is_content_datagram(dg) do continue
 			if ps.active do append(&ps.reals, dg)
 		}

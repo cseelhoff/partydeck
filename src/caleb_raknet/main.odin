@@ -171,6 +171,16 @@ net_predict_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_St
 		n, remote := net.recv_udp(sock, buf[:]) or_continue
 		if n <= 0 do continue
 		data := buf[:n]
+		peer_count_before := len(live_peers)
+		peer_index := live_peer_index(&live_peers, remote)
+		label := live_peers[peer_index].label
+		if len(live_peers) != peer_count_before {
+			fmt.printfln("predict client %s -> %v", label, remote)
+		}
+		if live_predict_handle_health(sock, &wire, live_peers[peer_index].addr, data) {
+			continue
+		}
+
 		now := time.now()
 		if !udp_datagram_push(dgrams, remote, now, data) {
 			fmt.eprintfln("datagram store full, dropping %d bytes", n)
@@ -179,12 +189,6 @@ net_predict_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_St
 		log_datagram(log, log_scratch, remote, now, data)
 		process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
 
-		peer_count_before := len(live_peers)
-		peer_index := live_peer_index(&live_peers, remote)
-		label := live_peers[peer_index].label
-		if len(live_peers) != peer_count_before {
-			fmt.printfln("predict client %s -> %v", label, remote)
-		}
 		if live_predict_handle_offline(sock, &wire, live_peers[peer_index].addr, data, scratch) {
 			continue
 		}
@@ -194,7 +198,7 @@ net_predict_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_St
 		net.send_udp(sock, ack, remote)
 
 		ps := find_peer(&live.peers, label, &live.nidx)
-		sent_msgs := reassemble_side(ps, .C2S, {data}, scratch)
+		sent_msgs := filter_health_messages(reassemble_side(ps, .C2S, {data}, scratch), scratch)
 		if len(sent_msgs) == 0 do continue
 
 		preds := predict_caleb_step(&live, label, remote, sent_msgs)
@@ -243,13 +247,27 @@ net_relay_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 	sync_write_out(predict_out_path, "")
 	http_port := env_int("PROBE_PORT", DEFAULT_DTLIVE_PORT)
 	http_sock, http_enabled := dtlive_try_listen(bind_addr, http_port)
+	relay_resp_wait_ms := env_int("RELAY_RESP_WAIT_MS", 700)
+	relay_resp_idle_ms := env_int("RELAY_RESP_IDLE_MS", 50)
 
 	clients: [dynamic]Relay_Client
-	fmt.printfln("caleb_raknet relay listening on %s:%d -> %s; capture -> %s; predict -> %s", LISTEN_HOST, LISTEN_PORT, upstream_text, capture_path, predict_out_path)
+	pending_client_dgs: [dynamic]Relay_Pending_Client_Datagram
+	fmt.printfln("caleb_raknet relay listening on %s:%d -> %s; capture -> %s; predict -> %s; response window %dms idle %dms", LISTEN_HOST, LISTEN_PORT, upstream_text, capture_path, predict_out_path, relay_resp_wait_ms, relay_resp_idle_ms)
 
 	buf: [MAX_UDP_SIZE]byte
 	polls: [128]posix.pollfd
 	for {
+		if len(pending_client_dgs) > 0 {
+			pending := pending_client_dgs[0]
+			for i := 1; i < len(pending_client_dgs); i += 1 do pending_client_dgs[i - 1] = pending_client_dgs[i]
+			resize(&pending_client_dgs, len(pending_client_dgs) - 1)
+			if relay_handle_c2s(sock, &clients, pending.client, pending.data, upstream, dgrams, msgs, reasm, &live, predict_out_path, capture, log_scratch, predict_scratch) {
+				relay_wait_for_responses(sock, http_sock, http_enabled, &clients, &pending_client_dgs, upstream, dgrams, msgs, reasm, &live, predict_out_path, capture, log_scratch, predict_scratch, relay_resp_wait_ms, relay_resp_idle_ms)
+				predict_caleb_live_write(&live, predict_out_path)
+			}
+			continue
+		}
+
 		poll_count := 1 + len(clients)
 		http_poll_index := -1
 		polls[0] = posix.pollfd{fd = udp_fd(sock), events = {.IN}}
@@ -270,30 +288,9 @@ net_relay_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 		if .IN in polls[0].revents {
 			n, remote := net.recv_udp(sock, buf[:]) or_continue
 			if n <= 0 do continue
-			data := buf[:n]
-			idx := relay_client_index(&clients, remote)
-			if idx < 0 {
-				up_sock := net.make_unbound_udp_socket(.IP4) or_return
-				idx = len(clients)
-				append(&clients, Relay_Client{client = remote, peer = relay_peer_label(idx + 1), socket = up_sock})
-				fmt.printfln("relay client %s -> %v", clients[idx].peer, remote)
-			}
-			now := time.now()
-			log_relay_datagram(capture, log_scratch, "c2s", clients[idx].peer, now, data)
-			if !udp_datagram_push(dgrams, remote, now, data) {
-				fmt.eprintfln("datagram store full, dropping %d bytes", n)
-			} else {
-				process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
-			}
-			net.send_udp(clients[idx].socket, data, upstream)
-
-			if is_content_datagram(data) {
-				ps := find_peer(&live.peers, clients[idx].peer, &live.nidx)
-				sent_msgs := reassemble_side(ps, .C2S, {data}, predict_scratch)
-				if len(sent_msgs) > 0 {
-					predict_caleb_step(&live, clients[idx].peer, clients[idx].client, sent_msgs)
-					predict_caleb_live_write(&live, predict_out_path)
-				}
+			if relay_handle_c2s(sock, &clients, remote, buf[:n], upstream, dgrams, msgs, reasm, &live, predict_out_path, capture, log_scratch, predict_scratch) {
+				relay_wait_for_responses(sock, http_sock, http_enabled, &clients, &pending_client_dgs, upstream, dgrams, msgs, reasm, &live, predict_out_path, capture, log_scratch, predict_scratch, relay_resp_wait_ms, relay_resp_idle_ms)
+				predict_caleb_live_write(&live, predict_out_path)
 			}
 		}
 
@@ -301,29 +298,142 @@ net_relay_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 			if !(.IN in polls[i + 1].revents) do continue
 			n, from := net.recv_udp(clients[i].socket, buf[:]) or_continue
 			if n <= 0 do continue
-			data := buf[:n]
-			now := time.now()
-			log_relay_datagram(capture, log_scratch, "s2c", clients[i].peer, now, data)
-			if !udp_datagram_push(dgrams, from, now, data) {
-				fmt.eprintfln("datagram store full, dropping %d bytes", n)
-			} else {
-				process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
-			}
-			net.send_udp(sock, data, clients[i].client)
-
-			if is_content_datagram(data) {
-				ps := find_peer(&live.peers, clients[i].peer, &live.nidx)
-				real_msgs := reassemble_side(ps, .Real, {data}, predict_scratch)
-				if len(real_msgs) > 0 {
-					for msg in real_msgs {
-						predict_caleb_route_real(&live.txns, ps, msg, predict_scratch)
-					}
-					predict_caleb_live_write(&live, predict_out_path)
-				}
-			}
+			relay_handle_s2c(sock, clients[:], i, buf[:n], from, dgrams, msgs, reasm, &live, predict_out_path, capture, log_scratch, predict_scratch)
 		}
 	}
 	return nil
+}
+
+relay_client_index_or_create :: proc(clients: ^[dynamic]Relay_Client, remote: net.Endpoint) -> int {
+	idx := relay_client_index(clients, remote)
+	if idx >= 0 do return idx
+	up_sock, err := net.make_unbound_udp_socket(.IP4)
+	if err != nil {
+		fmt.eprintfln("relay upstream socket create failed -> %v", err)
+		return -1
+	}
+	idx = len(clients^)
+	append(clients, Relay_Client{client = remote, peer = relay_peer_label(idx + 1), socket = up_sock})
+	fmt.printfln("relay client %s -> %v", clients^[idx].peer, remote)
+	return idx
+}
+
+relay_handle_c2s :: proc(sock: net.UDP_Socket, clients: ^[dynamic]Relay_Client, remote: net.Endpoint, data: []byte, upstream: net.Endpoint, dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, reasm: ^Reassembly, live: ^Predict_Caleb_Live, predict_out_path: string, capture: ^os.File, log_scratch: mem.Allocator, predict_scratch: mem.Allocator) -> bool {
+	idx := relay_client_index_or_create(clients, remote)
+	if idx < 0 do return false
+	client := &clients^[idx]
+	if !is_content_datagram(data) || datagram_is_health_channel(data) {
+		net.send_udp(client.socket, data, upstream)
+		return false
+	}
+
+	now := time.now()
+	log_relay_datagram(capture, log_scratch, "c2s", client.peer, now, data)
+	if !udp_datagram_push(dgrams, remote, now, data) {
+		fmt.eprintfln("datagram store full, dropping %d bytes", len(data))
+	} else {
+		process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
+	}
+	net.send_udp(client.socket, data, upstream)
+
+	ps := find_peer(&live.peers, client.peer, &live.nidx)
+	sent_msgs := filter_health_messages(reassemble_side(ps, .C2S, {data}, predict_scratch), predict_scratch)
+	if len(sent_msgs) == 0 do return false
+	predict_caleb_step(live, client.peer, client.client, sent_msgs)
+	return true
+}
+
+relay_handle_s2c :: proc(sock: net.UDP_Socket, clients: []Relay_Client, idx: int, data: []byte, from: net.Endpoint, dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, reasm: ^Reassembly, live: ^Predict_Caleb_Live, predict_out_path: string, capture: ^os.File, log_scratch: mem.Allocator, predict_scratch: mem.Allocator) {
+	if idx < 0 || idx >= len(clients) do return
+	if !is_content_datagram(data) || datagram_is_health_channel(data) {
+		net.send_udp(sock, data, clients[idx].client)
+		return
+	}
+	now := time.now()
+	log_relay_datagram(capture, log_scratch, "s2c", clients[idx].peer, now, data)
+	if !udp_datagram_push(dgrams, from, now, data) {
+		fmt.eprintfln("datagram store full, dropping %d bytes", len(data))
+	} else {
+		process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
+	}
+	net.send_udp(sock, data, clients[idx].client)
+
+	if is_content_datagram(data) {
+		ps := find_peer(&live.peers, clients[idx].peer, &live.nidx)
+		real_msgs := filter_health_messages(reassemble_side(ps, .Real, {data}, predict_scratch), predict_scratch)
+		if len(real_msgs) > 0 {
+			for msg in real_msgs {
+				predict_caleb_route_real(&live.txns, ps, msg, predict_scratch)
+			}
+			predict_caleb_live_write(live, predict_out_path)
+		}
+	}
+}
+
+relay_wait_for_responses :: proc(sock: net.UDP_Socket, http_sock: net.TCP_Socket, http_enabled: bool, clients: ^[dynamic]Relay_Client, pending_client_dgs: ^[dynamic]Relay_Pending_Client_Datagram, upstream: net.Endpoint, dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, reasm: ^Reassembly, live: ^Predict_Caleb_Live, predict_out_path: string, capture: ^os.File, log_scratch: mem.Allocator, predict_scratch: mem.Allocator, wait_ms, idle_ms: int) {
+	if wait_ms <= 0 || len(clients^) == 0 do return
+	now_tick := time.tick_now()._nsec
+	deadline := now_tick + i64(wait_ms) * i64(time.Millisecond)
+	idle_deadline: i64 = 0
+	saw_response := false
+	buf: [MAX_UDP_SIZE]byte
+	polls: [128]posix.pollfd
+	for {
+		now_tick = time.tick_now()._nsec
+		remaining := deadline - now_tick
+		if saw_response && idle_deadline > 0 && idle_deadline - now_tick < remaining {
+			remaining = idle_deadline - now_tick
+		}
+		if remaining <= 0 do break
+		poll_count := min(len(clients^) + 1, len(polls))
+		polls[0] = posix.pollfd{fd = udp_fd(sock), events = {.IN}}
+		for client, i in clients^[:poll_count - 1] {
+			polls[i + 1] = posix.pollfd{fd = udp_fd(client.socket), events = {.IN}}
+		}
+		http_poll_index := -1
+		if http_enabled && poll_count < len(polls) {
+			http_poll_index = poll_count
+			polls[http_poll_index] = posix.pollfd{fd = tcp_fd(http_sock), events = {.IN}}
+			poll_count += 1
+		}
+		timeout_ms := int((remaining + i64(time.Millisecond) - 1) / i64(time.Millisecond))
+		if timeout_ms > 2_147_483_647 do timeout_ms = 2_147_483_647
+		ready := posix.poll(&polls[0], posix.nfds_t(poll_count), i32(timeout_ms))
+		if ready <= 0 do break
+		if http_poll_index >= 0 && .IN in polls[http_poll_index].revents {
+			dtlive_handle_one(http_sock, log_scratch)
+		}
+		if .IN in polls[0].revents {
+			n, remote := net.recv_udp(sock, buf[:]) or_continue
+			if n > 0 {
+				idx := relay_client_index_or_create(clients, remote)
+				if idx >= 0 {
+					if !is_content_datagram(buf[:n]) || datagram_is_health_channel(buf[:n]) {
+						net.send_udp(clients^[idx].socket, buf[:n], upstream)
+					} else {
+						copy_data := make([]byte, n, context.allocator)
+						copy(copy_data, buf[:n])
+						append(pending_client_dgs, Relay_Pending_Client_Datagram{client = remote, data = copy_data})
+					}
+				}
+			}
+		}
+		upstream_poll_count := min(len(clients^), len(polls) - 1)
+		for i in 0 ..< upstream_poll_count + 1 {
+			if i == 0 do continue
+			if !(.IN in polls[i].revents) do continue
+			client_idx := i - 1
+			if client_idx < 0 || client_idx >= len(clients^) do continue
+			n, from := net.recv_udp(clients^[client_idx].socket, buf[:]) or_continue
+			if n <= 0 do continue
+			meaningful_response := is_content_datagram(buf[:n]) && !datagram_is_health_channel(buf[:n])
+			relay_handle_s2c(sock, clients^[:], client_idx, buf[:n], from, dgrams, msgs, reasm, live, predict_out_path, capture, log_scratch, predict_scratch)
+			if meaningful_response {
+				saw_response = true
+				idle_deadline = time.tick_now()._nsec + i64(max(idle_ms, 1)) * i64(time.Millisecond)
+			}
+		}
+	}
 }
 
 live_predict_handle_offline :: proc(sock: net.UDP_Socket, wire: ^World, addr: Peer_Addr, data: []byte, scratch: mem.Allocator) -> bool {
@@ -342,6 +452,13 @@ live_predict_handle_offline :: proc(sock: net.UDP_Socket, wire: ^World, addr: Pe
 	case:
 		return true
 	}
+	live_flush_outbox(sock, wire)
+	return true
+}
+
+live_predict_handle_health :: proc(sock: net.UDP_Socket, wire: ^World, addr: Peer_Addr, data: []byte) -> bool {
+	if !datagram_is_health_channel(data) do return false
+	_ = predict(wire, addr, data)
 	live_flush_outbox(sock, wire)
 	return true
 }
@@ -648,6 +765,9 @@ Predict_Caleb_Live :: struct {
 	raknet_samples_text:     string,
 	total_connections:       u64,
 	connection_result_peers: [dynamic]string,
+	joiner_label:            string,
+	peer_identities:        [dynamic]Predict_Caleb_Peer_Identity,
+	scene_handles:          [dynamic]Predict_Caleb_Scene_Handle,
 	steam_lobbies:           [dynamic]Predict_Caleb_Steam_Lobby,
 	cross_preds:             [dynamic]Predict_Caleb_Cross_Pred,
 	peers:                   [dynamic]^Peer_State,
@@ -658,6 +778,17 @@ Predict_Caleb_Live :: struct {
 Predict_Caleb_Steam_Lobby :: struct {
 	label: string,
 	id:    u64,
+}
+
+Predict_Caleb_Peer_Identity :: struct {
+	label:    string,
+	identity: string,
+}
+
+Predict_Caleb_Scene_Handle :: struct {
+	label:  string,
+	scene:  string,
+	handle: u8,
 }
 
 Predict_Caleb_Cross_Pred :: struct {
@@ -675,6 +806,11 @@ Relay_Client :: struct {
 	client: net.Endpoint,
 	peer:   string,
 	socket: net.UDP_Socket,
+}
+
+Relay_Pending_Client_Datagram :: struct {
+	client: net.Endpoint,
+	data:   []byte,
 }
 
 env_truthy :: proc(key: string) -> bool {
@@ -829,6 +965,82 @@ live_host_steam_lobby :: proc(live: ^Predict_Caleb_Live) -> u64 {
 	return live_steam_lobby(live, "C1", 109775242850226431)
 }
 
+predict_caleb_set_identity :: proc(live: ^Predict_Caleb_Live, label, identity: string) {
+	if identity == "" do return
+	for &entry in live.peer_identities {
+		if entry.label == label {
+			entry.identity = identity
+			return
+		}
+	}
+	append(&live.peer_identities, Predict_Caleb_Peer_Identity{label = label, identity = identity})
+}
+
+predict_caleb_identity_label :: proc(live: ^Predict_Caleb_Live, label: string) -> string {
+	for entry in live.peer_identities {
+		if entry.label == label do return entry.identity
+	}
+	return label
+}
+
+predict_caleb_identity_from_raw :: proc(raw: []byte) -> string {
+	s := string(raw)
+	if strings.contains(s, `"PlayerName":"Major Hoff"`) ||
+	   strings.contains(s, `"m_sSteamUserId":76561197977870267`) ||
+	   strings.contains(s, `"m_sEosUserId":"0002ea2c70fa4f89a5d876065a55c786"`) {
+		return "C2"
+	}
+	if strings.contains(s, `"PlayerName":"elsie"`) ||
+	   strings.contains(s, `"m_sSteamUserId":76561199572083022`) ||
+	   strings.contains(s, `"m_sEosUserId":"000239105cf443abbdf0238c827bd9e8"`) {
+		return "C1"
+	}
+	return ""
+}
+
+predict_caleb_learn_identity :: proc(live: ^Predict_Caleb_Live, label: string, msg: []byte) {
+	predict_caleb_set_identity(live, label, predict_caleb_identity_from_raw(msg))
+}
+
+predict_caleb_set_scene_handle :: proc(live: ^Predict_Caleb_Live, label, scene: string, handle: u8) {
+	if scene == "" do return
+	for &entry in live.scene_handles {
+		if entry.label == label && entry.scene == scene {
+			entry.handle = handle
+			return
+		}
+	}
+	append(&live.scene_handles, Predict_Caleb_Scene_Handle{label = label, scene = scene, handle = handle})
+}
+
+predict_caleb_party_handle :: proc(live: ^Predict_Caleb_Live, label: string, fallback: u8) -> u8 {
+	for entry in live.scene_handles {
+		if entry.label == label && strings.has_prefix(entry.scene, "party-") do return entry.handle
+	}
+	return fallback
+}
+
+predict_caleb_is_joiner :: proc(live: ^Predict_Caleb_Live, label: string) -> bool {
+	return predict_caleb_label_is_joiner(live.joiner_label, label)
+}
+
+predict_caleb_other_peer_label :: proc(live: ^Predict_Caleb_Live, label: string) -> string {
+	return predict_caleb_other_peer_label_from_states(live.peers[:], label)
+}
+
+predict_caleb_label_is_joiner :: proc(joiner_label, label: string) -> bool {
+	if joiner_label != "" do return joiner_label == label
+	return label == "C2"
+}
+
+predict_caleb_other_peer_label_from_states :: proc(peers: []^Peer_State, label: string) -> string {
+	for peer in peers {
+		if peer.label != label do return peer.label
+	}
+	if label == "C1" do return "C2"
+	return "C1"
+}
+
 predict_caleb_live_init :: proc(live: ^Predict_Caleb_Live, scratch: mem.Allocator, write_scratch: mem.Allocator = context.allocator) -> Error {
 	live.scratch = scratch
 	live.write_scratch = write_scratch
@@ -869,6 +1081,7 @@ predict_caleb_step :: proc(live: ^Predict_Caleb_Live, label: string, remote: net
 
 	new_incoming_in_txn := false
 	for msg in sent_msgs {
+		predict_caleb_learn_identity(live, txn.label, msg)
 		decoded := decode_message(msg, scratch)
 		#partial switch decoded in decoded {
 		case Connection_Request:
@@ -971,8 +1184,9 @@ predict_caleb_step :: proc(live: ^Predict_Caleb_Live, label: string, remote: net
 				if ready_handle == 145 && txn.label == "C2" {
 					append_scene_message(&txn.preds, 144, 7, party_settings_body("C2", 7, 5, "707203", scratch), scratch)
 				}
-				if ready_handle == 146 && txn.label == "C2" {
-					append_scene_message(&txn.preds, 146, 15, steam_join_lobby_body(8, live_host_steam_lobby(live), scratch), scratch)
+				if ready_handle == 146 && predict_caleb_is_joiner(live, txn.label) {
+					host_label := predict_caleb_other_peer_label(live, txn.label)
+					append_scene_message(&txn.preds, 146, 15, steam_join_lobby_body(8, live_steam_lobby(live, host_label, live_host_steam_lobby(live)), scratch), scratch)
 				}
 				if ready_handle == 148 && txn.label == "C2" {
 					append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(22, 14, scratch), scratch)
@@ -1004,12 +1218,15 @@ predict_caleb_step :: proc(live: ^Predict_Caleb_Live, label: string, remote: net
 				if ready_handle == 145 && txn.label == "C2" {
 					append_scene_message(&txn.preds, 144, 7, party_settings_body("C2", 8, 7, "707203", scratch), scratch)
 				}
-				if ready_handle == 146 && txn.label == "C2" {
-					append_scene_message(&txn.preds, 146, 3, party_memberdata_body("C2", 12, 9, true, 1, scratch), scratch)
-					append_cross_captured_push_rpc(live, "C1", "party/party.memberConnected", "C2", 144, 9, 1, 9, scratch)
-					append_cross_scene_message(live, "C1", 144, 3, party_memberdata_body("C2", 12, 9, true, 1, scratch), scratch)
+				if ready_handle == 146 && predict_caleb_is_joiner(live, txn.label) {
+					joiner_identity := predict_caleb_identity_label(live, txn.label)
+					host_label := predict_caleb_other_peer_label(live, txn.label)
+					host_party_handle := predict_caleb_party_handle(live, host_label, 144)
+					append_scene_message(&txn.preds, 146, 3, party_memberdata_body(joiner_identity, 12, 9, true, 1, scratch), scratch)
+					append_cross_captured_push_rpc(live, host_label, "party/party.memberConnected", joiner_identity, host_party_handle, 9, 1, 9, scratch)
+					append_cross_scene_message(live, host_label, host_party_handle, 3, party_memberdata_body(joiner_identity, 12, 9, true, 1, scratch), scratch)
 				}
-				if ready_handle == 146 && txn.label == "C1" {
+				if ready_handle == 146 && !predict_caleb_is_joiner(live, txn.label) {
 					append_scene_rpc_complete(&txn.preds, 146, 3, 1, true, scratch)
 					append_scene_message(&txn.preds, 144, 7, scene_rpc_uint_prefix_body(24, 15, scratch), scratch)
 					append_scene_message(&txn.preds, 144, 7, scene_rpc_uint_prefix_body(26, 16, scratch), scratch)
@@ -1041,6 +1258,8 @@ predict_caleb_step :: proc(live: ^Predict_Caleb_Live, label: string, remote: net
 				#partial switch args in decoded.args {
 				case Connect_To_Scene_Args:
 					handle := next_connect_scene_handle(live.txns[:], ps)
+					tok := parse_connection_token(args.token, scratch)
+					if tok.ok do predict_caleb_set_scene_handle(live, txn.label, scene_suffix(tok.scene_id), u8(handle))
 					raw := build_scene_connection_result_raw(handle, args.routes, scratch)
 					append_response_msg(&txn.preds, decoded.req_id, raw, scratch)
 					append_response_complete(&txn.preds, decoded.req_id, true, scratch)
@@ -1048,6 +1267,7 @@ predict_caleb_step :: proc(live: ^Predict_Caleb_Live, label: string, remote: net
 			}
 
 		case Scene_Message:
+			route_name := route_registry_resolve(&ps.reg_real, ps.ep_client, decoded.scene_handle, decoded.route_handle)
 			if decoded.decoded.has_rpc_id {
 				append(&txn.rpc_keys, Predict_Caleb_RPC_Key{decoded.scene_handle, decoded.decoded.rpc_id})
 			}
@@ -1129,23 +1349,38 @@ predict_caleb_step :: proc(live: ^Predict_Caleb_Live, label: string, remote: net
 					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_body(decoded.decoded, scratch), scratch)
 				}
 			case 5:
-				if decoded.scene_handle == 142 {
+				if route_name == "Friends.Subscribe" {
+					if body := captured_friend_notification(live.steam_friends_text, txn.label, 0, scratch); body != nil {
+						append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
+					}
+					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 2, decoded.decoded.rpc_id, false, scratch)
+				} else if route_name == "PartyManagement.CreateConnectionTokenFromInvitationCode" {
+					live.joiner_label = txn.label
+					host_label := predict_caleb_other_peer_label(live, txn.label)
+					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer(host_label), scratch), scratch)
+				} else if decoded.scene_handle == 142 {
 					if body := captured_friend_notification(live.steam_friends_text, txn.label, 0, scratch); body != nil {
 						append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
 					}
 					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 2, decoded.decoded.rpc_id, false, scratch)
 				} else if decoded.scene_handle == 143 {
-					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer("C1"), scratch), scratch)
+					live.joiner_label = txn.label
+					host_label := predict_caleb_other_peer_label(live, txn.label)
+					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer(host_label), scratch), scratch)
 				} else {
 					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
 				}
 			case 4:
-				if decoded.scene_handle == 142 {
-					if body := captured_friend_notification(live.steam_friends_text, txn.label, 1, scratch); body != nil {
+				if route_name == "Friends.UpdateFriendList" {
+					if body := captured_friend_notification_for_body(live.steam_friends_text, decoded.decoded, txn.label, 1, scratch); body != nil {
 						append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
 					}
-				} else if decoded.scene_handle == 143 {
+				} else if route_name == "partymanagement.createsession" || decoded.decoded.has_rpc_id {
 					append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer(txn.label), scratch), scratch)
+				} else if decoded.scene_handle == 142 || decoded.scene_handle == 143 {
+					if body := captured_friend_notification_for_body(live.steam_friends_text, decoded.decoded, txn.label, 1, scratch); body != nil {
+						append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
+					}
 				} else if decoded.scene_handle != 142 {
 					append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
 				}
@@ -1520,34 +1755,11 @@ decoded_message_can_be_extra :: proc(msg: Decoded_Message, others: []Decoded_Mes
 	for other in others {
 		if decoded_message_match(msg, other, allocator) do return true
 	}
-	if decoded_message_is_dynamic_scene_noise(msg) do return true
 	return decoded_message_is_transport_noise(msg)
-}
-
-decoded_message_is_dynamic_scene_noise :: proc(msg: Decoded_Message) -> bool {
-	#partial switch m in msg {
-	case Scene_Message:
-		if m.route_handle == 1 && m.decoded.has_rpc_id do return true
-		if m.scene_handle >= 144 {
-			switch m.route_handle {
-			case 1, 3, 7, 8, 9, 10, 14, 16:
-				return true
-			}
-		}
-		if m.scene_handle >= 144 && m.route_handle == 5 do return true
-		if m.scene_handle >= 146 && m.route_handle == 2 && !m.decoded.has_rpc_id do return true
-		if m.scene_handle >= 146 && m.route_handle == 4 && m.decoded.has_rpc_id do return true
-		return m.route_handle == 2
-	}
-	return false
 }
 
 decoded_message_is_transport_noise :: proc(msg: Decoded_Message) -> bool {
 	#partial switch m in msg {
-	case Connected_Ping:
-		return true
-	case Connected_Pong:
-		return true
 	case Response_Msg:
 		#partial switch _ in m.data {
 		case Ping_Response:
@@ -1604,8 +1816,13 @@ response_data_match :: proc(real, pred: Response_Data, allocator := context.allo
 
 scene_body_match :: proc(real, pred: Scene_Body, allocator := context.allocator) -> bool {
 	if real.has_rpc_id && pred.has_rpc_id && real.rpc_id == pred.rpc_id {
-		if scene_body_has_party_state(real) && scene_body_has_party_state(pred) do return true
-		if scene_body_has_invitation_code(real) && scene_body_has_invitation_code(pred) do return true
+		if scene_body_has_party_state(real) || scene_body_has_party_state(pred) {
+			return scene_body_party_state_match(real, pred, allocator)
+		}
+		if real_code, ok := scene_body_invitation_code(real); ok {
+			pred_code, pred_ok := scene_body_invitation_code(pred)
+			return pred_ok && real_code == pred_code
+		}
 		if scene_body_has_matchmaking_stats(real) && scene_body_has_matchmaking_stats(pred) do return true
 		if scene_body_has_token_envelope(real) && scene_body_has_token_envelope(pred) {
 			if real_token_scene, ok := scene_token_body_scene(real, allocator); ok {
@@ -1623,16 +1840,95 @@ scene_body_match :: proc(real, pred: Scene_Body, allocator := context.allocator)
 	       bytes_equal(real.values.raw[:real.values.consumed], pred.values.raw[:pred.values.consumed])
 }
 
-scene_body_has_invitation_code :: proc(body: Scene_Body) -> bool {
-	if len(body.values.roots) != 1 do return false
+Party_State_Key :: struct {
+	invitation_code: string,
+	party_id:        string,
+	leader_id:       string,
+	member_ids:      []string,
+}
+
+scene_body_party_state_match :: proc(real, pred: Scene_Body, allocator := context.allocator) -> bool {
+	real_key, real_ok := scene_body_party_state_key(real, allocator)
+	pred_key, pred_ok := scene_body_party_state_key(pred, allocator)
+	if !real_ok || !pred_ok do return false
+	if real_key.invitation_code != pred_key.invitation_code do return false
+	if real_key.party_id != pred_key.party_id do return false
+	if real_key.leader_id != pred_key.leader_id do return false
+	return string_set_match(real_key.member_ids, pred_key.member_ids, allocator)
+}
+
+scene_body_party_state_key :: proc(body: Scene_Body, allocator := context.allocator) -> (Party_State_Key, bool) {
+	if len(body.values.roots) == 0 do return {}, false
+	nodes := body.values.nodes
 	root := body.values.roots[0]
-	if root < 0 || root >= len(body.values.nodes) do return false
-	node := body.values.nodes[root]
-	if node.kind != .Str || len(node.str) != 6 do return false
-	for ch in node.str {
-		if ch < '0' || ch > '9' do return false
+	if root < 0 || root >= len(nodes) || nodes[root].kind != .Array || nodes[root].count < 4 do return {}, false
+	settings := msgpack_array_child(nodes, root, 0)
+	if settings < 0 || nodes[settings].kind != .Array || nodes[settings].count < 8 do return {}, false
+	leader := msgpack_array_child(nodes, root, 1)
+	members := msgpack_array_child(nodes, root, 2)
+	custom := msgpack_array_child(nodes, settings, 1)
+	party_id := msgpack_array_child(nodes, settings, 7)
+	if leader < 0 || nodes[leader].kind != .Str do return {}, false
+	if members < 0 || nodes[members].kind != .Array do return {}, false
+	if party_id < 0 || nodes[party_id].kind != .Str do return {}, false
+
+	invitation_code := ""
+	if custom >= 0 && nodes[custom].kind == .Str {
+		invitation_code = json_string_value(nodes[custom].str, "InvitationCode")
+	}
+
+	member_ids := make([dynamic]string, allocator)
+	child := members + 1
+	for _ in 0 ..< nodes[members].count {
+		if child < 0 || child >= len(nodes) do break
+		if nodes[child].kind == .Array {
+			id := msgpack_array_child(nodes, child, 0)
+			if id >= 0 && id < len(nodes) && nodes[id].kind == .Str do append(&member_ids, nodes[id].str)
+		}
+		child += nodes[child].subtree
+	}
+
+	return Party_State_Key {
+		invitation_code = invitation_code,
+		party_id        = nodes[party_id].str,
+		leader_id       = nodes[leader].str,
+		member_ids      = member_ids[:],
+	}, true
+}
+
+string_set_match :: proc(real, pred: []string, allocator := context.allocator) -> bool {
+	if len(real) != len(pred) do return false
+	matched := make([]bool, len(pred), allocator)
+	for r in real {
+		found := false
+		for p, i in pred {
+			if matched[i] do continue
+			if r == p {
+				matched[i] = true
+				found = true
+				break
+			}
+		}
+		if !found do return false
 	}
 	return true
+}
+
+scene_body_invitation_code :: proc(body: Scene_Body) -> (string, bool) {
+	if len(body.values.roots) != 1 do return "", false
+	root := body.values.roots[0]
+	if root < 0 || root >= len(body.values.nodes) do return "", false
+	node := body.values.nodes[root]
+	if node.kind != .Str || len(node.str) != 6 do return "", false
+	for ch in node.str {
+		if ch < '0' || ch > '9' do return "", false
+	}
+	return node.str, true
+}
+
+scene_body_has_invitation_code :: proc(body: Scene_Body) -> bool {
+	_, ok := scene_body_invitation_code(body)
+	return ok
 }
 
 scene_body_has_matchmaking_stats :: proc(body: Scene_Body) -> bool {
@@ -2088,7 +2384,21 @@ scene_token_response_for_suffix :: proc(scene_suffix: string, allocator := conte
 }
 
 captured_friend_notification :: proc(text, peer: string, index: int, allocator := context.allocator) -> []byte {
-	steam_id := steam_id_for_peer(peer)
+	return captured_friend_notification_by_steam_id(text, steam_id_for_peer(peer), index, allocator)
+}
+
+captured_friend_notification_for_body :: proc(text: string, body: Scene_Body, peer: string, index: int, allocator := context.allocator) -> []byte {
+	raw := string(body.values.raw[:body.values.consumed])
+	if strings.contains(raw, steam_id_for_peer("C1")) {
+		if out := captured_friend_notification_by_steam_id(text, steam_id_for_peer("C1"), index, allocator); out != nil do return out
+	}
+	if strings.contains(raw, steam_id_for_peer("C2")) {
+		if out := captured_friend_notification_by_steam_id(text, steam_id_for_peer("C2"), index, allocator); out != nil do return out
+	}
+	return captured_friend_notification(text, peer, index, allocator)
+}
+
+captured_friend_notification_by_steam_id :: proc(text, steam_id: string, index: int, allocator := context.allocator) -> []byte {
 	needle := fmt.aprintf("\"%s\"", steam_id, allocator = allocator)
 	start := strings.index(text, needle)
 	if start < 0 do return nil
@@ -2479,6 +2789,7 @@ predict_caleb :: proc(datagrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 	number_of_transactions_to_test := 211
 	total_connections: u64 = 0
 	connection_result_peers: [dynamic]string
+	joiner_label := ""
 	steam_lobbies: [dynamic]Predict_Caleb_Steam_Lobby
 	peers: [dynamic]^Peer_State
 	txns: [dynamic]Predict_Caleb_Txn
@@ -2506,12 +2817,13 @@ predict_caleb :: proc(datagrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 
 		dg, ok := hex.decode(transmute([]byte)rec.hex, scratch)
 		if !ok do continue
+		if datagram_is_health_channel(dg) do continue
 
 		ps := find_peer(&peers, rec.peer, &nidx)
 
 		if rec.dir == "s2c" {
 			if is_content_datagram(dg) {
-				real_msgs := reassemble_side(ps, .Real, {dg}, scratch)
+				real_msgs := filter_health_messages(reassemble_side(ps, .Real, {dg}, scratch), scratch)
 				for msg in real_msgs {
 					predict_caleb_route_real(&txns, ps, msg, scratch)
 				}
@@ -2521,7 +2833,7 @@ predict_caleb :: proc(datagrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 		if rec.dir != "c2s" do continue
 		if !is_content_datagram(dg) do continue
 
-		sent_msgs := reassemble_side(ps, .C2S, {dg}, scratch)
+		sent_msgs := filter_health_messages(reassemble_side(ps, .C2S, {dg}, scratch), scratch)
 		if len(sent_msgs) == 0 do continue
 
 		for &txn in txns {
@@ -2655,8 +2967,9 @@ predict_caleb :: proc(datagrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 					if ready_handle == 145 && txn.label == "C2" {
 						append_scene_message(&txn.preds, 144, 7, party_settings_body("C2", 7, 5, "707203", scratch), scratch)
 					}
-					if ready_handle == 146 && txn.label == "C2" {
-						append_scene_message(&txn.preds, 146, 15, steam_join_lobby_body(8, steam_lobbies_get(steam_lobbies[:], "C1", 109775242850226431), scratch), scratch)
+					if ready_handle == 146 && predict_caleb_label_is_joiner(joiner_label, txn.label) {
+						host_label := predict_caleb_other_peer_label_from_states(peers[:], txn.label)
+						append_scene_message(&txn.preds, 146, 15, steam_join_lobby_body(8, steam_lobbies_get(steam_lobbies[:], host_label, steam_lobbies_get(steam_lobbies[:], "C1", 109775242850226431)), scratch), scratch)
 					}
 					if ready_handle == 148 && txn.label == "C2" {
 						append_scene_message(&txn.preds, 146, 3, scene_rpc_uint_prefix_body(22, 14, scratch), scratch)
@@ -2693,10 +3006,10 @@ predict_caleb :: proc(datagrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 					if ready_handle == 145 && txn.label == "C2" {
 						append_scene_message(&txn.preds, 144, 7, party_settings_body("C2", 8, 7, "707203", scratch), scratch)
 					}
-					if ready_handle == 146 && txn.label == "C2" {
+					if ready_handle == 146 && predict_caleb_label_is_joiner(joiner_label, txn.label) {
 						append_scene_message(&txn.preds, 146, 3, party_memberdata_body("C2", 12, 9, true, 1, scratch), scratch)
 					}
-					if ready_handle == 146 && txn.label == "C1" {
+					if ready_handle == 146 && !predict_caleb_label_is_joiner(joiner_label, txn.label) {
 						append_scene_rpc_complete(&txn.preds, 146, 3, 1, true, scratch)
 						append_scene_message(&txn.preds, 144, 7, scene_rpc_uint_prefix_body(24, 15, scratch), scratch)
 						append_scene_message(&txn.preds, 144, 7, scene_rpc_uint_prefix_body(26, 16, scratch), scratch)
@@ -2735,6 +3048,7 @@ predict_caleb :: proc(datagrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 				}
 
 			case Scene_Message:
+				route_name := route_registry_resolve(&ps.reg_real, ps.ep_client, decoded.scene_handle, decoded.route_handle)
 				if decoded.decoded.has_rpc_id {
 					append(&txn.rpc_keys, Predict_Caleb_RPC_Key{decoded.scene_handle, decoded.decoded.rpc_id})
 				}
@@ -2815,24 +3129,39 @@ predict_caleb :: proc(datagrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 					if decoded.scene_handle == 141 {
 						append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_body(decoded.decoded, scratch), scratch)
 					}
-				case 5: // friends Friends.Subscribe
-					if decoded.scene_handle == 142 {
+				case 5: // friends Friends.Subscribe / party-manager join-code token
+					if route_name == "Friends.Subscribe" {
+						if body := captured_friend_notification(steam_friends_text, txn.label, 0, scratch); body != nil {
+							append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
+						}
+						append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 2, decoded.decoded.rpc_id, false, scratch)
+					} else if route_name == "PartyManagement.CreateConnectionTokenFromInvitationCode" {
+						joiner_label = txn.label
+						host_label := predict_caleb_other_peer_label_from_states(peers[:], txn.label)
+						append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer(host_label), scratch), scratch)
+					} else if decoded.scene_handle == 142 {
 						if body := captured_friend_notification(steam_friends_text, txn.label, 0, scratch); body != nil {
 							append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
 						}
 						append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 2, decoded.decoded.rpc_id, false, scratch)
 					} else if decoded.scene_handle == 143 {
-						append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer("C1"), scratch), scratch)
+						joiner_label = txn.label
+						host_label := predict_caleb_other_peer_label_from_states(peers[:], txn.label)
+						append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer(host_label), scratch), scratch)
 					} else {
 						append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
 					}
-				case 4: // friends Friends.UpdateFriendList
-					if decoded.scene_handle == 142 {
-						if body := captured_friend_notification(steam_friends_text, txn.label, 1, scratch); body != nil {
+				case 4: // friends Friends.UpdateFriendList / party-manager createsession
+					if route_name == "Friends.UpdateFriendList" {
+						if body := captured_friend_notification_for_body(steam_friends_text, decoded.decoded, txn.label, 1, scratch); body != nil {
 							append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
 						}
-					} else if decoded.scene_handle == 143 {
+					} else if route_name == "partymanagement.createsession" || decoded.decoded.has_rpc_id {
 						append_auth_rpc_response(&txn.preds, decoded.scene_handle, decoded.decoded.rpc_id, scene_token_response_for_suffix(party_scene_for_peer(txn.label), scratch), scratch)
+					} else if decoded.scene_handle == 142 || decoded.scene_handle == 143 {
+						if body := captured_friend_notification_for_body(steam_friends_text, decoded.decoded, txn.label, 1, scratch); body != nil {
+							append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
+						}
 					} else if decoded.scene_handle != 142 {
 						append_scene_rpc_complete(&txn.preds, decoded.scene_handle, 1, decoded.decoded.rpc_id, false, scratch)
 					}
@@ -2908,6 +3237,7 @@ ingest_jsonl :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, r
 
 		decoded, ok := hex.decode(transmute([]byte)rec.hex, line_alloc)
 		if !ok do continue
+		if datagram_is_health_channel(decoded) do continue
 
 		from, _ := net.parse_endpoint(rec.from)
 		recv_time, _ := time.rfc3339_to_time_utc(rec.t)
