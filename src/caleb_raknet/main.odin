@@ -29,6 +29,8 @@ import "core:sys/posix"
 LISTEN_HOST :: "0.0.0.0"
 LISTEN_PORT :: 30100          // matches raknet.py HOST/PORT
 DEFAULT_RELAY_UPSTREAM :: "dt-live.passtechgames.com:30100"
+DEFAULT_RELAY_REAL_HOST :: "dt-live.passtechgames.com"
+REAL_AUTH_TOKEN_PATH :: "/darktales/live-1-05-00/scenes/authenticator/token"
 DEFAULT_RELAY_CAPTURE :: "/tmp/pdlog/probe/relay_capture.jsonl"
 DEFAULT_PREDICT_CALEB_FILE :: "/tmp/pdlog/probe/predict_caleb.json"
 DEFAULT_RAKNET_ENDPOINT :: "127.0.0.1:30100"
@@ -239,6 +241,8 @@ net_relay_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 	capture := os.open(capture_path, {.Write, .Create, .Append}) or_return
 	defer os.close(capture)
 	sync_write_out(predict_out_path, "")
+	http_port := env_int("PROBE_PORT", DEFAULT_DTLIVE_PORT)
+	http_sock, http_enabled := dtlive_try_listen(bind_addr, http_port)
 
 	clients: [dynamic]Relay_Client
 	fmt.printfln("caleb_raknet relay listening on %s:%d -> %s; capture -> %s; predict -> %s", LISTEN_HOST, LISTEN_PORT, upstream_text, capture_path, predict_out_path)
@@ -247,12 +251,21 @@ net_relay_listen :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Stor
 	polls: [128]posix.pollfd
 	for {
 		poll_count := 1 + len(clients)
+		http_poll_index := -1
 		polls[0] = posix.pollfd{fd = udp_fd(sock), events = {.IN}}
 		for client, i in clients {
 			polls[i + 1] = posix.pollfd{fd = udp_fd(client.socket), events = {.IN}}
 		}
+		if http_enabled && poll_count < len(polls) {
+			http_poll_index = poll_count
+			polls[http_poll_index] = posix.pollfd{fd = tcp_fd(http_sock), events = {.IN}}
+			poll_count += 1
+		}
 		ready := posix.poll(&polls[0], posix.nfds_t(poll_count), 1000)
 		if ready <= 0 do continue
+		if http_poll_index >= 0 && .IN in polls[http_poll_index].revents {
+			dtlive_handle_one(http_sock, log_scratch)
+		}
 
 		if .IN in polls[0].revents {
 			n, remote := net.recv_udp(sock, buf[:]) or_continue
@@ -443,12 +456,117 @@ dtlive_response_body :: proc(path: string, allocator := context.allocator) -> (s
 		return "{\"current\":{\"id\":\"passtech-live\",\"adminEndpoints\":[\"https://dt-live.passtechgames.com\"],\"endpoints\":[\"https://dt-live.passtechgames.com\"],\"tags\":[]},\"clusters\":[{\"id\":\"passtech-live\",\"adminEndpoints\":null,\"endpoints\":[\"https://dt-live.passtechgames.com\"],\"tags\":[]}]}", "application/json"
 	}
 	if string_has_suffix(path, "/token") {
-		return scene_token_json_endpoint("authenticator", env_string("RAKNET_ENDPOINT", DEFAULT_RAKNET_ENDPOINT, allocator), allocator), "application/json; charset=utf-8"
+		raknet_endpoint := env_string("RAKNET_ENDPOINT", DEFAULT_RAKNET_ENDPOINT, allocator)
+		if env_truthy("RAKNET_RELAY") {
+			if body, ok := dtlive_relay_token_json(path, raknet_endpoint, allocator); ok {
+				return body, "application/json; charset=utf-8"
+			}
+		}
+		return scene_token_json_endpoint("authenticator", raknet_endpoint, allocator), "application/json; charset=utf-8"
 	}
 	if path == "/" {
 		return "{\"name\":\"dt-live-1\",\"version\":\"9.3.0.2\",\"reportedStatus\":\"Leader\",\"leader\":{\"uid\":\"5w0GiaMkGUuN+QnuOyHTKQ\",\"name\":\"dt-live-1\",\"endpoint\":\"dt-live.passtechgames.com:40243\",\"cluster\":\"passtech-live\"},\"cluster\":\"passtech-live\",\"logLastCommittedEntryId\":19,\"logLastEntryId\":19,\"logLastSnapshot\":null,\"state\":\"Running\",\"id\":\"5w0GiaMkGUuN+QnuOyHTKQ\"}", "application/json"
 	}
 	return `{}`, "application/json"
+}
+
+dtlive_relay_token_json :: proc(path, raknet_endpoint: string, allocator := context.allocator) -> (string, bool) {
+	real_host := env_string("RELAY_REAL_HOST", DEFAULT_RELAY_REAL_HOST, allocator)
+	fetch_path := path
+	if fetch_path == "" || fetch_path[0] != '/' do fetch_path = REAL_AUTH_TOKEN_PATH
+	url := fmt.aprintf("https://%s%s", real_host, fetch_path, allocator = allocator)
+	command := []string{
+		"curl", "-4", "-fsSL", "--max-time", "10", "-X", "POST",
+		"-H", "Accept: application/json",
+		"-H", "clientVersion: 1.05.00.05",
+		"-H", "Content-Type: text/plain; charset=utf-8, application/msgpack",
+		"-H", "devProduct: false",
+		"-H", "platform: pc",
+		"-H", "serverVersion: 2.0",
+		"-H", "User-Agent: cpprestsdk/2.8.01",
+		"-H", "x-version: 3",
+		url,
+	}
+	state, stdout, stderr, err := os.process_exec(os.Process_Desc{command = command}, allocator)
+	if err != nil || !state.success || len(stdout) == 0 {
+		fmt.eprintfln("dtlive relay token fetch failed -> err=%v status=%d stderr=%s", err, state.exit_code, string(stderr))
+		return "", false
+	}
+	real_body := trim_ascii_space(string(stdout))
+	if real_body == "" do return "", false
+	if real_body[0] == '{' {
+		if rewritten, ok := rewrite_raknet_endpoint(real_body, raknet_endpoint, allocator); ok {
+			return rewritten, true
+		}
+		fmt.eprintfln("dtlive relay token fetch returned JSON without endpoints.raknet; using local fallback")
+		return "", false
+	}
+	if real_body[0] != '"' {
+		real_body = json_quote_ascii(real_body, allocator)
+	}
+	return relay_token_envelope_json(real_body, raknet_endpoint, allocator), true
+}
+
+relay_token_envelope_json :: proc(token_json, raknet_endpoint: string, allocator := context.allocator) -> string {
+	b := strings.builder_make(allocator)
+	strings.write_string(&b, `{"token":`)
+	strings.write_string(&b, token_json)
+	strings.write_string(&b, `,"endpoints":{"raknet":["`)
+	strings.write_string(&b, raknet_endpoint)
+	strings.write_string(&b, `"]},"encryption":{"algorithm":"aes256","mode":"GCM","key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}}`)
+	return strings.to_string(b)
+}
+
+rewrite_raknet_endpoint :: proc(body, raknet_endpoint: string, allocator := context.allocator) -> (string, bool) {
+	needle := `"raknet":[`
+	start := strings.index(body, needle)
+	if start < 0 do return "", false
+	array_start := start + len(needle)
+	array_end := array_start
+	in_string := false
+	escaped := false
+	for array_end < len(body) {
+		ch := body[array_end]
+		if escaped {
+			escaped = false
+		} else if ch == '\\' && in_string {
+			escaped = true
+		} else if ch == '"' {
+			in_string = !in_string
+		} else if ch == ']' && !in_string {
+			break
+		}
+		array_end += 1
+	}
+	if array_end >= len(body) do return "", false
+	b := strings.builder_make(allocator)
+	strings.write_string(&b, body[:array_start])
+	strings.write_string(&b, json_quote_ascii(raknet_endpoint, allocator))
+	strings.write_string(&b, body[array_end:])
+	return strings.to_string(b), true
+}
+
+trim_ascii_space :: proc(s: string) -> string {
+	lo := 0
+	hi := len(s)
+	for lo < hi && is_ascii_space(s[lo]) do lo += 1
+	for hi > lo && is_ascii_space(s[hi - 1]) do hi -= 1
+	return s[lo:hi]
+}
+
+is_ascii_space :: proc(c: byte) -> bool {
+	return c == ' ' || c == '\n' || c == '\r' || c == '\t'
+}
+
+json_quote_ascii :: proc(s: string, allocator := context.allocator) -> string {
+	b := strings.builder_make(allocator)
+	strings.write_byte(&b, '"')
+	for c in s {
+		if c == '"' || c == '\\' do strings.write_byte(&b, '\\')
+		strings.write_rune(&b, c)
+	}
+	strings.write_byte(&b, '"')
+	return strings.to_string(b)
 }
 
 open_log :: proc() -> (^os.File, os.Error) {
