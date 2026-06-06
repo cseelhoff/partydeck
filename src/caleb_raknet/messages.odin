@@ -12,9 +12,9 @@ import "core:net"
 import "core:strings"
 import "core:time"
 
-MAX_INTERNAL_PACKETS :: 512   // internal packets unframed from one datagram
-MAX_SPLITS       :: 64    // concurrent in-flight fragmented messages
-MAX_FRAGMENTS    :: 1024  // max fragments in one split packet
+MAX_INTERNAL_PACKETS :: 512 // internal packets unframed from one datagram
+MAX_SPLITS :: 64 // concurrent in-flight fragmented messages
+MAX_FRAGMENTS :: 1024 // max fragments in one split packet
 
 // RakNet PacketReliability (raknet.py: UNRELIABLE..RELIABLE_SEQUENCED).
 Reliability :: enum u8 {
@@ -55,12 +55,17 @@ RakNet_Message_Store :: struct {
 // Process one stored datagram: drop ACK/NAK and offline datagrams, unframe the
 // rest into internal packets, reassemble split fragments via `reasm`, and
 // append every complete application message to `msgs`.
-process_udp_datagram :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_Store, reasm: ^Reassembly, i: int) {
+process_udp_datagram :: proc(
+	dgrams: ^UDP_Datagram_Store,
+	msgs: ^RakNet_Message_Store,
+	reasm: ^Reassembly,
+	i: int,
+) {
 	datagram_bytes := udp_datagram_bytes(dgrams, i)
 	if len(datagram_bytes) == 0 do return
 	flags := datagram_bytes[0]
 	if flags & 0xC0 == 0xC0 do return // ACK / NAK
-	if flags & 0x80 == 0 do return    // offline / handshake datagram
+	if flags & 0x80 == 0 do return // offline / handshake datagram
 
 	from := dgrams.froms[i]
 	recv_time := dgrams.recv_times[i]
@@ -71,7 +76,14 @@ process_udp_datagram :: proc(dgrams: ^UDP_Datagram_Store, msgs: ^RakNet_Message_
 		raknet_packet := raknet_packets[packet_index]
 		if len(raknet_packet.payload) == 0 do continue
 		if !raknet_packet.has_split {
-			raknet_message_push(msgs, from, recv_time, raknet_packet.reliability, 1, raknet_packet.payload)
+			raknet_message_push(
+				msgs,
+				from,
+				recv_time,
+				raknet_packet.reliability,
+				1,
+				raknet_packet.payload,
+			)
 			continue
 		}
 		if raknet_packet.split_count == 0 || raknet_packet.split_count > MAX_FRAGMENTS do continue
@@ -107,7 +119,10 @@ udp_datagram_bytes :: proc(s: ^UDP_Datagram_Store, i: int) -> []byte {
 // its internal packets, filling out[] and returning how many were parsed.
 // Mirrors raknet.py parse_messages_ex: stop on any bounds/format failure and
 // return what was decoded so far.
-parse_internal_packets :: proc(datagram_bytes: []byte, raknet_packets: []RakNet_Internal_Packet) -> int {
+parse_internal_packets :: proc(
+	datagram_bytes: []byte,
+	raknet_packets: []RakNet_Internal_Packet,
+) -> int {
 	datagram_bytes_count := len(datagram_bytes)
 	header_offset := 4 // past flags(1) + uint24 LE sequence number(3)
 	raknet_packets_count := 0
@@ -119,7 +134,10 @@ parse_internal_packets :: proc(datagram_bytes: []byte, raknet_packets: []RakNet_
 		data_bits := int(read_u16_be(datagram_bytes, header_offset)); header_offset += 2
 		if data_bits == 0 do break
 
-		is_reliable := reliability == .Reliable || reliability == .Reliable_Ordered || reliability == .Reliable_Sequenced
+		is_reliable :=
+			reliability == .Reliable ||
+			reliability == .Reliable_Ordered ||
+			reliability == .Reliable_Sequenced
 		is_sequenced := reliability == .Unreliable_Sequenced || reliability == .Reliable_Sequenced
 		is_ordered := is_sequenced || reliability == .Reliable_Ordered
 
@@ -129,7 +147,10 @@ parse_internal_packets :: proc(datagram_bytes: []byte, raknet_packets: []RakNet_
 
 		if is_reliable {
 			if header_offset + 3 > datagram_bytes_count do break
-			raknet_packet.reliable_message_number = read_u24_le(datagram_bytes, header_offset); header_offset += 3
+			raknet_packet.reliable_message_number = read_u24_le(
+				datagram_bytes,
+				header_offset,
+			); header_offset += 3
 		}
 		if is_sequenced {
 			if header_offset + 3 > datagram_bytes_count do break
@@ -181,7 +202,13 @@ split_find :: proc(r: ^Reassembly, from: net.Endpoint, id: u16) -> ^Split_Buffer
 
 // Concatenate a completed split packet's fragments in index order straight into
 // the message store's pool, then record one message spanning them.
-reassemble_and_push :: proc(msgs: ^RakNet_Message_Store, sb: ^Split_Buffer, from: net.Endpoint, recv_time: time.Time, reliability: Reliability) -> bool {
+reassemble_and_push :: proc(
+	msgs: ^RakNet_Message_Store,
+	sb: ^Split_Buffer,
+	from: net.Endpoint,
+	recv_time: time.Time,
+	reliability: Reliability,
+) -> bool {
 	total := 0
 	for k in 0 ..< int(sb.count) {
 		total += len(sb.frags[k])
@@ -207,7 +234,14 @@ reassemble_and_push :: proc(msgs: ^RakNet_Message_Store, sb: ^Split_Buffer, from
 	return true
 }
 
-raknet_message_push :: proc(s: ^RakNet_Message_Store, from: net.Endpoint, recv_time: time.Time, reliability: Reliability, n_fragments: int, data: []byte) -> bool {
+raknet_message_push :: proc(
+	s: ^RakNet_Message_Store,
+	from: net.Endpoint,
+	recv_time: time.Time,
+	reliability: Reliability,
+	n_fragments: int,
+	data: []byte,
+) -> bool {
 	if s.count >= MAX_RAKNET_MESSAGES do return false
 	start := pool_end(s.starts[:], s.lengths[:], s.count)
 	if start + len(data) > BYTE_POOL_SIZE do return false
@@ -250,6 +284,7 @@ print_all_messages :: proc(s: ^RakNet_Message_Store) {
 		route_name := ""
 		if sm, ok := decoded.(Scene_Message); ok {
 			route_name = route_registry_resolve(&reg, from, sm.scene_handle, sm.route_handle)
+			decoded = scene_message_with_route_body(decoded, route_name, context.temp_allocator)
 		}
 		strings.builder_reset(&line)
 		// fmt.sbprintf(

@@ -61,13 +61,14 @@ Side_Reasm :: struct {
 // buffers keep stable addresses across the run (the peer list never copies them).
 Peer_State :: struct {
 	label:         string,
-	addr:          Peer_Addr,    // synthetic predictor client address
+	addr:          Peer_Addr, // synthetic predictor client address
 	ep_client:     net.Endpoint, // route-learning key for c2s (role Client)
 	ep_real:       net.Endpoint, // route-learning key for real s2c (role Server)
 	ep_pred:       net.Endpoint, // route-learning key for pred s2c (role Server)
 	reg_real:      Route_Registry, // learns from c2s + real (renders sent + real)
 	reg_pred:      Route_Registry, // learns from pred (renders pred)
 	reasm:         [3]Side_Reasm,
+	seen_reliable: [3]map[u32]bool, // per-side reliable message numbers already delivered (retransmit guard)
 	active:        bool,
 	t:             string,
 	sent_msgs:     [dynamic][]byte, // already-reassembled c2s MESSAGES
@@ -90,10 +91,23 @@ is_content_datagram :: proc(dg: []byte) -> bool {
 	return (f & 0x80) != 0 && (f & 0x40) == 0 && (f & 0x20) == 0
 }
 
+// True for a RakNet ACK (0xC0) or NAK (0xA0) datagram: the online bit (0x80) set
+// together with the ACK (0x40) or NAK (0x20) bit. The relay drops these from the
+// upstream because it re-encodes client traffic into its own sequence space and
+// acknowledges the clients itself.
+datagram_is_ack_or_nak :: proc(dg: []byte) -> bool {
+	if len(dg) == 0 do return false
+	f := dg[0]
+	return (f & 0x80) != 0 && ((f & 0x40) != 0 || (f & 0x20) != 0)
+}
+
 message_is_health_channel :: proc(msg: []byte) -> bool {
 	if len(msg) == 0 do return false
 	switch msg[0] {
-	case u8(Message_Id.Connected_Ping), u8(Message_Id.Connected_Pong), u8(Message_Id.New_Incoming_Connection), u8(Message_Id.Connection_Result):
+	case u8(Message_Id.Connected_Ping),
+	     u8(Message_Id.Connected_Pong),
+	     u8(Message_Id.New_Incoming_Connection),
+	     u8(Message_Id.Connection_Result):
 		return true
 	}
 	if message_is_system_ping(msg) do return true
@@ -102,7 +116,11 @@ message_is_health_channel :: proc(msg: []byte) -> bool {
 }
 
 message_is_system_ping :: proc(msg: []byte) -> bool {
-	return len(msg) >= 2 && msg[0] == u8(Message_Id.System_Request) && msg[1] == u8(System_Request_Id.Ping)
+	return(
+		len(msg) >= 2 &&
+		msg[0] == u8(Message_Id.System_Request) &&
+		msg[1] == u8(System_Request_Id.Ping) \
+	)
 }
 
 message_ping_response_req_id :: proc(msg: []byte) -> (u16, bool) {
@@ -136,7 +154,8 @@ datagram_is_health_channel :: proc(dg: []byte) -> bool {
 		if len(pk.payload) == 0 do continue
 		if pk.has_split do return false
 		if !message_is_health_channel(pk.payload) {
-			if req, ok := message_response_complete_req_id(pk.payload); ok && u16_in(ping_reqs[:ping_req_count], req) {
+			if req, ok := message_response_complete_req_id(pk.payload);
+			   ok && u16_in(ping_reqs[:ping_req_count], req) {
 				seen = true
 				continue
 			}
@@ -177,7 +196,14 @@ u16_in :: proc(values: []u16, value: u16) -> bool {
 
 // Feed one split fragment; return the complete message once the last fragment of
 // its split id has arrived, else ("", false).
-split_feed :: proc(sr: ^Side_Reasm, pk: RakNet_Internal_Packet, allocator := context.allocator) -> ([]byte, bool) {
+split_feed :: proc(
+	sr: ^Side_Reasm,
+	pk: RakNet_Internal_Packet,
+	allocator := context.allocator,
+) -> (
+	[]byte,
+	bool,
+) {
 	ent: ^Split_Entry
 	for &e in sr.entries {
 		if e.active && e.id == pk.split_id {
@@ -225,15 +251,31 @@ split_feed :: proc(sr: ^Side_Reasm, pk: RakNet_Internal_Packet, allocator := con
 
 // Parse a sequence of datagrams into the complete encapsulated MESSAGES they
 // carry, reassembling split fragments via the side's persistent buffer.
-reassemble_side :: proc(ps: ^Peer_State, side: Side, dgs: [][]byte, allocator := context.allocator) -> [][]byte {
+reassemble_side :: proc(
+	ps: ^Peer_State,
+	side: Side,
+	dgs: [][]byte,
+	allocator := context.allocator,
+) -> [][]byte {
 	out := make([dynamic][]byte, allocator)
 	sr := &ps.reasm[int(side)]
+	seen := &ps.seen_reliable[int(side)]
 	packets: [MAX_INTERNAL_PACKETS]RakNet_Internal_Packet
 	for dg in dgs {
 		n := parse_internal_packets(dg, packets[:])
 		for i in 0 ..< n {
 			pk := packets[i]
 			if len(pk.payload) == 0 do continue
+			// Drop reliable retransmits: RakNet's reliability layer delivers each
+			// reliable message number to the application exactly once. A resent
+			// datagram reuses the number, so a server would not re-respond.
+			if pk.reliability == .Reliable ||
+			   pk.reliability == .Reliable_Ordered ||
+			   pk.reliability == .Reliable_Sequenced {
+				if seen^ == nil do seen^ = make(map[u32]bool)
+				if seen^[pk.reliable_message_number] do continue
+				seen^[pk.reliable_message_number] = true
+			}
 			if !pk.has_split {
 				append(&out, slice.clone(pk.payload, allocator))
 				continue
@@ -245,9 +287,64 @@ reassemble_side :: proc(ps: ^Peer_State, side: Side, dgs: [][]byte, allocator :=
 	return out[:]
 }
 
+// One complete application message plus the reliability class it arrived on, so
+// the relay can re-frame and forward it upstream individually (gated) while
+// keeping each message's delivery semantics.
+Reassembled_Message :: struct {
+	reliability: Reliability,
+	payload:     []byte,
+}
+
+// Same reassembly as reassemble_side, but it preserves each message's reliability
+// class instead of discarding it. The relay uses this to re-encode and forward one
+// decoded message at a time toward upstream.
+reassemble_side_meta :: proc(
+	ps: ^Peer_State,
+	side: Side,
+	dgs: [][]byte,
+	allocator := context.allocator,
+) -> []Reassembled_Message {
+	out := make([dynamic]Reassembled_Message, allocator)
+	sr := &ps.reasm[int(side)]
+	seen := &ps.seen_reliable[int(side)]
+	packets: [MAX_INTERNAL_PACKETS]RakNet_Internal_Packet
+	for dg in dgs {
+		n := parse_internal_packets(dg, packets[:])
+		for i in 0 ..< n {
+			pk := packets[i]
+			if len(pk.payload) == 0 do continue
+			if pk.reliability == .Reliable ||
+			   pk.reliability == .Reliable_Ordered ||
+			   pk.reliability == .Reliable_Sequenced {
+				if seen^ == nil do seen^ = make(map[u32]bool)
+				if seen^[pk.reliable_message_number] do continue
+				seen^[pk.reliable_message_number] = true
+			}
+			if !pk.has_split {
+				append(
+					&out,
+					Reassembled_Message {
+						reliability = pk.reliability,
+						payload = slice.clone(pk.payload, allocator),
+					},
+				)
+				continue
+			}
+			full, ok := split_feed(sr, pk, allocator)
+			if ok do append(&out, Reassembled_Message{reliability = pk.reliability, payload = full})
+		}
+	}
+	return out[:]
+}
+
 // Render a burst of complete messages to one human-readable string, learning routes
 // into `reg` along the way (so scene messages later resolve their route names).
-render_burst :: proc(reg: ^Route_Registry, ep: net.Endpoint, msgs: [][]byte, allocator := context.allocator) -> string {
+render_burst :: proc(
+	reg: ^Route_Registry,
+	ep: net.Endpoint,
+	msgs: [][]byte,
+	allocator := context.allocator,
+) -> string {
 	sb := strings.builder_make(allocator)
 	for m, i in msgs {
 		if i > 0 do strings.write_string(&sb, HR_MSG_SEP)
@@ -256,6 +353,7 @@ render_burst :: proc(reg: ^Route_Registry, ep: net.Endpoint, msgs: [][]byte, all
 		route_name := ""
 		if sm, ok := decoded.(Scene_Message); ok {
 			route_name = route_registry_resolve(reg, ep, sm.scene_handle, sm.route_handle)
+			decoded = scene_message_with_route_body(decoded, route_name, context.temp_allocator)
 		}
 		write_decoded_message(&sb, decoded, route_name)
 	}
@@ -264,7 +362,13 @@ render_burst :: proc(reg: ^Route_Registry, ep: net.Endpoint, msgs: [][]byte, all
 
 // Run the predictor for one c2s datagram; split the emitted content datagrams into
 // own (back to caddr) and cross (server-initiated pushes to other peers).
-sync_predict :: proc(world: ^World, caddr: Peer_Addr, dg: []byte, own: ^[dynamic][]byte, cross: ^[dynamic]Out_Dg) {
+sync_predict :: proc(
+	world: ^World,
+	caddr: Peer_Addr,
+	dg: []byte,
+	own: ^[dynamic][]byte,
+	cross: ^[dynamic]Out_Dg,
+) {
 	out := predict(world, caddr, dg)
 	for od in out {
 		if !is_content_datagram(od.data) do continue
@@ -335,7 +439,18 @@ finalize_txn :: proc(ps: ^Peer_State, out_sb: ^strings.Builder, stats: ^Sync_Sta
 	free_all(context.temp_allocator)
 
 	match := real_human == pred_human
-	sync_write_record(out_sb, ps.t, ps.label, match, ps.sent_msgs[:], real_msgs, pred_msgs, ps.sent_human, real_human, pred_human)
+	sync_write_record(
+		out_sb,
+		ps.t,
+		ps.label,
+		match,
+		ps.sent_msgs[:],
+		real_msgs,
+		pred_msgs,
+		ps.sent_human,
+		real_human,
+		pred_human,
+	)
 	stats.total += 1
 	if match do stats.matched += 1
 
@@ -356,10 +471,22 @@ find_peer :: proc(peers: ^[dynamic]^Peer_State, label: string, nidx: ^int) -> ^P
 	nidx^ += 1
 	ps := new(Peer_State)
 	ps.label = strings.clone(label)
-	ps.addr = Peer_Addr{ip = {10, 0, 0, u8(n)}, port = u16(n)}
-	ps.ep_client = net.Endpoint{address = net.IP4_Address{10, 0, 0, u8(n)}, port = n}
-	ps.ep_real = net.Endpoint{address = net.IP4_Address{10, 1, 0, u8(n)}, port = n}
-	ps.ep_pred = net.Endpoint{address = net.IP4_Address{10, 2, 0, u8(n)}, port = n}
+	ps.addr = Peer_Addr {
+		ip   = {10, 0, 0, u8(n)},
+		port = u16(n),
+	}
+	ps.ep_client = net.Endpoint {
+		address = net.IP4_Address{10, 0, 0, u8(n)},
+		port    = n,
+	}
+	ps.ep_real = net.Endpoint {
+		address = net.IP4_Address{10, 1, 0, u8(n)},
+		port    = n,
+	}
+	ps.ep_pred = net.Endpoint {
+		address = net.IP4_Address{10, 2, 0, u8(n)},
+		port    = n,
+	}
 	route_registry_init(&ps.reg_real)
 	route_registry_init(&ps.reg_pred)
 	append(peers, ps)
@@ -477,7 +604,12 @@ sync_replay :: proc(path: string, out_path := SYNC_ASSERT_FILE) -> Error {
 	}
 
 	sync_write_out(out_path, strings.to_string(out_sb))
-	fmt.printfln("=== sync replay: %d/%d transactions match -> %s ===", stats.matched, stats.total, out_path)
+	fmt.printfln(
+		"=== sync replay: %d/%d transactions match -> %s ===",
+		stats.matched,
+		stats.total,
+		out_path,
+	)
 	return nil
 }
 

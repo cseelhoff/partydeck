@@ -94,11 +94,11 @@ Connection_Request_Accepted :: struct {
 // IPv6, so the stride is not fixed; decoding each address is left to a caller.
 // internal_list_bytes is len(internal_list), retained for the existing renderer.
 New_Incoming_Connection :: struct {
-	server:             System_Address,
-	internal_list:      []byte,
+	server:              System_Address,
+	internal_list:       []byte,
 	internal_list_bytes: int,
-	ping_time:          u64,
-	pong_time:          u64,
+	ping_time:           u64,
+	pong_time:           u64,
 }
 
 // Disconnection_Notification: no body.
@@ -172,7 +172,8 @@ Connection_Result :: struct {
 Scene_Message :: struct {
 	scene_handle: u8,
 	route_handle: u16,
-	body:         []byte,
+	body:         Scene_Message_Body,
+	raw_body:     []byte,
 	decoded:      Scene_Body,
 }
 
@@ -234,10 +235,10 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 	case .Connection_Request:
 		if len(body) < 16 do return Malformed_Message{id, len(body), 16, msg}
 		return Connection_Request {
-			guid         = read_u64_be(body, 0),
-			time         = read_u64_be(body, 8),
+			guid = read_u64_be(body, 0),
+			time = read_u64_be(body, 8),
 			use_security = len(body) > 16 && body[16] != 0,
-			trailer      = body[16:],
+			trailer = body[16:],
 		}
 
 	case .Connection_Request_Accepted:
@@ -259,11 +260,11 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 	case .New_Incoming_Connection:
 		if len(body) < 7 + 16 do return Malformed_Message{id, len(body), 7 + 16, msg}
 		return New_Incoming_Connection {
-			server              = decode_system_address(body[:7]),
-			internal_list       = body[7:len(body) - 16],
+			server = decode_system_address(body[:7]),
+			internal_list = body[7:len(body) - 16],
 			internal_list_bytes = len(body) - 7 - 16,
-			ping_time           = read_u64_be(body, len(body) - 16),
-			pong_time           = read_u64_be(body, len(body) - 8),
+			ping_time = read_u64_be(body, len(body) - 16),
+			pong_time = read_u64_be(body, len(body) - 8),
 		}
 
 	case .Disconnection_Notification:
@@ -274,9 +275,9 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 		msg_id := System_Request_Id(body[0])
 		decoded := decode_msgpack_field(body[3:], allocator)
 		return System_Request {
-			msg_id   = msg_id,
-			req_id   = read_u16_le(body, 1),
-			args     = parse_system_request_args(msg_id, decoded, allocator),
+			msg_id = msg_id,
+			req_id = read_u16_le(body, 1),
+			args = parse_system_request_args(msg_id, decoded, allocator),
 			raw_args = body[3:],
 		}
 
@@ -284,8 +285,8 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 		if len(body) < 2 do return Malformed_Message{id, len(body), 2, msg}
 		return Response_Msg {
 			req_id = read_u16_le(body, 0),
-			data   = parse_response_data(decode_msgpack_field(body[2:], allocator), allocator),
-			raw    = body[2:],
+			data = parse_response_data(decode_msgpack_field(body[2:], allocator), allocator),
+			raw = body[2:],
 		}
 
 	case .Response_Complete:
@@ -294,7 +295,10 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 
 	case .Response_Error:
 		if len(body) < 2 do return Malformed_Message{id, len(body), 2, msg}
-		return Response_Error{req_id = read_u16_le(body, 0), data = decode_msgpack_field(body[2:], allocator)}
+		return Response_Error {
+			req_id = read_u16_le(body, 0),
+			data = decode_msgpack_field(body[2:], allocator),
+		}
 
 	case .Connection_Result:
 		if len(body) < 8 do return Malformed_Message{id, len(body), 8, msg}
@@ -304,11 +308,13 @@ decode_message :: proc(msg: []byte, allocator := context.allocator) -> Decoded_M
 	if int(id) >= SCENE_HANDLE_MIN {
 		if len(body) < 2 do return Malformed_Message{id, len(body), 2, msg}
 		route_payload := body[2:]
+		decoded_body := decode_scene_body(route_payload, allocator)
 		return Scene_Message {
 			scene_handle = id,
 			route_handle = read_u16_le(body, 0),
-			body         = route_payload,
-			decoded      = decode_scene_body(route_payload, allocator),
+			body = parse_scene_message_body("", route_payload, decoded_body, allocator),
+			raw_body = route_payload,
+			decoded = decoded_body,
 		}
 	}
 	return Unknown_Message{id = id, body = body}
@@ -370,16 +376,31 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message, ro
 	case Connected_Pong:
 		fmt.sbprintf(sb, "Connected_Pong echo=%d clk=%d", f.echo_clock, f.clock)
 	case Connection_Request:
-		fmt.sbprintf(sb, "Connection_Request guid=%016x time=%d sec=%v", f.guid, f.time, f.use_security)
+		fmt.sbprintf(
+			sb,
+			"Connection_Request guid=%016x time=%d sec=%v",
+			f.guid,
+			f.time,
+			f.use_security,
+		)
 	case Connection_Request_Accepted:
 		fmt.sbprintf(
-			sb, "Connection_Request_Accepted remote=%s sysidx=%d internal=%d echo=%d srv=%d",
-			address_to_string(f.remote), f.system_index, f.internal_count, f.echo_time, f.server_time,
+			sb,
+			"Connection_Request_Accepted remote=%s sysidx=%d internal=%d echo=%d srv=%d",
+			address_to_string(f.remote),
+			f.system_index,
+			f.internal_count,
+			f.echo_time,
+			f.server_time,
 		)
 	case New_Incoming_Connection:
 		fmt.sbprintf(
-			sb, "New_Incoming_Connection server=%s internal_list=%dB ping=%d pong=%d",
-			address_to_string(f.server), f.internal_list_bytes, f.ping_time, f.pong_time,
+			sb,
+			"New_Incoming_Connection server=%s internal_list=%dB ping=%d pong=%d",
+			address_to_string(f.server),
+			f.internal_list_bytes,
+			f.ping_time,
+			f.pong_time,
 		)
 	case Disconnection_Notification:
 		fmt.sbprintf(sb, "Disconnection_Notification")
@@ -401,10 +422,16 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message, ro
 		// Show the raw byte length only when the body did not decode cleanly --
 		// otherwise the decoded value list already accounts for every byte.
 		if f.decoded.values.ok do strings.write_byte(sb, ' ')
-		else do fmt.sbprintf(sb, " body=%dB ", len(f.body))
+		else do fmt.sbprintf(sb, " body=%dB ", len(f.raw_body))
 		write_scene_body(sb, f.decoded)
 	case Malformed_Message:
-		fmt.sbprintf(sb, "Malformed_Message id=0x%02x body=%dB expected>=%dB", f.id, f.body_len, f.expected)
+		fmt.sbprintf(
+			sb,
+			"Malformed_Message id=0x%02x body=%dB expected>=%dB",
+			f.id,
+			f.body_len,
+			f.expected,
+		)
 	case Unknown_Message:
 		fmt.sbprintf(sb, "Unknown_Message id=0x%02x body=%dB", f.id, len(f.body))
 	case:

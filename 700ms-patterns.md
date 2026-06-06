@@ -1,20 +1,25 @@
 # 700ms Relay Capture Patterns
 
-Source run: successful full multiplayer relay capture from 2026-06-05 around 18:35-18:37.
+Latest source run: successful full multiplayer relay capture from 2026-06-05 around
+22:37 (working raw-delay relay; C1 = laptop 10.1.1.117 / Elsie, C2 = desktop
+10.1.1.129 / Major Hoff). Captured with `RELAY_RESP_WAIT_MS=700` (response-grouping
+window). Note: `RELAY_GATE_MS` was 0 (no injected send delay) for this run, so the
+700ms here is response-collection grouping, not send spacing.
 
 Files examined:
 - `/tmp/pdlog/probe/relay_capture.jsonl`
 - `/tmp/pdlog/probe/predict_caleb.json`
 
-Relay summary before removing Stormancer system pings:
-- Relay capture rows: 537 total, 237 c2s and 300 s2c.
-- Prediction records: 201 total, 141 true and 60 false with the stricter matcher.
-- Peer record counts: C1 has 98 transactions, C2 has 103 transactions.
-- Transport health/control is no longer present in transaction logs.
+Relay summary (pings/health already filtered out of transaction logs):
+- Relay capture rows: 388 total.
+- Prediction records: 140 total, 123 true and 17 false with the strict matcher.
+- Peer record counts: C1 has 61 transactions, C2 has 79 transactions.
+- The matcher is order-insensitive (multiset match), so none of the 17 failures are
+  ordering issues -- every failure is a wrong/extra predicted message or a missing
+  real message.
 
-After also filtering Stormancer `System_Request msg_id=Ping` and `Ping_Response`, the same capture imports as:
-- Prediction records: 146 total, 89 true and 57 false.
-- Ping/health records: 0.
+Earlier run (2026-06-05 ~18:35, pre-final relay): 201 records (141/60), or 146
+(89/57) after also filtering Stormancer system pings. Kept for history only.
 
 ## Peer Identities
 
@@ -28,6 +33,71 @@ Do not infer identity from `C1` or `C2`. Peer labels are connection-order labels
 Useful stable identities:
 - Elsie: user id `9fe2fc1fa18643e2818bbd65198d4b00`, SteamID `76561199572083022`, EOS id `000239105cf443abbdf0238c827bd9e8`.
 - Major Hoff: user id `4168ffb24de245f88060d27c9580685e`, SteamID `76561197977870267`, EOS id `0002ea2c70fa4f89a5d876065a55c786`.
+
+### Identity decoupling fix (2026-06-05)
+
+The two humans are always Elsie (identity `"C1"`) and Major Hoff (identity `"C2"`);
+only their *connect order* swaps between runs. Therefore the hardcoded `"C1"`/`"C2"`
+literals inside the body builders (`user_id_for_peer`, `party_userdata_json_template`,
+etc.) are correct *identities*. The bug class on a connect-order-swapped run is only
+where the predictor used the *connection label* `txn.label` as if it were the
+identity.
+
+Fix (live `predict_caleb_step` only):
+- At the `Authentication.Login` site (route 6, handle 141) the canonical identity from
+  the Steam ticket is now stored into `peer_identities` via `predict_caleb_set_identity`,
+  so identity is known *early* (before any party userdata is sent).
+- Self-identity body sites now translate `txn.label` -> canonical identity via
+  `predict_caleb_identity_label`: `steam_create_lobby_body` (CreateLobby partyDataToken),
+  the handle-144 self `party_memberdata_body_with_userdata`, the handle-146 rpc 2049
+  `party_member_connected_body_with_userdata`, the handle-144 rpc 257 captured
+  `party.memberConnected`, and `party_state_response_learned`/`party_state_response_raw`.
+- `predict_caleb_userdata_for_label` now looks up learned userdata by *connection label*
+  (the real client bytes) but falls back to the template by *identity*.
+
+Left untranslated on purpose (role/join-sequence dependent, not pure self identity):
+the hardcoded `"C2"`/`"C1"` literal `party_memberdata_body` calls at handle 145 and the
+`party_memberdata_body("C2", 20, 13, ...)` at route 6. These encode a host/joiner join
+sequence and must not be translated blind; they need live validation first.
+
+The offline `predict_caleb` replay path is intentionally unchanged (it lacks the
+early-login identity infrastructure and is an unreliable validator for gated captures).
+Validate this fix against a fresh **live** `predict_caleb.json` only.
+
+### Structural party member-status counter (2026-06-05)
+
+`party.memberStatusUpdated` broadcasts (scene route 8) carry an `rpc_id` and a party
+`version` that the real server assigns from a *single global monotonic counter*, in the
+order members actually ready — **not** by peer label. In one live run the broadcasts form
+a clean sequence: rpc `13,14,15,16,17,18` with `version` bumping every two broadcasts
+(`10,10,11,11,12,12`). Each ready event is delivered to both connections (one broadcast
+per scene), so each event consumes two consecutive `rpc_id`s sharing one `version`.
+
+The route-9 (`party.updategamefinderplayerstatus`) handler emits the *self*-broadcast (the
+member being told its own ready registered). Those two self-broadcasts get the middle
+values `rpc 14 / v 10` (first member to ready) and `rpc 15 / v 11` (second). The old code
+hardcoded them by handle (`144 -> rpc 15`, `146 -> rpc 14`), which is backwards whenever
+the ready order differs from the assumed order — the exact `idx96`/`idx100` symmetric swap.
+
+Fix: a monotonic `ready_status_seq` counter (field on `Predict_Caleb_Live`; a local in the
+offline path) assigns `rpc 14+seq` / `version 10+seq` in arrival order. The matcher passes
+route 8 on `rpc_id` alone (dynamic party route), so correcting the `rpc_id` ordering is
+sufficient to flip `idx96`/`idx100` to match. Expected: live `137/112/25 -> 137/114/23`.
+
+NOT fixed (deliberately, would require window-attribution overfitting): the *cross*-peer
+deliveries of the same events (`idx95/99/101/102`) — which 700ms window the broadcast of
+the *other* peer's ready lands in is timing-governed, not a counter problem. Validate the
+counter against a fresh **live** `predict_caleb.json`.
+
+Validated 2026-06-05 (swapped-order live run with one user retry, 165/132/33): the
+version-drift class dropped from 5 failures to 1, and the self-broadcast now matches in the
+opposite ready order (`idx123` C2/Elsie readied first → `rpc14/v10`, predicted correctly).
+The route-9 gate was then generalized from the hardcoded `scene_handle == 144 || 146` to
+`scene_handle >= 144 && route_name == "party.updategamefinderplayerstatus"` so the same
+counter also covers a **retry**-allocated party scene handle (e.g. `148`) without misfiring
+on a non-party scene. The remaining failures in that run are retry artifacts (extra async
+re-join pushes; a create-vs-join role confusion where the host re-creates the lobby on
+retry), not counter problems.
 
 ## Scene Handle Patterns
 
@@ -212,17 +282,48 @@ Grouping caveats:
 - Some client datagrams still contain multiple meaningful scene messages; the relay timing window cannot split a single RakNet datagram.
 - With pings filtered, any remaining `Ping` / `Ping_Response` in `predict_caleb.json` should be treated as a bug in the filter.
 
-## Mismatch Buckets From This Run
+## Mismatch Buckets From The 22:37 Run (17 false of 140)
 
-With strict matching, current mismatch categories were roughly:
-- Party state / invite code / dynamic identity and party id mismatches.
-- Game session and match-start push mismatches.
-- Scene-ready push burst mismatches.
-- Friends notification sample/timing mismatches.
-- One scene connection result mismatch.
-- One merger status / live pool stats mismatch.
+The 17 `match=false` records break down into three causes. Record indices are
+0-based positions in `predict_caleb.json`.
 
-Do not hide these with matcher exceptions. They represent either dynamic state to learn or predictor behavior to correct.
+### A. Unmodeled async state-driven server pushes (the majority)
+The client sent a `stormancer.rpc.completed [0]` (or a ready/token request) and the
+real backend answered with one or more async pushes the predictor does not emit, so
+PRED is empty or missing trailing messages. These are inherently state/timing driven
+(the doc's "pending/cross push" category) and cannot be matched by timing alone.
+- idx 36 (C1): completed -> real `Response_Complete` + `party.memberConnected`; PRED empty.
+- idx 99 (C2): `Scene_Ready2 h147` -> real adds `party.memberDataUpdated`; PRED has only bool+complete.
+- idx 107 (C1): UpdatePartyUserData2 + updatepartysettings -> real adds `party.memberStatusUpdated`; PRED has only the two completions.
+- idx 114 (C1): completed -> real `Steam.UpdateLobbyJoinable`; PRED empty.
+- idx 115 (C2): completed -> real `player.update`; PRED empty.
+- idx 117 (C1) / idx 119 (C2): `GameSession.GetP2PToken` -> real `rpc.next[[nil,false,nil]]` (matched) PLUS an async `player.update` / `party.settingsUpdated`; PRED has only the rpc.next.
+- idx 132 (C2): completed -> real `party.settingsUpdated`; PRED empty.
+- idx 135 (C1): completed -> real `party.memberDisconnected` + `player.update`; PRED empty.
+- idx 70 (C2): `Scene_Ready2 h145` -> real has TWO `party.settingsUpdated` (rpc 7 and 8); PRED emits only rpc 7.
+
+### B. Dynamic member/party state content we do not track exactly
+PRED has the right message shapes but member-data fields (RequestedHero, LobbyState,
+MemberDataInitialized), member ordering, or connection-status integers differ from
+the live values. These need a real per-member state model.
+- idx 20 (C1): own-party-ready burst; first `party.settingsUpdated` settings value and a trailing `memberDataUpdated` differ.
+- idx 33 (C1): `Scene_Ready2 h145`; PRED emits a spurious leading `memberDataUpdated` and wrong RequestedHero values.
+- idx 103 (C2): `party.getpartystate2`; member connection-status integers differ (real 0/1, PRED 0/0).
+- idx 116 (C1) / idx 118 (C2): large `Scene_Ready2 h146/h148` bursts; many member-data and push diffs.
+
+### C. Hardcoded per-session rpc_id push rules (FIXABLE)
+The predictor keys several party pushes on hardcoded `rpc_id` constants
+(`(counter<<8)`: 2049, 2816, 3584, 4096, 6400, 3840). The connect flow is
+deterministic enough that 4 of 6 (`2049`, `2816`, `4096`, `6400`) still matched
+True in this brand-new capture. Only two diverged, and they are a matched pair:
+the "Cannot update data when member is ready." error actually occurred at idx 102
+(C2, handle 146, rpc 3584) but the predictor emitted it at idx 105 (C1, handle 144,
+rpc 3840) -- where the real response was `gamefinder.update`. Fix: emit the error
+on the (146, 3584) rule (matches idx 102 exactly -> True) and drop it from the
+(144, 3840) rule, keeping only the `gamefinder.update [0]` push there.
+
+Do not hide the A/B buckets with matcher exceptions; they represent dynamic state to
+model. Bucket C is a concrete predictor correction applied in main.odin.
 
 ## Concrete Odin Changes Suggested
 

@@ -97,7 +97,7 @@ encode_message :: proc(message: Decoded_Message, allocator := context.allocator)
 		// scene_handle is itself the leading id byte (>= SCENE_HANDLE_MIN).
 		append(&b, f.scene_handle)
 		write_u16_le(&b, f.route_handle)
-		append(&b, ..f.body)
+		append(&b, ..f.raw_body)
 
 	case Malformed_Message:
 		// Could not be parsed; `raw` is the full original message (id included).
@@ -133,16 +133,28 @@ write_u16_be :: proc(b: ^[dynamic]byte, v: u16) {
 write_u64_be :: proc(b: ^[dynamic]byte, v: u64) {
 	append(
 		b,
-		u8(v >> 56), u8(v >> 48), u8(v >> 40), u8(v >> 32),
-		u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v),
+		u8(v >> 56),
+		u8(v >> 48),
+		u8(v >> 40),
+		u8(v >> 32),
+		u8(v >> 24),
+		u8(v >> 16),
+		u8(v >> 8),
+		u8(v),
 	)
 }
 
 write_u64_le :: proc(b: ^[dynamic]byte, v: u64) {
 	append(
 		b,
-		u8(v), u8(v >> 8), u8(v >> 16), u8(v >> 24),
-		u8(v >> 32), u8(v >> 40), u8(v >> 48), u8(v >> 56),
+		u8(v),
+		u8(v >> 8),
+		u8(v >> 16),
+		u8(v >> 24),
+		u8(v >> 32),
+		u8(v >> 40),
+		u8(v >> 48),
+		u8(v >> 56),
 	)
 }
 
