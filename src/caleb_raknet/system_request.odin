@@ -36,12 +36,33 @@ Scene_Route :: struct {
 }
 
 // Connect_To_Scene (134): join a scene, registering the client's own route table
-// and metadata. `token` authenticates/identifies the target scene.
+// and decoded metadata fields. `token` authenticates/identifies the target scene.
 Connect_To_Scene_Args :: struct {
-	token:               string,
-	routes:              []Scene_Route,
-	scene_metadata:      []Metadata_Entry,
-	connection_metadata: []Metadata_Entry,
+	token:                                           string,
+	routes:                                          []Scene_Route,
+	scene_stormancer_plugins_rpc:                    string,
+	scene_stormancer_plugins_nintendo:               string,
+	scene_stormancer_plugins_xbl_use_modern_gamertag: string,
+	scene_stormancer_plugins_steam:                  string,
+	scene_app_id:                                    string,
+	scene_account_id:                                string,
+	scene_stormancer_game_version:                   string,
+	scene_stormancer_plugins_psn:                    string,
+	connection_stormancer_party:                     string,
+	connection_version:                              string,
+	connection_server_name:                          string,
+	connection_timeout:                              string,
+	connection_server_version:                       string,
+	connection_stormancer_party_plugin:              string,
+	connection_stormancer_partymanagement:           string,
+	connection_stormancer_plugins_gamefinder_protocol: string,
+	connection_plugins:                              string,
+	connection_serializers:                          string,
+	connection_transport:                            string,
+	connection_platform:                             string,
+	connection_protocol:                             string,
+	connection_type:                                 string,
+	connection_serializer:                           string,
 }
 
 // Get_Scene_Infos (136): ask for a scene's route/serializer info before joining.
@@ -89,6 +110,7 @@ Set_Metadata_Args :: struct {
 // identified by its runtime-assigned handle. Wire shape {SceneHandle: uint}.
 Scene_Ready_Args :: struct {
 	scene_handle: u64,
+	sent_game_version_update: bool, // tracks if initial gameversion update has been sent for this scene; not part of the wire format
 }
 
 // Disconnect_From_Scene (135): leave a scene, identified by handle. The args are
@@ -136,11 +158,34 @@ parse_system_request_args :: proc(
 	#partial switch msg_id {
 	case .Connect_To_Scene:
 		if !args.ok || len(n) == 0 || n[0].kind != .Map do return Unparsed_Args{args.raw}
+		scene_metadata := collect_metadata(n, msgpack_map_get(n, 0, "SceneMetadata"), allocator)
+		connection_metadata := collect_metadata(n, msgpack_map_get(n, 0, "ConnectionMetadata"), allocator)
 		return Connect_To_Scene_Args {
-			token               = node_str(n, msgpack_map_get(n, 0, "Token")),
-			routes              = collect_routes(n, msgpack_map_get(n, 0, "Routes"), allocator),
-			scene_metadata      = collect_metadata(n, msgpack_map_get(n, 0, "SceneMetadata"), allocator),
-			connection_metadata = collect_metadata(n, msgpack_map_get(n, 0, "ConnectionMetadata"), allocator),
+			token                                           = node_str(n, msgpack_map_get(n, 0, "Token")),
+			routes                                          = collect_routes(n, msgpack_map_get(n, 0, "Routes"), allocator),
+			scene_stormancer_plugins_rpc                    = metadata_value(scene_metadata, "stormancer.plugins.rpc"),
+			scene_stormancer_plugins_nintendo               = metadata_value(scene_metadata, "stormancer.plugins.nintendo"),
+			scene_stormancer_plugins_xbl_use_modern_gamertag = metadata_value(scene_metadata, "Stormancer.plugins.XBLServices.useModernGamerTag"),
+			scene_stormancer_plugins_steam                  = metadata_value(scene_metadata, "stormancer.plugins.steam"),
+			scene_app_id                                    = metadata_value(scene_metadata, "appId"),
+			scene_account_id                                = metadata_value(scene_metadata, "accountId"),
+			scene_stormancer_game_version                   = metadata_value(scene_metadata, "stormancer.gameVersion"),
+			scene_stormancer_plugins_psn                    = metadata_value(scene_metadata, "stormancer.plugins.psn"),
+			connection_stormancer_party                     = metadata_value(connection_metadata, "stormancer.party"),
+			connection_version                              = metadata_value(connection_metadata, "version"),
+			connection_server_name                          = metadata_value(connection_metadata, "server.name"),
+			connection_timeout                              = metadata_value(connection_metadata, "timeout"),
+			connection_server_version                       = metadata_value(connection_metadata, "server.version"),
+			connection_stormancer_party_plugin              = metadata_value(connection_metadata, "stormancer.party.plugin"),
+			connection_stormancer_partymanagement           = metadata_value(connection_metadata, "stormancer.partymanagement"),
+			connection_stormancer_plugins_gamefinder_protocol = metadata_value(connection_metadata, "stormancer.plugins.gamefinder.protocol"),
+			connection_plugins                              = metadata_value(connection_metadata, "plugins"),
+			connection_serializers                          = metadata_value(connection_metadata, "serializers"),
+			connection_transport                            = metadata_value(connection_metadata, "transport"),
+			connection_platform                             = metadata_value(connection_metadata, "platform"),
+			connection_protocol                             = metadata_value(connection_metadata, "protocol"),
+			connection_type                                 = metadata_value(connection_metadata, "type"),
+			connection_serializer                           = metadata_value(connection_metadata, "serializer"),
 		}
 
 	case .Get_Scene_Infos:
@@ -277,10 +322,37 @@ write_system_request_args :: proc(sb: ^strings.Builder, args: System_Request_Arg
 	case Connect_To_Scene_Args:
 		fmt.sbprintf(sb, "Connect token=%dB routes=", len(a.token))
 		write_routes(sb, a.routes)
-		strings.write_string(sb, " scene_meta=")
-		write_metadata(sb, a.scene_metadata)
-		strings.write_string(sb, " conn_meta=")
-		write_metadata(sb, a.connection_metadata)
+		fmt.sbprintf(
+			sb,
+			" scene_meta={stormancer.plugins.rpc=%q, stormancer.plugins.nintendo=%q, Stormancer.plugins.XBLServices.useModernGamerTag=%q, stormancer.plugins.steam=%q, appId=%q, accountId=%q, stormancer.gameVersion=%q, stormancer.plugins.psn=%q}",
+			a.scene_stormancer_plugins_rpc,
+			a.scene_stormancer_plugins_nintendo,
+			a.scene_stormancer_plugins_xbl_use_modern_gamertag,
+			a.scene_stormancer_plugins_steam,
+			a.scene_app_id,
+			a.scene_account_id,
+			a.scene_stormancer_game_version,
+			a.scene_stormancer_plugins_psn,
+		)
+		fmt.sbprintf(
+			sb,
+			" conn_meta={stormancer.party=%q, version=%q, server.name=%q, timeout=%q, server.version=%q, stormancer.party.plugin=%q, stormancer.partymanagement=%q, stormancer.plugins.gamefinder.protocol=%q, plugins=%q, serializers=%q, transport=%q, platform=%q, protocol=%q, type=%q, serializer=%q}",
+			a.connection_stormancer_party,
+			a.connection_version,
+			a.connection_server_name,
+			a.connection_timeout,
+			a.connection_server_version,
+			a.connection_stormancer_party_plugin,
+			a.connection_stormancer_partymanagement,
+			a.connection_stormancer_plugins_gamefinder_protocol,
+			a.connection_plugins,
+			a.connection_serializers,
+			a.connection_transport,
+			a.connection_platform,
+			a.connection_protocol,
+			a.connection_type,
+			a.connection_serializer,
+		)
 	case Get_Scene_Infos_Args:
 		fmt.sbprintf(
 			sb,

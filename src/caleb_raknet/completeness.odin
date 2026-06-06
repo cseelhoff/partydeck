@@ -103,8 +103,7 @@ scan_system_request_args :: proc(
 	case Connect_To_Scene_Args:
 		scan_token(a.token, "Connect_To_Scene.Token", sink, allocator)
 		scan_routes(a.routes, "Connect_To_Scene.Routes", sink)
-		scan_metadata(a.scene_metadata, "Connect_To_Scene.SceneMetadata", sink)
-		scan_metadata(a.connection_metadata, "Connect_To_Scene.ConnectionMetadata", sink)
+		scan_connect_to_scene_args(a, sink)
 	case Get_Scene_Infos_Args:
 		scan_token(a.token, "Get_Scene_Infos.Token", sink, allocator)
 	case Set_Metadata_Args:
@@ -228,6 +227,48 @@ scan_set_metadata_args :: proc(a: Set_Metadata_Args, sink: ^[dynamic]Completenes
 	scan_string(a.protocol, "Set_Metadata.Metadata.protocol", sink)
 	scan_string(a.connection_type, "Set_Metadata.Metadata.type", sink)
 	scan_string(a.serializer, "Set_Metadata.Metadata.serializer", sink)
+}
+
+scan_connect_to_scene_args :: proc(a: Connect_To_Scene_Args, sink: ^[dynamic]Completeness_Issue) {
+	scan_string(a.scene_stormancer_plugins_rpc, "Connect_To_Scene.SceneMetadata.stormancer.plugins.rpc", sink)
+	scan_string(a.scene_stormancer_plugins_nintendo, "Connect_To_Scene.SceneMetadata.stormancer.plugins.nintendo", sink)
+	scan_string(
+		a.scene_stormancer_plugins_xbl_use_modern_gamertag,
+		"Connect_To_Scene.SceneMetadata.Stormancer.plugins.XBLServices.useModernGamerTag",
+		sink,
+	)
+	scan_string(a.scene_stormancer_plugins_steam, "Connect_To_Scene.SceneMetadata.stormancer.plugins.steam", sink)
+	scan_string(a.scene_app_id, "Connect_To_Scene.SceneMetadata.appId", sink)
+	scan_string(a.scene_account_id, "Connect_To_Scene.SceneMetadata.accountId", sink)
+	scan_string(a.scene_stormancer_game_version, "Connect_To_Scene.SceneMetadata.stormancer.gameVersion", sink)
+	scan_string(a.scene_stormancer_plugins_psn, "Connect_To_Scene.SceneMetadata.stormancer.plugins.psn", sink)
+	scan_string(a.connection_stormancer_party, "Connect_To_Scene.ConnectionMetadata.stormancer.party", sink)
+	scan_string(a.connection_version, "Connect_To_Scene.ConnectionMetadata.version", sink)
+	scan_string(a.connection_server_name, "Connect_To_Scene.ConnectionMetadata.server.name", sink)
+	scan_string(a.connection_timeout, "Connect_To_Scene.ConnectionMetadata.timeout", sink)
+	scan_string(a.connection_server_version, "Connect_To_Scene.ConnectionMetadata.server.version", sink)
+	scan_string(
+		a.connection_stormancer_party_plugin,
+		"Connect_To_Scene.ConnectionMetadata.stormancer.party.plugin",
+		sink,
+	)
+	scan_string(
+		a.connection_stormancer_partymanagement,
+		"Connect_To_Scene.ConnectionMetadata.stormancer.partymanagement",
+		sink,
+	)
+	scan_string(
+		a.connection_stormancer_plugins_gamefinder_protocol,
+		"Connect_To_Scene.ConnectionMetadata.stormancer.plugins.gamefinder.protocol",
+		sink,
+	)
+	scan_string(a.connection_plugins, "Connect_To_Scene.ConnectionMetadata.plugins", sink)
+	scan_string(a.connection_serializers, "Connect_To_Scene.ConnectionMetadata.serializers", sink)
+	scan_string(a.connection_transport, "Connect_To_Scene.ConnectionMetadata.transport", sink)
+	scan_string(a.connection_platform, "Connect_To_Scene.ConnectionMetadata.platform", sink)
+	scan_string(a.connection_protocol, "Connect_To_Scene.ConnectionMetadata.protocol", sink)
+	scan_string(a.connection_type, "Connect_To_Scene.ConnectionMetadata.type", sink)
+	scan_string(a.connection_serializer, "Connect_To_Scene.ConnectionMetadata.serializer", sink)
 }
 
 scan_routes :: proc(routes: []Scene_Route, field: string, sink: ^[dynamic]Completeness_Issue) {

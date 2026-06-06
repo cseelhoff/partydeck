@@ -6,6 +6,7 @@ package caleb_raknet
 // decodes each message into the typed unions, then dispatches through explicit
 // switch cases. The cases are stubs for now.
 
+import "core:encoding/hex"
 import "core:fmt"
 import "core:mem"
 import "core:net"
@@ -81,12 +82,6 @@ Simple_Server_State :: struct {
 client_list: map[net.Endpoint]uint
 total_clients: uint
 g_server_state: [dynamic]Simple_Server_State
-
-Simple_Response_Type :: enum u8 {
-	Connection_Request_Accepted,
-	Response_Msg,
-	Response_Complete,
-}
 
 simple_net :: proc(
 	dgrams: ^UDP_Datagram_Store,
@@ -202,22 +197,22 @@ simple_net :: proc(
 				decoded = scene_message_with_route_body(decoded, route_name, scratch)
 			}
 			simple_server_state := &g_server_state[int(client_id)]
-			response_types := simple_dispatch_decoded_message(
+			simple_apply_decoded_message(client_id, label, decoded, verbose, simple_server_state)
+			response_messages := simple_dispatch_decoded_message(
 				client_id,
 				label,
 				decoded,
 				verbose,
 				simple_server_state,
 			)
-			for response_type in response_types {
-				switch response_type {
-				case .Connection_Request_Accepted:
-					_ = simple_server_state.connection_request_accepted
-				case .Response_Msg:
-					_ = simple_server_state.response_msg
-				case .Response_Complete:
-					_ = simple_server_state.response_complete
-				}
+			for response_message in response_messages {
+				simple_apply_decoded_message(
+					client_id,
+					label,
+					response_message,
+					verbose,
+					simple_server_state,
+				)
 			}
 		}
 	}
@@ -293,6 +288,137 @@ simple_net_stub :: proc(label, name: string, verbose: bool) {
 	if verbose do fmt.printfln("simple %s -> %s", label, name)
 }
 
+get_route_from_handle :: proc(
+	simple_server_state: ^Simple_Server_State,
+	scene_handle: u64,
+    route_name_query: string,
+) -> u16 {
+	if scene_handle < u64(SCENE_HANDLE_MIN) do return 0
+	scene_index := int(scene_handle - u64(SCENE_HANDLE_MIN))
+	if scene_index < 0 || scene_index >= len(simple_server_state.scene_connection_result.scenes) {
+		return 0
+	}
+
+	scene := simple_server_state.scene_connection_result.scenes[scene_index]
+	for route_name, route_index in scene.routes {
+		if route_name == route_name_query do return u16(route_index + 1)
+	}
+	return 0
+}
+
+steam_identity_for_peer :: proc(peer: string) -> string {
+	if peer == "C2" do return "steam:76561197977870267"
+	return "steam:76561199572083022"
+}
+
+steam_id_from_login_ticket :: proc(ticket: string, allocator := context.allocator) -> string {
+	data, ok := hex.decode(transmute([]byte)ticket, allocator)
+	if !ok || len(data) < 20 do return ""
+	defer delete(data, allocator)
+	return fmt.aprintf("%d", read_u64_le(data, 12), allocator = allocator)
+}
+
+user_id_from_steam_id :: proc(steam_id: string) -> string {
+	switch steam_id {
+	case "76561197977870267":
+		return "4168ffb24de245f88060d27c9580685e"
+	case "76561199572083022":
+		return "9fe2fc1fa18643e2818bbd65198d4b00"
+	}
+	return ""
+}
+
+simple_apply_decoded_message :: proc(
+	client_id: uint,
+	label: string,
+	message: Decoded_Message,
+	verbose: bool,
+	simple_server_state: ^Simple_Server_State,
+) {
+	switch m in message {
+	case Connected_Ping:
+		simple_server_state.connected_ping = m
+		simple_net_stub(label, "Connected_Ping", verbose)
+	case Connected_Pong:
+		simple_server_state.connected_pong = m
+		simple_net_stub(label, "Connected_Pong", verbose)
+	case Connection_Request:
+		simple_server_state.connection_request = m
+		simple_net_stub(label, "Connection_Request", verbose)
+	case Connection_Request_Accepted:
+		simple_server_state.connection_request_accepted = m
+		simple_net_stub(label, "Connection_Request_Accepted", verbose)
+	case New_Incoming_Connection:
+		simple_server_state.new_incoming_connection = m
+		simple_net_stub(label, "New_Incoming_Connection", verbose)
+	case Disconnection_Notification:
+		simple_server_state.disconnection_notification = m
+		simple_net_stub(label, "Disconnection_Notification", verbose)
+	case System_Request:
+		simple_server_state.system_request = m
+		simple_apply_system_request(client_id, label, m, verbose, simple_server_state)
+	case Response_Msg:
+		simple_server_state.response_msg = m
+		simple_dispatch_response_msg(client_id, label, m, verbose, simple_server_state)
+	case Response_Complete:
+		simple_server_state.response_complete = m
+		simple_net_stub(label, "Response_Complete", verbose)
+	case Response_Error:
+		simple_server_state.response_error = m
+		simple_net_stub(label, "Response_Error", verbose)
+	case Connection_Result:
+		simple_server_state.connection_result = m
+		simple_net_stub(label, "Connection_Result", verbose)
+	case Scene_Message:
+		simple_server_state.scene_message = m
+		simple_dispatch_scene_message(client_id, label, m, verbose, simple_server_state)
+	case Malformed_Message:
+		simple_server_state.malformed_message = m
+		simple_net_stub(label, "Malformed_Message", verbose)
+	case Unknown_Message:
+		simple_server_state.unknown_message = m
+		simple_net_stub(label, "Unknown_Message", verbose)
+	}
+}
+
+simple_apply_system_request :: proc(
+	client_id: uint,
+	label: string,
+	message: System_Request,
+	verbose: bool,
+	simple_server_state: ^Simple_Server_State,
+) {
+	switch args in message.args {
+	case Connect_To_Scene_Args:
+		simple_server_state.connect_to_scene_args = args
+		simple_net_stub(label, "System_Request.Connect_To_Scene", verbose)
+	case Get_Scene_Infos_Args:
+		simple_server_state.get_scene_infos_args = args
+		simple_net_stub(label, "System_Request.Get_Scene_Infos", verbose)
+	case Set_Metadata_Args:
+		simple_server_state.set_metadata_args = args
+		simple_net_stub(label, "System_Request.Set_Metadata", verbose)
+	case Scene_Ready_Args:
+		was_sent := simple_server_state.scene_ready_args.sent_game_version_update
+		simple_server_state.scene_ready_args = args
+		simple_server_state.scene_ready_args.sent_game_version_update = was_sent
+		simple_server_state.scene_message.scene_handle = u8(args.scene_handle)
+		simple_net_stub(label, "System_Request.Scene_Ready", verbose)
+	case Disconnect_From_Scene_Args:
+		simple_server_state.disconnect_from_scene_args = args
+		simple_net_stub(label, "System_Request.Disconnect_From_Scene", verbose)
+	case Ping_Args:
+		simple_server_state.ping_args = args
+		simple_net_stub(label, "System_Request.Ping", verbose)
+	case No_Args:
+		simple_server_state.no_args = args
+		simple_net_stub(label, "System_Request.No_Args", verbose)
+	case Unparsed_Args:
+		simple_server_state.unparsed_args = args
+		simple_net_stub(label, "System_Request.Unparsed_Args", verbose)
+	}
+}
+
 simple_dispatch_decoded_message :: proc(
 	client_id: uint,
 	label: string,
@@ -300,25 +426,20 @@ simple_dispatch_decoded_message :: proc(
 	verbose: bool,
 	simple_server_state: ^Simple_Server_State,
 ) -> (
-	response_types: [dynamic; 2]Simple_Response_Type,
+	response_messages: [dynamic; 3]Decoded_Message,
 ) {
 	switch m in message {
 	case Connected_Ping:
-		simple_server_state.connected_ping = m
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Connected_Ping", verbose)
 	case Connected_Pong:
-		simple_server_state.connected_pong = m
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Connected_Pong", verbose)
 	case Connection_Request:
-		simple_server_state.connection_request = m
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:47.962577337Z line=  "sent_human_readable": "Connection_Request guid=0dd000327154492d time=216649998 sec=false",
-		simple_server_state.scene_connection_result.scene_handle = 140
-
-		simple_server_state.connection_request_accepted = Connection_Request_Accepted {
+		response := Connection_Request_Accepted {
 			remote = system_address_from_endpoint(simple_server_state.remote),
-			system_index = 0,
+			system_index = simple_server_state.connection_request_accepted.system_index + 1,
 			internal = [MAX_INTERNAL_IDS]System_Address {
 				0 = System_Address{version = 4, ip = {127, 0, 0, 1}, port = SERVER_PORT},
 			},
@@ -326,50 +447,50 @@ simple_dispatch_decoded_message :: proc(
 			echo_time = m.time,
 			server_time = server_time_ms(),
 		}
-		append(&response_types, Simple_Response_Type.Connection_Request_Accepted)
+		append(&response_messages, Decoded_Message(response))
 	case Connection_Request_Accepted:
-		simple_server_state.connection_request_accepted = m
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Connection_Request_Accepted", verbose)
 	case New_Incoming_Connection:
-		simple_server_state.new_incoming_connection = m
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "New_Incoming_Connection", verbose)
 	case Disconnection_Notification:
-		simple_server_state.disconnection_notification = m
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:55.599718695Z line=  "sent_human_readable": "Disconnection_Notification",
 		simple_net_stub(label, "Disconnection_Notification", verbose)
 	case System_Request:
-		simple_server_state.system_request = m
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:49.582001573Z line=  "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
-		return simple_dispatch_system_request(client_id, label, m, verbose, simple_server_state)
+		//   "real_human_readable": "Response_Msg req=1 data=Session_Token sid=\"la1AFGj1KUerZTS8aegRXw\" jwt=JWT{header={\"alg\":\"none\",\"typ\":\"JWT\",\"clusterId\":\"passtech-live\"} payload={\"Stormancer/sessionId\":\"la1AFGj1KUerZTS8aegRXw\",\"nbf\":1780707835,\"exp\":1780794235,\"iat\":1780707835,\"iss\":\"passtech-live\"} sig=0B} | Response_Complete req=1 has_values=true",
 
+        append(&response_messages, Decoded_Message(Response_Msg {
+            req_id = m.req_id,
+            data = Session_Token {
+                jwt = "",
+                session_id = "la1AFGj1KUerZTS8aegRXw",
+            },
+        }))
+        append(&response_messages, Decoded_Message(Response_Complete {
+            req_id = m.req_id,
+            has_values = true,
+        }))
 	case Response_Msg:
-		simple_server_state.response_msg = m
+		simple_net_stub(label, "Response_Msg", verbose)
 		// predict_caleb sent_human_readable: not found in sent_human_readable
-		simple_dispatch_response_msg(client_id, label, m, verbose, simple_server_state)
 	case Response_Complete:
-		simple_server_state.response_complete = m
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Response_Complete", verbose)
 	case Response_Error:
-		simple_server_state.response_error = m
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Response_Error", verbose)
 	case Connection_Result:
-		simple_server_state.connection_result = m
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Connection_Result", verbose)
 	case Scene_Message:
-		simple_server_state.scene_message = m
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:54.547386728Z line=  "sent_human_readable": "Scene_Message handle=141 route=6(Authentication.Login) rpc=1 [[\"steam\", {\"gameVersion.clientVersion\": \"1.05.00.05\", \"provider\": \"steam\", \"ticket\": \"140000004F316731E9C817C7BB9F0C0101001001C24E236A180000000100000005000000C7D1724E00372436898F5A0AB9000000B20000003200000004000000BB9F0C0101001001F09A1F00A7599BB88101010A00000000BC531B6A3C03376A010059C2100000000000BA6E72D9F085C7D5CD2628D22C0C0D67544C6D4C162CA664248F076E7D4D8A1CED297A86B596A9A28B2CAF53E1FC7E91B8D486F59399B96EC6C110FED6589A3B49E0846268CCC94B17B81FEAF04BB0B0DC23263FFEEA5B70A43A1FA6CC3427AF84EC70F53AFED224AE327149656DEB25CDA05E87CDF2677BA72EE53B8F905BA0\", \"version\": \"v1\", \"appId\": \"2071280\"}]]",
-		simple_dispatch_scene_message(client_id, label, m, verbose, simple_server_state)
+		simple_net_stub(label, "Scene_Message", verbose)
 	case Malformed_Message:
-		simple_server_state.malformed_message = m
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Malformed_Message", verbose)
 	case Unknown_Message:
-		simple_server_state.unknown_message = m
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Unknown_Message", verbose)
 	}
@@ -383,25 +504,28 @@ simple_dispatch_system_request :: proc(
 	verbose: bool,
 	simple_server_state: ^Simple_Server_State,
 ) -> (
-	response_types: [dynamic; 2]Simple_Response_Type,
+	response_messages: [dynamic; 3]Decoded_Message,
 ) {
 	switch args in message.args {
 	case Connect_To_Scene_Args:
-		simple_server_state.connect_to_scene_args = args
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:52.313899701Z line=  "sent_human_readable": "System_Request msg_id=Connect_To_Scene req=7 args=Connect token=449B routes=[stormancer.rpc.completed#0, stormancer.rpc.next#0, gameVersion.update#0, stormancer.rpc.cancel#0, sendRequest#0, stormancer.rpc.error#0, serverVersion.update#0, users.renewCredentials#0] scene_meta={stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.nintendo=\"enabled\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\", stormancer.plugins.steam=\"4.2.1.42\", appId=\"live-1-05-00\", accountId=\"darktales\", stormancer.gameVersion=\"default\", stormancer.plugins.psn=\"202006171\"} conn_meta={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
-		simple_server_state.response_msg = Response_Msg {
-			req_id = message.req_id,
-			data = Scene_Connection_Result {
-				scene_handle = 141,
-				route_mappings = []Route_Mapping {
-					Route_Mapping{handle = 6, name = "Authentication.Login"},
-				},
-			},
+		scene_handle := u64(SCENE_HANDLE_MIN + len(simple_server_state.scene_connection_result.scenes))
+		result := simple_server_state.scene_connection_result
+		for route, route_index in args.routes {
+			scene_connection_result_set_route(&result, scene_handle, u64(route_index + 1), route.name)
 		}
+		response_msg := Response_Msg {
+			req_id = message.req_id,
+			data   = result,
+		}
+		response_complete := Response_Complete {
+			req_id     = message.req_id,
+			has_values = true,
+		}
+		append(&response_messages, Decoded_Message(response_msg), Decoded_Message(response_complete))
 	case Get_Scene_Infos_Args:
-		simple_server_state.get_scene_infos_args = args
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:50.428809511Z line=  "sent_human_readable": "System_Request msg_id=Get_Scene_Infos req=2 args=Get_Scene_Infos token=449B metadata={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\"}",
-		simple_server_state.response_msg = Response_Msg {
+		response_msg := Response_Msg {
             req_id = message.req_id,
             //   "real_human_readable": "Response_Msg req=2 data=Scene_Infos shard=0 scene=\"authenticator\" serializer=\"msgpack/array\" meta={stormancer.plugins.nintendo=\"enabled\", stormancer.plugins.steam=\"4.2.1.42\", stormancer.gameVersion=\"default\", stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.psn=\"202006171\", accountId=\"darktales\", appId=\"live-1-05-00\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\"} routes=[stormancer.rpc.next#0, stormancer.rpc.cancel#1, stormancer.rpc.error#2, stormancer.rpc.completed#3, Authentication.GetMetadata#4, Authentication.Register#5, Authentication.Login#6, Authentication.GetStatus#7, Authentication.Unlink#8, sendRequest#9, sceneauthorization.gettoken#10, UserSession.GetAuthenticatedUsersCountPublic#11, UserSession.CreateUserBearerToken#12, UserSession.GetUserIdFromBearerToken#13, UserSession.GetUserOptions#14, UserSession.UpdateUserOptions#15, NX.GetAdvertisedParties#16, Steam.QueryUserIds#17, Steam.DecodePartyDataBearerTokens#18, Locator.GetSceneConnectionToken#19] | Response_Complete req=2 has_values=true",
             data = Scene_Infos {
@@ -449,47 +573,62 @@ simple_dispatch_system_request :: proc(
 				selected_serializer = "msgpack/array",
             },
         }
-        simple_server_state.response_complete = Response_Complete {
+		response_complete := Response_Complete {
             req_id     = message.req_id,
             has_values = true,
         }
-		append(&response_types, Simple_Response_Type.Response_Msg, Simple_Response_Type.Response_Complete)
-        return
+		append(&response_messages, Decoded_Message(response_msg), Decoded_Message(response_complete))
 	case Set_Metadata_Args:
-		simple_server_state.set_metadata_args = args
-		// predict_caleb sent_human_readable t=2026-06-06T01:03:51.418934655Z line=  "sent_human_readable": "System_Request msg_id=Set_Metadata req=5 args=Set_Metadata {stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
-		simple_net_stub(label, "System_Request.Set_Metadata", verbose)
+		response_complete := Response_Complete {
+            req_id     = message.req_id,
+            has_values = false,
+        }
+		append(&response_messages, Decoded_Message(response_complete))
 	case Scene_Ready_Args:
-		simple_server_state.scene_ready_args = args
-		// predict_caleb sent_human_readable t=2026-06-06T01:03:53.163040373Z line=  "sent_human_readable": "System_Request msg_id=Scene_Ready2 req=9 args=Scene_Ready handle=141",
-		simple_net_stub(label, "System_Request.Scene_Ready", verbose)
+        //  "real_human_readable": "Response_Msg req=9 data=Bool_Result v=true | Scene_Message handle=141 route=3(gameVersion.update) [\"bot,1.05.*\"] | Response_Complete req=9 has_values=true | Response_Complete req=12 has_values=true",
+		response_msg := Response_Msg {
+            req_id = message.req_id,
+			data   = Bool_Result{value = true},
+        }
+		append(&response_messages, Decoded_Message(response_msg))
+        if simple_server_state.scene_ready_args.sent_game_version_update == false {
+			scene_message := Scene_Message {
+                scene_handle = u8(args.scene_handle),
+				route_handle = get_route_from_handle(simple_server_state, args.scene_handle, "gameVersion.update"),
+                body = GameVersion_Update_Body {
+					accepted_version = "bot,1.05.*",
+                },
+            }
+			append(&response_messages, Decoded_Message(scene_message))
+        }
+		response_complete := Response_Complete {
+            req_id     = message.req_id,
+            has_values = true,
+        }
+		append(&response_messages, Decoded_Message(response_complete))
 	case Disconnect_From_Scene_Args:
-		simple_server_state.disconnect_from_scene_args = args
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:26.261603647Z line=  "sent_human_readable": "System_Request msg_id=Disconnect_From_Scene req=36 args=Disconnect handle=144",
 		simple_net_stub(label, "System_Request.Disconnect_From_Scene", verbose)
 	case Ping_Args:
-		simple_server_state.ping_args = args
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "System_Request.Ping", verbose)
 	case No_Args:
-		simple_server_state.no_args = args
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:49.582001573Z line=  "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
-		simple_server_state.response_msg = Response_Msg {
+		response_msg := Response_Msg {
 			req_id = message.req_id,
 			data = Session_Token {
 				jwt = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIiwiY2x1c3RlcklkIjoicGFzc3RlY2gtbGl2ZSJ9.eyJTdG9ybWFuY2VyL3Nlc3Npb25JZCI6ImJYMkZOMVdhS1Vxb3VCY2JVNTlWbVEiLCJuYmYiOjE3ODA1MzcyMTIsImV4cCI6MTc4MDYyMzYxMiwiaWF0IjoxNzgwNTM3MjEyLCJpc3MiOiJwYXNzdGVjaC1saXZlIn0.",
 				session_id = "bX2FN1WaKUqouBcbU59VmQ",
 			},
 		}
-		simple_server_state.response_complete = Response_Complete {
+		response_complete := Response_Complete {
 			req_id     = message.req_id,
 			has_values = true,
 		}
-		append(&response_types, Simple_Response_Type.Response_Msg, Simple_Response_Type.Response_Complete)
+		append(&response_messages, Decoded_Message(response_msg), Decoded_Message(response_complete))
 		simple_net_stub(label, "System_Request.No_Args", verbose)
 		return
 	case Unparsed_Args:
-		simple_server_state.unparsed_args = args
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "System_Request.Unparsed_Args", verbose)
 	}
@@ -537,7 +676,8 @@ simple_dispatch_scene_message :: proc(
 	message: Scene_Message,
 	verbose: bool,
 	simple_server_state: ^Simple_Server_State,
-) {
+) -> (
+	response_messages: [dynamic; 3]Decoded_Message) {
 	switch body in message.body {
 	case Scene_Raw_Body:
 		simple_server_state.scene_raw_body = body
@@ -557,8 +697,33 @@ simple_dispatch_scene_message :: proc(
 		simple_net_stub(label, "Scene_Message.Stormancer_Rpc_Error", verbose)
 	case Authentication_Login_Body:
 		simple_server_state.authentication_login = body
-		// predict_caleb sent_human_readable t=2026-06-06T01:03:54.547386728Z line=  "sent_human_readable": "Scene_Message handle=141 route=6(Authentication.Login) rpc=1 [[\"steam\", {\"gameVersion.clientVersion\": \"1.05.00.05\", \"provider\": \"steam\", \"ticket\": \"140000004F316731E9C817C7BB9F0C0101001001C24E236A180000000100000005000000C7D1724E00372436898F5A0AB9000000B20000003200000004000000BB9F0C0101001001F09A1F00A7599BB88101010A00000000BC531B6A3C03376A010059C2100000000000BA6E72D9F085C7D5CD2628D22C0C0D67544C6D4C162CA664248F076E7D4D8A1CED297A86B596A9A28B2CAF53E1FC7E91B8D486F59399B96EC6C110FED6589A3B49E0846268CCC94B17B81FEAF04BB0B0DC23263FFEEA5B70A43A1FA6CC3427AF84EC70F53AFED224AE327149656DEB25CDA05E87CDF2677BA72EE53B8F905BA0\", \"version\": \"v1\", \"appId\": \"2071280\"}]]",
-		simple_net_stub(label, "Scene_Message.Authentication_Login", verbose)
+		steam_id := steam_id_from_login_ticket(body.ticket)
+		user_id := user_id_from_steam_id(steam_id)
+		steam_identity := fmt.aprintf("steam:%s", steam_id)
+		// "Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=1 [[nil, true, \"4168ffb24de245f88060d27c9580685e\", \"\", {\"steam\": \"steam:76561197977870267\"}, {}]]"
+		append(&response_messages, Decoded_Message(Scene_Message {
+			scene_handle = message.scene_handle,
+			route_handle = get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+			body = Stormancer_Rpc_Next_Body {
+				rpc_id         = 1,
+				result_is_nil  = true,
+				success        = true,
+				user_id        = user_id,
+				error_message  = "",
+				identity_count = 1,
+				steam_identity = steam_identity,
+				steam_id       = steam_id,
+				metadata_count = 0,
+			},
+		}))
+        append(&response_messages, Decoded_Message(Scene_Message {
+            scene_handle = message.scene_handle,
+            route_handle = get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+            body = Stormancer_Rpc_Completed_Body {
+                rpc_id = 257,
+                message_sent = false,
+            },
+        }))
 	case Friends_Subscribe_Body:
 		simple_server_state.friends_subscribe = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:58.633021004Z line=  "sent_human_readable": "Scene_Message handle=142 route=5(Friends.Subscribe) rpc=1 []",
@@ -577,6 +742,7 @@ simple_dispatch_scene_message :: proc(
 		simple_net_stub(label, "Scene_Message.GameSession_GetP2PToken", verbose)
 	case GameVersion_Update_Body:
 		simple_server_state.game_version_update = body
+		simple_server_state.scene_ready_args.sent_game_version_update = true
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Scene_Message.GameVersion_Update", verbose)
 	case Gamefinder_Update_Body:
@@ -664,4 +830,5 @@ simple_dispatch_scene_message :: proc(
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:55.897566898Z line=  "sent_human_readable": "Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=2 [\"stormancer.friends\", \"\"] | Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=3 [\"stormancer.plugins.partyManagement\", \"\"] | Scene_Message handle=141 route=15(UserSession.UpdateUserOptions) rpc=4 [\"crossplay\", {\"enabled\": true}]",
 		simple_net_stub(label, "Scene_Message.UserSession_UpdateUserOptions", verbose)
 	}
+	return
 }

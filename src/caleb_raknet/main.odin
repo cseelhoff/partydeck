@@ -3469,7 +3469,7 @@ response_data_match :: proc(real, pred: Response_Data, allocator := context.allo
 		)
 	case Scene_Connection_Result:
 		p, ok := pred.(Scene_Connection_Result)
-		return ok && route_mappings_match(r.route_mappings, p.route_mappings)
+		return ok && scene_connection_result_match(r, p)
 	case Other_Response:
 		p, ok := pred.(Other_Response)
 		return ok && bytes_equal(r.data.raw, p.data.raw)
@@ -3768,10 +3768,14 @@ scene_routes_match :: proc(real, pred: []Scene_Route) -> bool {
 	return true
 }
 
-route_mappings_match :: proc(real, pred: []Route_Mapping) -> bool {
-	if len(real) != len(pred) do return false
-	for route, i in real {
-		if route.name != pred[i].name || route.handle != pred[i].handle do return false
+scene_connection_result_match :: proc(real, pred: Scene_Connection_Result) -> bool {
+	if len(real.scenes) != len(pred.scenes) do return false
+	for scene, scene_index in real.scenes {
+		pred_scene := pred.scenes[scene_index]
+		if len(scene.routes) != len(pred_scene.routes) do return false
+		for route_name, route_index in scene.routes {
+			if route_name != pred_scene.routes[route_index] do return false
+		}
 	}
 	return true
 }

@@ -50,19 +50,20 @@ Scene_Infos :: struct {
 	selected_serializer:                           string,
 }
 
-// Route_Mapping: one route-name -> runtime handle binding from a Connect_To_Scene
-// reply's RouteMappings map. The handle is what the client tags scene messages with.
-Route_Mapping :: struct {
-	name:   string,
-	handle: u16,
+SCENE_CONNECTION_RESULT_MAX_SCENES :: 8
+SCENE_CONNECTION_RESULT_MAX_ROUTES :: 18
+
+// Scene: one server->client route table. The containing Scene_Connection_Result
+// index determines scene handle: scenes[0] is handle 141, scenes[1] is 142, etc.
+// The route index determines route handle: routes[0] is handle 1, routes[1] is 2.
+Scene :: struct {
+	routes: [dynamic; SCENE_CONNECTION_RESULT_MAX_ROUTES]string,
 }
 
-// Scene_Connection_Result: the reply to Connect_To_Scene. `scene_handle` is the
-// runtime handle assigned to the joined scene; `route_mappings` binds each route
-// name to the small handle used on the wire thereafter.
+// Scene_Connection_Result: the reply to Connect_To_Scene. RouteMappings is decoded
+// into the scene slot implied by SceneHandle and routes are stored by handle index.
 Scene_Connection_Result :: struct {
-	scene_handle:   u64,
-	route_mappings: []Route_Mapping,
+	scenes: [dynamic; SCENE_CONNECTION_RESULT_MAX_SCENES]Scene,
 }
 
 // Bool_Result: a bare {v: bool} acknowledgement (e.g. a Subscribe / SetStatus ok).
@@ -151,10 +152,11 @@ parse_response_data :: proc(data: Msgpack, allocator := context.allocator) -> Re
 	}
 
 	if msgpack_map_get(n, 0, "SceneHandle") >= 0 && msgpack_map_get(n, 0, "RouteMappings") >= 0 {
-		return Scene_Connection_Result {
-			scene_handle   = node_uint(n, msgpack_map_get(n, 0, "SceneHandle")),
-			route_mappings = collect_route_mappings(n, msgpack_map_get(n, 0, "RouteMappings"), allocator),
-		}
+		return collect_scene_connection_result(
+			node_uint(n, msgpack_map_get(n, 0, "SceneHandle")),
+			n,
+			msgpack_map_get(n, 0, "RouteMappings"),
+		)
 	}
 
 	if v := msgpack_map_get(n, 0, "v"); v >= 0 && n[v].kind == .Bool {
@@ -164,25 +166,53 @@ parse_response_data :: proc(data: Msgpack, allocator := context.allocator) -> Re
 	return Other_Response{data}
 }
 
-// Read a msgpack map<str, uint> at `map_idx` into name/handle pairs (the
-// RouteMappings shape). Non-string keys / non-uint values render as ""/0.
-collect_route_mappings :: proc(
+// Read a msgpack RouteMappings map into the scene slot implied by `scene_handle`.
+collect_scene_connection_result :: proc(
+	scene_handle: u64,
 	nodes: []Msgpack_Node,
 	map_idx: int,
-	allocator := context.allocator,
-) -> []Route_Mapping {
-	if map_idx < 0 || map_idx >= len(nodes) || nodes[map_idx].kind != .Map do return nil
+) -> (result: Scene_Connection_Result) {
+	if map_idx < 0 || map_idx >= len(nodes) || nodes[map_idx].kind != .Map do return
 	count := nodes[map_idx].count
-	out := make([dynamic]Route_Mapping, 0, count, allocator)
 	j := map_idx + 1
 	for _ in 0 ..< count {
 		k := nodes[j]
 		v := j + k.subtree
 		if v >= len(nodes) do break
-		append(&out, Route_Mapping{name = node_str(nodes, j), handle = u16(node_uint(nodes, v))})
+		scene_connection_result_set_route(
+			&result,
+			scene_handle,
+			node_uint(nodes, v),
+			node_str(nodes, j),
+		)
 		j = v + nodes[v].subtree
 	}
-	return out[:]
+	return
+}
+
+scene_connection_result_set_route :: proc(
+	result: ^Scene_Connection_Result,
+	scene_handle: u64,
+	route_handle: u64,
+	route_name: string,
+) {
+	if scene_handle < u64(SCENE_HANDLE_MIN) do return
+	scene_index := int(scene_handle - u64(SCENE_HANDLE_MIN))
+	if scene_index < 0 || scene_index >= SCENE_CONNECTION_RESULT_MAX_SCENES do return
+	if route_handle == 0 || route_handle > u64(SCENE_CONNECTION_RESULT_MAX_ROUTES) do return
+
+	for len(result.scenes) <= scene_index do append(&result.scenes, Scene{})
+	scene := &result.scenes[scene_index]
+	route_index := int(route_handle - 1)
+	for len(scene.routes) <= route_index do append(&scene.routes, "")
+	scene.routes[route_index] = route_name
+}
+
+scene_connection_result_handle :: proc(result: Scene_Connection_Result) -> u64 {
+	for scene, scene_index in result.scenes {
+		if len(scene.routes) > 0 do return u64(SCENE_HANDLE_MIN + scene_index)
+	}
+	return 0
 }
 
 // Decode the Get_Session_Token reply: exactly two back-to-back top-level msgpack
@@ -240,8 +270,8 @@ write_response_data :: proc(sb: ^strings.Builder, data: Response_Data) {
 		strings.write_string(sb, " routes=")
 		write_routes(sb, d.routes)
 	case Scene_Connection_Result:
-		fmt.sbprintf(sb, "Scene_Connection_Result handle=%d routes=", d.scene_handle)
-		write_route_mappings(sb, d.route_mappings)
+		fmt.sbprintf(sb, "Scene_Connection_Result handle=%d routes=", scene_connection_result_handle(d))
+		write_scene_connection_result_routes(sb, d)
 	case Bool_Result:
 		fmt.sbprintf(sb, "Bool_Result v=%v", d.value)
 	case Session_Token:
@@ -298,11 +328,16 @@ write_metadata_field :: proc(sb: ^strings.Builder, wrote: ^bool, key, value: str
 	wrote^ = true
 }
 
-write_route_mappings :: proc(sb: ^strings.Builder, rm: []Route_Mapping) {
+write_scene_connection_result_routes :: proc(sb: ^strings.Builder, result: Scene_Connection_Result) {
 	strings.write_byte(sb, '[')
-	for r, i in rm {
-		if i > 0 do strings.write_string(sb, ", ")
-		fmt.sbprintf(sb, "%s#%d", r.name, r.handle)
+	wrote := false
+	for scene in result.scenes {
+		for route_name, route_index in scene.routes {
+			if len(route_name) == 0 do continue
+			if wrote do strings.write_string(sb, ", ")
+			fmt.sbprintf(sb, "%s#%d", route_name, route_index + 1)
+			wrote = true
+		}
 	}
 	strings.write_byte(sb, ']')
 }
