@@ -100,6 +100,8 @@ main :: proc() {
 		err = sync_replay(args[2])
 	} else if len(args) > 2 && args[1] == "predict-caleb" {
 		err = predict_caleb(datagrams, msgs, reasm, args[2])
+	} else if len(args) > 1 && args[1] == "simple" {
+		err = simple_net(datagrams, msgs, reasm)
 	} else if len(args) > 1 {
 		err = replay(datagrams, msgs, reasm, args[1])
 	} else {
@@ -3462,7 +3464,7 @@ response_data_match :: proc(real, pred: Response_Data, allocator := context.allo
 			ok &&
 			r.scene_id == p.scene_id &&
 			r.selected_serializer == p.selected_serializer &&
-			metadata_match(r.metadata, p.metadata) &&
+			scene_infos_metadata_match(r, p) &&
 			scene_routes_match(r.routes, p.routes) \
 		)
 	case Scene_Connection_Result:
@@ -3735,6 +3737,26 @@ metadata_match :: proc(real, pred: []Metadata_Entry) -> bool {
 		if entry.key != pred[i].key || entry.value != pred[i].value do return false
 	}
 	return true
+}
+
+scene_infos_metadata_match :: proc(real, pred: Scene_Infos) -> bool {
+	return real.account_id == pred.account_id &&
+	       real.app_id == pred.app_id &&
+	       real.darktales_gamesession == pred.darktales_gamesession &&
+	       real.stormancer_friends == pred.stormancer_friends &&
+	       real.stormancer_gamesession == pred.stormancer_gamesession &&
+	       real.stormancer_game_version == pred.stormancer_game_version &&
+	       real.stormancer_party == pred.stormancer_party &&
+	       real.stormancer_partymanagement == pred.stormancer_partymanagement &&
+	       real.stormancer_party_merging == pred.stormancer_party_merging &&
+	       real.stormancer_party_revision == pred.stormancer_party_revision &&
+	       real.stormancer_plugins_gamefinder == pred.stormancer_plugins_gamefinder &&
+	       real.stormancer_plugins_gamefinder_protocol == pred.stormancer_plugins_gamefinder_protocol &&
+	       real.stormancer_plugins_nintendo == pred.stormancer_plugins_nintendo &&
+	       real.stormancer_plugins_psn == pred.stormancer_plugins_psn &&
+	       real.stormancer_plugins_rpc == pred.stormancer_plugins_rpc &&
+	       real.stormancer_plugins_steam == pred.stormancer_plugins_steam &&
+	       real.stormancer_plugins_xbl_use_modern_gamertag == pred.stormancer_plugins_xbl_use_modern_gamertag
 }
 
 scene_routes_match :: proc(real, pred: []Scene_Route) -> bool {

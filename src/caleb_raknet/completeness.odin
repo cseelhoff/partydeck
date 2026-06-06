@@ -107,9 +107,8 @@ scan_system_request_args :: proc(
 		scan_metadata(a.connection_metadata, "Connect_To_Scene.ConnectionMetadata", sink)
 	case Get_Scene_Infos_Args:
 		scan_token(a.token, "Get_Scene_Infos.Token", sink, allocator)
-		scan_metadata(a.metadata, "Get_Scene_Infos.Metadata", sink)
 	case Set_Metadata_Args:
-		scan_metadata(a.metadata, "Set_Metadata.Metadata", sink)
+		scan_set_metadata_args(a, sink)
 	case Scene_Ready_Args, Disconnect_From_Scene_Args, Ping_Args, No_Args:
 	// Pure scalar / empty args -- nothing encoded remains.
 	case Unparsed_Args:
@@ -129,7 +128,7 @@ scan_response_data :: proc(
 	switch d in data {
 	case Scene_Infos:
 		scan_string(d.scene_id, "Scene_Infos.SceneId", sink)
-		scan_metadata(d.metadata, "Scene_Infos.Metadata", sink)
+		scan_scene_infos_metadata(d, sink)
 		scan_routes(d.routes, "Scene_Infos.Routes", sink)
 	case Scene_Connection_Result:
 	// scene_handle + name->handle mappings are all scalars/short names.
@@ -179,6 +178,56 @@ scan_metadata :: proc(meta: []Metadata_Entry, field: string, sink: ^[dynamic]Com
 	for e in meta {
 		scan_string(e.value, field, sink)
 	}
+}
+
+scan_scene_infos_metadata :: proc(d: Scene_Infos, sink: ^[dynamic]Completeness_Issue) {
+	scan_string(d.account_id, "Scene_Infos.Metadata.accountId", sink)
+	scan_string(d.app_id, "Scene_Infos.Metadata.appId", sink)
+	scan_string(d.darktales_gamesession, "Scene_Infos.Metadata.darktales.gamesession", sink)
+	scan_string(d.stormancer_friends, "Scene_Infos.Metadata.stormancer.friends", sink)
+	scan_string(d.stormancer_gamesession, "Scene_Infos.Metadata.stormancer.gamesession", sink)
+	scan_string(d.stormancer_game_version, "Scene_Infos.Metadata.stormancer.gameVersion", sink)
+	scan_string(d.stormancer_party, "Scene_Infos.Metadata.stormancer.party", sink)
+	scan_string(d.stormancer_partymanagement, "Scene_Infos.Metadata.stormancer.partymanagement", sink)
+	scan_string(d.stormancer_party_merging, "Scene_Infos.Metadata.stormancer.partyMerging", sink)
+	scan_string(d.stormancer_party_revision, "Scene_Infos.Metadata.stormancer.party.revision", sink)
+	scan_string(d.stormancer_plugins_gamefinder, "Scene_Infos.Metadata.stormancer.plugins.gamefinder", sink)
+	scan_string(
+		d.stormancer_plugins_gamefinder_protocol,
+		"Scene_Infos.Metadata.stormancer.plugins.gamefinder.protocol",
+		sink,
+	)
+	scan_string(d.stormancer_plugins_nintendo, "Scene_Infos.Metadata.stormancer.plugins.nintendo", sink)
+	scan_string(d.stormancer_plugins_psn, "Scene_Infos.Metadata.stormancer.plugins.psn", sink)
+	scan_string(d.stormancer_plugins_rpc, "Scene_Infos.Metadata.stormancer.plugins.rpc", sink)
+	scan_string(d.stormancer_plugins_steam, "Scene_Infos.Metadata.stormancer.plugins.steam", sink)
+	scan_string(
+		d.stormancer_plugins_xbl_use_modern_gamertag,
+		"Scene_Infos.Metadata.Stormancer.plugins.XBLServices.useModernGamerTag",
+		sink,
+	)
+}
+
+scan_set_metadata_args :: proc(a: Set_Metadata_Args, sink: ^[dynamic]Completeness_Issue) {
+	scan_string(a.stormancer_party, "Set_Metadata.Metadata.stormancer.party", sink)
+	scan_string(a.version, "Set_Metadata.Metadata.version", sink)
+	scan_string(a.server_name, "Set_Metadata.Metadata.server.name", sink)
+	scan_string(a.timeout, "Set_Metadata.Metadata.timeout", sink)
+	scan_string(a.server_version, "Set_Metadata.Metadata.server.version", sink)
+	scan_string(a.stormancer_party_plugin, "Set_Metadata.Metadata.stormancer.party.plugin", sink)
+	scan_string(a.stormancer_partymanagement, "Set_Metadata.Metadata.stormancer.partymanagement", sink)
+	scan_string(
+		a.stormancer_plugins_gamefinder_protocol,
+		"Set_Metadata.Metadata.stormancer.plugins.gamefinder.protocol",
+		sink,
+	)
+	scan_string(a.plugins, "Set_Metadata.Metadata.plugins", sink)
+	scan_string(a.serializers, "Set_Metadata.Metadata.serializers", sink)
+	scan_string(a.transport, "Set_Metadata.Metadata.transport", sink)
+	scan_string(a.platform, "Set_Metadata.Metadata.platform", sink)
+	scan_string(a.protocol, "Set_Metadata.Metadata.protocol", sink)
+	scan_string(a.connection_type, "Set_Metadata.Metadata.type", sink)
+	scan_string(a.serializer, "Set_Metadata.Metadata.serializer", sink)
 }
 
 scan_routes :: proc(routes: []Scene_Route, field: string, sink: ^[dynamic]Completeness_Issue) {

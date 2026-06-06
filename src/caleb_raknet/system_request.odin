@@ -45,16 +45,44 @@ Connect_To_Scene_Args :: struct {
 }
 
 // Get_Scene_Infos (136): ask for a scene's route/serializer info before joining.
-// Same `token` as Connect plus the client's connection `metadata`.
+// Same `token` as Connect plus the client's connection metadata fields.
 Get_Scene_Infos_Args :: struct {
-	token:    string,
-	metadata: []Metadata_Entry,
+	token:                                  string,
+	stormancer_party:                       string,
+	version:                                string,
+	server_name:                            string,
+	timeout:                                string,
+	server_version:                         string,
+	stormancer_party_plugin:                string,
+	stormancer_partymanagement:             string,
+	stormancer_plugins_gamefinder_protocol: string,
+	plugins:                                string,
+	serializers:                            string,
+	transport:                              string,
+	platform:                               string,
+	protocol:                               string,
+	connection_type:                        string,
+	serializer:                             string,
 }
 
-// Set_Metadata (0): (re)declare the connection's metadata bag. The args ARE the
-// flat map -- there is no wrapper object.
+// Set_Metadata (0): (re)declare the connection metadata fields. The args ARE
+// the flat map -- there is no wrapper object.
 Set_Metadata_Args :: struct {
-	metadata: []Metadata_Entry,
+	stormancer_party:                       string,
+	version:                                string,
+	server_name:                            string,
+	timeout:                                string,
+	server_version:                         string,
+	stormancer_party_plugin:                string,
+	stormancer_partymanagement:             string,
+	stormancer_plugins_gamefinder_protocol: string,
+	plugins:                                string,
+	serializers:                            string,
+	transport:                              string,
+	platform:                               string,
+	protocol:                               string,
+	connection_type:                        string,
+	serializer:                             string,
 }
 
 // Scene_Ready / Scene_Ready2 (1 / 16): confirm a scene finished wiring up,
@@ -117,14 +145,46 @@ parse_system_request_args :: proc(
 
 	case .Get_Scene_Infos:
 		if !args.ok || len(n) == 0 || n[0].kind != .Map do return Unparsed_Args{args.raw}
+		metadata := collect_metadata(n, msgpack_map_get(n, 0, "Metadata"), allocator)
 		return Get_Scene_Infos_Args {
-			token    = node_str(n, msgpack_map_get(n, 0, "Token")),
-			metadata = collect_metadata(n, msgpack_map_get(n, 0, "Metadata"), allocator),
+			token                                  = node_str(n, msgpack_map_get(n, 0, "Token")),
+			stormancer_party                       = metadata_value(metadata, "stormancer.party"),
+			version                                = metadata_value(metadata, "version"),
+			server_name                            = metadata_value(metadata, "server.name"),
+			timeout                                = metadata_value(metadata, "timeout"),
+			server_version                         = metadata_value(metadata, "server.version"),
+			stormancer_party_plugin                = metadata_value(metadata, "stormancer.party.plugin"),
+			stormancer_partymanagement             = metadata_value(metadata, "stormancer.partymanagement"),
+			stormancer_plugins_gamefinder_protocol = metadata_value(metadata, "stormancer.plugins.gamefinder.protocol"),
+			plugins                                = metadata_value(metadata, "plugins"),
+			serializers                            = metadata_value(metadata, "serializers"),
+			transport                              = metadata_value(metadata, "transport"),
+			platform                               = metadata_value(metadata, "platform"),
+			protocol                               = metadata_value(metadata, "protocol"),
+			connection_type                        = metadata_value(metadata, "type"),
+			serializer                             = metadata_value(metadata, "serializer"),
 		}
 
 	case .Set_Metadata:
 		if !args.ok || len(n) == 0 || n[0].kind != .Map do return Unparsed_Args{args.raw}
-		return Set_Metadata_Args{metadata = collect_metadata(n, 0, allocator)}
+		metadata := collect_metadata(n, 0, allocator)
+		return Set_Metadata_Args {
+			stormancer_party                       = metadata_value(metadata, "stormancer.party"),
+			version                                = metadata_value(metadata, "version"),
+			server_name                            = metadata_value(metadata, "server.name"),
+			timeout                                = metadata_value(metadata, "timeout"),
+			server_version                         = metadata_value(metadata, "server.version"),
+			stormancer_party_plugin                = metadata_value(metadata, "stormancer.party.plugin"),
+			stormancer_partymanagement             = metadata_value(metadata, "stormancer.partymanagement"),
+			stormancer_plugins_gamefinder_protocol = metadata_value(metadata, "stormancer.plugins.gamefinder.protocol"),
+			plugins                                = metadata_value(metadata, "plugins"),
+			serializers                            = metadata_value(metadata, "serializers"),
+			transport                              = metadata_value(metadata, "transport"),
+			platform                               = metadata_value(metadata, "platform"),
+			protocol                               = metadata_value(metadata, "protocol"),
+			connection_type                        = metadata_value(metadata, "type"),
+			serializer                             = metadata_value(metadata, "serializer"),
+		}
 
 	case .Scene_Ready, .Scene_Ready2:
 		if !args.ok || len(n) == 0 || n[0].kind != .Map do return Unparsed_Args{args.raw}
@@ -182,6 +242,13 @@ collect_metadata :: proc(nodes: []Msgpack_Node, map_idx: int, allocator := conte
 	return out[:]
 }
 
+metadata_value :: proc(metadata: []Metadata_Entry, key: string) -> string {
+	for entry in metadata {
+		if entry.key == key do return entry.value
+	}
+	return ""
+}
+
 // Read an array of {Name, Handle, Metadata} route maps at `arr_idx`.
 collect_routes :: proc(nodes: []Msgpack_Node, arr_idx: int, allocator := context.allocator) -> []Scene_Route {
 	if arr_idx < 0 || arr_idx >= len(nodes) || nodes[arr_idx].kind != .Array do return nil
@@ -215,11 +282,46 @@ write_system_request_args :: proc(sb: ^strings.Builder, args: System_Request_Arg
 		strings.write_string(sb, " conn_meta=")
 		write_metadata(sb, a.connection_metadata)
 	case Get_Scene_Infos_Args:
-		fmt.sbprintf(sb, "Get_Scene_Infos token=%dB metadata=", len(a.token))
-		write_metadata(sb, a.metadata)
+		fmt.sbprintf(
+			sb,
+			"Get_Scene_Infos token=%dB metadata={stormancer.party=%q, version=%q, server.name=%q, timeout=%q, server.version=%q, stormancer.party.plugin=%q, stormancer.partymanagement=%q, stormancer.plugins.gamefinder.protocol=%q, plugins=%q, serializers=%q, transport=%q, platform=%q, protocol=%q, type=%q, serializer=%q}",
+			len(a.token),
+			a.stormancer_party,
+			a.version,
+			a.server_name,
+			a.timeout,
+			a.server_version,
+			a.stormancer_party_plugin,
+			a.stormancer_partymanagement,
+			a.stormancer_plugins_gamefinder_protocol,
+			a.plugins,
+			a.serializers,
+			a.transport,
+			a.platform,
+			a.protocol,
+			a.connection_type,
+			a.serializer,
+		)
 	case Set_Metadata_Args:
-		strings.write_string(sb, "Set_Metadata ")
-		write_metadata(sb, a.metadata)
+		fmt.sbprintf(
+			sb,
+			"Set_Metadata {stormancer.party=%q, version=%q, server.name=%q, timeout=%q, server.version=%q, stormancer.party.plugin=%q, stormancer.partymanagement=%q, stormancer.plugins.gamefinder.protocol=%q, plugins=%q, serializers=%q, transport=%q, platform=%q, protocol=%q, type=%q, serializer=%q}",
+			a.stormancer_party,
+			a.version,
+			a.server_name,
+			a.timeout,
+			a.server_version,
+			a.stormancer_party_plugin,
+			a.stormancer_partymanagement,
+			a.stormancer_plugins_gamefinder_protocol,
+			a.plugins,
+			a.serializers,
+			a.transport,
+			a.platform,
+			a.protocol,
+			a.connection_type,
+			a.serializer,
+		)
 	case Scene_Ready_Args:
 		fmt.sbprintf(sb, "Scene_Ready handle=%d", a.scene_handle)
 	case Disconnect_From_Scene_Args:

@@ -17,21 +17,37 @@ package caleb_raknet
 // Anything else (token blobs, raw clocks, future shapes) is kept whole as
 // Other_Response -- nothing is dropped, a parse miss is an explicit value.
 //
-// Strings alias the source bytes (zero-copy); the metadata/route slices are
-// allocated with the caller's allocator (temp in the debug path).
+// Strings alias the source bytes (zero-copy); route slices are allocated with
+// the caller's allocator (temp in the debug path).
 
 import "core:fmt"
 import "core:strings"
 
 // Scene_Infos: the reply to Get_Scene_Infos (msg_id 136). Describes a scene before
-// the client joins it -- its id, metadata bag, the routes it exposes (reusing the
-// Scene_Route shape registered on connect), and the negotiated serializer.
+// the client joins it -- its id, decoded metadata fields, the routes it exposes
+// (reusing the Scene_Route shape registered on connect), and the negotiated serializer.
 Scene_Infos :: struct {
-	shard_id:            u64,
-	scene_id:            string,
-	metadata:            []Metadata_Entry,
-	routes:              []Scene_Route,
-	selected_serializer: string,
+	shard_id:                                      u64,
+	scene_id:                                      string,
+	account_id:                                    string,
+	app_id:                                        string,
+	darktales_gamesession:                         string,
+	stormancer_friends:                            string,
+	stormancer_gamesession:                        string,
+	stormancer_game_version:                       string,
+	stormancer_party:                              string,
+	stormancer_partymanagement:                    string,
+	stormancer_party_merging:                      string,
+	stormancer_party_revision:                     string,
+	stormancer_plugins_gamefinder:                 string,
+	stormancer_plugins_gamefinder_protocol:        string,
+	stormancer_plugins_nintendo:                   string,
+	stormancer_plugins_psn:                        string,
+	stormancer_plugins_rpc:                        string,
+	stormancer_plugins_steam:                      string,
+	stormancer_plugins_xbl_use_modern_gamertag:    string,
+	routes:                                        []Scene_Route,
+	selected_serializer:                           string,
 }
 
 // Route_Mapping: one route-name -> runtime handle binding from a Connect_To_Scene
@@ -108,12 +124,29 @@ parse_response_data :: proc(data: Msgpack, allocator := context.allocator) -> Re
 	}
 
 	if msgpack_map_get(n, 0, "SceneId") >= 0 && msgpack_map_get(n, 0, "Routes") >= 0 {
+		metadata := collect_metadata(n, msgpack_map_get(n, 0, "Metadata"), allocator)
 		return Scene_Infos {
-			shard_id            = node_uint(n, msgpack_map_get(n, 0, "ShardId")),
-			scene_id            = node_str(n, msgpack_map_get(n, 0, "SceneId")),
-			metadata            = collect_metadata(n, msgpack_map_get(n, 0, "Metadata"), allocator),
-			routes              = collect_routes(n, msgpack_map_get(n, 0, "Routes"), allocator),
-			selected_serializer = node_str(n, msgpack_map_get(n, 0, "SelectedSerializer")),
+			shard_id                                   = node_uint(n, msgpack_map_get(n, 0, "ShardId")),
+			scene_id                                   = node_str(n, msgpack_map_get(n, 0, "SceneId")),
+			account_id                                 = metadata_value(metadata, "accountId"),
+			app_id                                     = metadata_value(metadata, "appId"),
+			darktales_gamesession                      = metadata_value(metadata, "darktales.gamesession"),
+			stormancer_friends                         = metadata_value(metadata, "stormancer.friends"),
+			stormancer_gamesession                     = metadata_value(metadata, "stormancer.gamesession"),
+			stormancer_game_version                    = metadata_value(metadata, "stormancer.gameVersion"),
+			stormancer_party                           = metadata_value(metadata, "stormancer.party"),
+			stormancer_partymanagement                 = metadata_value(metadata, "stormancer.partymanagement"),
+			stormancer_party_merging                   = metadata_value(metadata, "stormancer.partyMerging"),
+			stormancer_party_revision                  = metadata_value(metadata, "stormancer.party.revision"),
+			stormancer_plugins_gamefinder              = metadata_value(metadata, "stormancer.plugins.gamefinder"),
+			stormancer_plugins_gamefinder_protocol     = metadata_value(metadata, "stormancer.plugins.gamefinder.protocol"),
+			stormancer_plugins_nintendo                = metadata_value(metadata, "stormancer.plugins.nintendo"),
+			stormancer_plugins_psn                     = metadata_value(metadata, "stormancer.plugins.psn"),
+			stormancer_plugins_rpc                     = metadata_value(metadata, "stormancer.plugins.rpc"),
+			stormancer_plugins_steam                   = metadata_value(metadata, "stormancer.plugins.steam"),
+			stormancer_plugins_xbl_use_modern_gamertag = metadata_value(metadata, "Stormancer.plugins.XBLServices.useModernGamerTag"),
+			routes                                     = collect_routes(n, msgpack_map_get(n, 0, "Routes"), allocator),
+			selected_serializer                        = node_str(n, msgpack_map_get(n, 0, "SelectedSerializer")),
 		}
 	}
 
@@ -203,7 +236,7 @@ write_response_data :: proc(sb: ^strings.Builder, data: Response_Data) {
 			d.scene_id,
 			d.selected_serializer,
 		)
-		write_metadata(sb, d.metadata)
+		write_scene_infos_metadata(sb, d)
 		strings.write_string(sb, " routes=")
 		write_routes(sb, d.routes)
 	case Scene_Connection_Result:
@@ -223,6 +256,46 @@ write_response_data :: proc(sb: ^strings.Builder, data: Response_Data) {
 	case:
 		strings.write_string(sb, "(nil)")
 	}
+}
+
+write_scene_infos_metadata :: proc(sb: ^strings.Builder, d: Scene_Infos) {
+	wrote := false
+	strings.write_byte(sb, '{')
+	write_metadata_field(sb, &wrote, "accountId", d.account_id)
+	write_metadata_field(sb, &wrote, "appId", d.app_id)
+	write_metadata_field(sb, &wrote, "darktales.gamesession", d.darktales_gamesession)
+	write_metadata_field(sb, &wrote, "stormancer.friends", d.stormancer_friends)
+	write_metadata_field(sb, &wrote, "stormancer.gamesession", d.stormancer_gamesession)
+	write_metadata_field(sb, &wrote, "stormancer.gameVersion", d.stormancer_game_version)
+	write_metadata_field(sb, &wrote, "stormancer.party", d.stormancer_party)
+	write_metadata_field(sb, &wrote, "stormancer.partymanagement", d.stormancer_partymanagement)
+	write_metadata_field(sb, &wrote, "stormancer.partyMerging", d.stormancer_party_merging)
+	write_metadata_field(sb, &wrote, "stormancer.party.revision", d.stormancer_party_revision)
+	write_metadata_field(sb, &wrote, "stormancer.plugins.gamefinder", d.stormancer_plugins_gamefinder)
+	write_metadata_field(
+		sb,
+		&wrote,
+		"stormancer.plugins.gamefinder.protocol",
+		d.stormancer_plugins_gamefinder_protocol,
+	)
+	write_metadata_field(sb, &wrote, "stormancer.plugins.nintendo", d.stormancer_plugins_nintendo)
+	write_metadata_field(sb, &wrote, "stormancer.plugins.psn", d.stormancer_plugins_psn)
+	write_metadata_field(sb, &wrote, "stormancer.plugins.rpc", d.stormancer_plugins_rpc)
+	write_metadata_field(sb, &wrote, "stormancer.plugins.steam", d.stormancer_plugins_steam)
+	write_metadata_field(
+		sb,
+		&wrote,
+		"Stormancer.plugins.XBLServices.useModernGamerTag",
+		d.stormancer_plugins_xbl_use_modern_gamertag,
+	)
+	strings.write_byte(sb, '}')
+}
+
+write_metadata_field :: proc(sb: ^strings.Builder, wrote: ^bool, key, value: string) {
+	if len(value) == 0 do return
+	if wrote^ do strings.write_string(sb, ", ")
+	fmt.sbprintf(sb, "%s=%q", key, value)
+	wrote^ = true
 }
 
 write_route_mappings :: proc(sb: ^strings.Builder, rm: []Route_Mapping) {
