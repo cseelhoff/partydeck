@@ -17,9 +17,15 @@ Stormancer_Rpc_Completed_Body :: struct {
 }
 
 Stormancer_Rpc_Next_Body :: struct {
-	rpc_id:   u16,
-	values:   Msgpack_Seq,
-	raw_tail: []byte,
+	rpc_id:         u16,
+	result_is_nil:  bool,
+	success:        bool,
+	user_id:        string,
+	error_message:  string,
+	identity_count: int,
+	steam_identity: string,
+	steam_id:       string,
+	metadata_count: int,
 }
 
 Stormancer_Rpc_Error_Body :: struct {
@@ -279,11 +285,7 @@ parse_scene_message_body :: proc(
 	case "stormancer.rpc.completed":
 		return parse_stormancer_rpc_completed_body(raw)
 	case "stormancer.rpc.next":
-		return Stormancer_Rpc_Next_Body {
-			rpc_id = decoded.rpc_id,
-			values = decoded.values,
-			raw_tail = decoded.raw_tail,
-		}
+		return parse_stormancer_rpc_next_body(decoded)
 	case "stormancer.rpc.error":
 		return parse_stormancer_rpc_error_body(decoded)
 	case "Authentication.Login":
@@ -363,6 +365,25 @@ parse_stormancer_rpc_completed_body :: proc(raw: []byte) -> Stormancer_Rpc_Compl
 		out.rpc_id = read_u16_le(raw, 1)
 	}
 	return out
+}
+
+parse_stormancer_rpc_next_body :: proc(body: Scene_Body) -> Stormancer_Rpc_Next_Body {
+	nodes := body.values.nodes
+	root := scene_seq_root(body, 0)
+	identities := scene_array_child(nodes, root, 4)
+	metadata := scene_array_child(nodes, root, 5)
+	steam_identity := scene_map_string(nodes, identities, "steam")
+	return Stormancer_Rpc_Next_Body {
+		rpc_id = body.rpc_id,
+		result_is_nil = scene_node_is_nil(nodes, scene_array_child(nodes, root, 0)),
+		success = scene_node_bool(nodes, scene_array_child(nodes, root, 1)),
+		user_id = scene_node_text(nodes, scene_array_child(nodes, root, 2)),
+		error_message = scene_node_text(nodes, scene_array_child(nodes, root, 3)),
+		identity_count = scene_node_count(nodes, identities),
+		steam_identity = steam_identity,
+		steam_id = steam_id_from_identity(steam_identity),
+		metadata_count = scene_node_count(nodes, metadata),
+	}
 }
 
 parse_stormancer_rpc_error_body :: proc(body: Scene_Body) -> Stormancer_Rpc_Error_Body {
@@ -787,7 +808,24 @@ scene_node_uint :: proc(nodes: []Msgpack_Node, idx: int) -> u64 {
 	return 0
 }
 
+scene_node_count :: proc(nodes: []Msgpack_Node, idx: int) -> int {
+	if idx < 0 || idx >= len(nodes) do return 0
+	return nodes[idx].count
+}
+
+scene_node_is_nil :: proc(nodes: []Msgpack_Node, idx: int) -> bool {
+	if idx < 0 || idx >= len(nodes) do return false
+	return nodes[idx].kind == .Nil
+}
+
 scene_node_bool :: proc(nodes: []Msgpack_Node, idx: int) -> bool {
 	if idx < 0 || idx >= len(nodes) do return false
 	return nodes[idx].kind == .Bool && nodes[idx].b
+}
+
+steam_id_from_identity :: proc(identity: string) -> string {
+	prefix :: "steam:"
+	if len(identity) <= len(prefix) do return ""
+	if identity[:len(prefix)] != prefix do return ""
+	return identity[len(prefix):]
 }

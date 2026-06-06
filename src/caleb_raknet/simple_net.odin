@@ -7,17 +7,27 @@ package caleb_raknet
 // switch cases. The cases are stubs for now.
 
 import "core:encoding/hex"
+import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:os"
+import "core:strings"
 import "core:sys/posix"
 import "core:time"
 
 SIMPLE_DEFAULT_RAKNET_ENDPOINT :: "10.1.1.129:30100"
 SIMPLE_DEFAULT_DTLIVE_PORT :: 8080
+SIMPLE_DEFAULT_PREDICT_FILE :: "/tmp/pdlog/probe/simple_predict.json"
+SIMPLE_POLL_TIMEOUT_MS :: 1000
+SIMPLE_MAX_RESPONSES :: 12
+
+Poll_Slot :: enum int {
+	UDP,
+	HTTP,
+}
 
 Simple_Server_State :: struct {
-	client_id:                   uint,
 	remote:                      net.Endpoint,
 	connected_ping:              Connected_Ping,
 	connected_pong:              Connected_Pong,
@@ -47,6 +57,9 @@ Simple_Server_State :: struct {
 	session_token:               Session_Token,
 	ping_response:               Ping_Response,
 	other_response:              Other_Response,
+	identity_label:              string,
+	steam_id:                    string,
+	steam_lobby_id:              u64,
 	scene_raw_body:              Scene_Raw_Body,
 	stormancer_rpc_completed:    Stormancer_Rpc_Completed_Body,
 	stormancer_rpc_next:         Stormancer_Rpc_Next_Body,
@@ -79,9 +92,11 @@ Simple_Server_State :: struct {
 	user_session_update_options: UserSession_UpdateUserOptions_Body,
 }
 
-client_list: map[net.Endpoint]uint
-total_clients: uint
+client_list: map[net.Endpoint]int
 g_server_state: [dynamic]Simple_Server_State
+g_simple_scene_infos: Predict_Caleb_Scene_Infos
+g_simple_steam_friends_text: string
+g_simple_user_ids_by_steam: map[string]string
 
 simple_net :: proc(
 	dgrams: ^UDP_Datagram_Store,
@@ -99,6 +114,7 @@ simple_net :: proc(
 	scratch_arena: mem.Arena
 	mem.arena_init(&scratch_arena, scratch_backing)
 	scratch := mem.arena_allocator(&scratch_arena)
+	simple_scene_infos_load(scratch) or_return
 
 	log_scratch_backing := make([]byte, MAX_UDP_SIZE * 4 + 512)
 	defer delete(log_scratch_backing)
@@ -115,177 +131,390 @@ simple_net :: proc(
 	http_sock, http_enabled := dtlive_try_listen(bind_addr, http_port)
 	raknet_endpoint := env_string("RAKNET_ENDPOINT", SIMPLE_DEFAULT_RAKNET_ENDPOINT, scratch)
 	verbose := env_truthy("SIMPLE_NET_VERBOSE")
+	simple_predict_path := env_string("SIMPLE_PREDICT_FILE", SIMPLE_DEFAULT_PREDICT_FILE, scratch)
+	simple_predict_log := strings.builder_make()
+	defer strings.builder_destroy(&simple_predict_log)
+	sync_write_out(simple_predict_path, "")
 
 	fmt.printfln(
-		"simple_net listening on udp %s:%d; dtlive plain %s:%d; token raknet endpoint %s",
+		"simple_net listening on udp %s:%d; dtlive plain %s:%d; token raknet endpoint %s; predict -> %s",
 		LISTEN_HOST,
 		LISTEN_PORT,
 		LISTEN_HOST,
 		http_port,
 		raknet_endpoint,
+		simple_predict_path,
 	)
 
-	buf: [MAX_UDP_SIZE]byte
-	polls: [2]posix.pollfd
+	polls: [dynamic; 2]posix.pollfd
 	for {
-		poll_count := 1
-		polls[0] = posix.pollfd {
+		clear(&polls)
+		append(&polls, posix.pollfd {
 			fd     = udp_fd(sock),
 			events = {.IN},
-		}
+		})
 		if http_enabled {
-			polls[1] = posix.pollfd {
+			append(&polls, posix.pollfd {
 				fd     = tcp_fd(http_sock),
 				events = {.IN},
-			}
-			poll_count = 2
+			})
 		}
 
-		ready := posix.poll(&polls[0], posix.nfds_t(poll_count), 1000)
+		ready := posix.poll(&polls[Poll_Slot.UDP], posix.nfds_t(len(polls)), SIMPLE_POLL_TIMEOUT_MS)
 		if ready <= 0 do continue
-		if http_enabled && .IN in polls[1].revents {
+		if http_enabled && .IN in polls[Poll_Slot.HTTP].revents {
 			simple_dtlive_handle_one(http_sock, log_scratch)
 		}
-		if !(.IN in polls[0].revents) do continue
+		if !(.IN in polls[Poll_Slot.UDP].revents) do continue
 
-		n, remote := net.recv_udp(sock, buf[:]) or_continue
-		if n <= 0 do continue
-		data := buf[:n]
-		client_id, is_new_client := simple_net_client_id(remote)
-		if is_new_client {
-			fmt.printfln("simple client_id=%d -> %v", client_id, remote)
-		}
-
-		peer_count_before := len(live_peers)
-		peer_index := live_peer_index(&live_peers, remote)
-		label := live_peers[peer_index].label
-		if len(live_peers) != peer_count_before {
-			fmt.printfln("simple client %s -> %v", label, remote)
-		}
-
-		if live_predict_handle_health(sock, &wire, live_peers[peer_index].addr, data) do continue
-
-		now := time.now()
-		if !udp_datagram_push(dgrams, remote, now, data) {
-			fmt.eprintfln("datagram store full, dropping %d bytes", n)
-			continue
-		}
-		process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
-
-		if live_predict_handle_offline(sock, &wire, live_peers[peer_index].addr, data, scratch) {
-			continue
-		}
-		if !is_content_datagram(data) do continue
-
-		net.send_udp(sock, make_ack(read_u24_le(data, 1), scratch), remote)
-
-		ps := find_peer(&peers, label, &nidx)
-		encoded_messages := filter_health_messages(
-			reassemble_side(ps, .C2S, {data}, scratch),
+		buf: [MAX_UDP_SIZE]byte
+		bytes_read, remote := net.recv_udp(sock, buf[:]) or_continue
+		if bytes_read <= 0 do continue
+		simple_handle_udp_datagram(
+			sock,
+			remote,
+			buf[:bytes_read],
+			dgrams,
+			msgs,
+			reasm,
+			&wire,
+			&live_peers,
+			&peers,
+			&nidx,
+			&simple_predict_log,
+			simple_predict_path,
+			verbose,
 			scratch,
 		)
-		for encoded_message in encoded_messages {
-			decoded := decode_message(encoded_message, scratch)
-			route_registry_observe(&ps.reg_real, ps.ep_client, decoded)
-			if sm, ok := decoded.(Scene_Message); ok {
-				route_name := route_registry_resolve(
-					&ps.reg_real,
-					ps.ep_client,
-					sm.scene_handle,
-					sm.route_handle,
-				)
-				decoded = scene_message_with_route_body(decoded, route_name, scratch)
-			}
-			simple_server_state := &g_server_state[int(client_id)]
-			simple_apply_decoded_message(client_id, label, decoded, verbose, simple_server_state)
-			response_messages := simple_dispatch_decoded_message(
-				client_id,
-				label,
-				decoded,
-				verbose,
-				simple_server_state,
-			)
-			for response_message in response_messages {
-				simple_apply_decoded_message(
-					client_id,
-					label,
-					response_message,
-					verbose,
-					simple_server_state,
-				)
-			}
-		}
 	}
 	return nil
 }
 
+simple_handle_udp_datagram :: proc(
+	sock: net.UDP_Socket,
+	remote: net.Endpoint,
+	data: []byte,
+	dgrams: ^UDP_Datagram_Store,
+	msgs: ^RakNet_Message_Store,
+	reasm: ^Reassembly,
+	wire: ^World,
+	live_peers: ^[dynamic]Live_Peer_Wire,
+	peers: ^[dynamic]^Peer_State,
+	nidx: ^int,
+	simple_predict_log: ^strings.Builder,
+	simple_predict_path: string,
+	verbose: bool,
+	scratch: mem.Allocator,
+) {
+	client_id, is_new_client := simple_net_client_id(remote)
+	if is_new_client {
+		fmt.printfln("simple client_id=%d -> %v", client_id, remote)
+	}
+
+	peer_count_before := len(live_peers^)
+	peer_index := live_peer_index(live_peers, remote)
+	label := live_peers^[peer_index].label
+	if len(live_peers^) != peer_count_before {
+		fmt.printfln("simple client %s -> %v", label, remote)
+	}
+
+	if live_predict_handle_health(sock, wire, live_peers^[peer_index].addr, data) do return
+
+	if !udp_datagram_push(dgrams, remote, time.now(), data) {
+		fmt.eprintfln("datagram store full, dropping %d bytes", len(data))
+		return
+	}
+	process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
+
+	if live_predict_handle_offline(sock, wire, live_peers^[peer_index].addr, data, scratch) do return
+	if !is_content_datagram(data) do return
+
+	net.send_udp(sock, make_ack(read_u24_le(data, 1), scratch), remote)
+
+	peer_state := find_peer(peers, label, nidx)
+	encoded_messages := filter_health_messages(reassemble_side(peer_state, .C2S, {data}, scratch), scratch)
+	if len(encoded_messages) == 0 do return
+
+	decoded_messages: [dynamic]Decoded_Message
+	response_messages: [dynamic]Decoded_Message
+	for encoded_message in encoded_messages {
+		decoded := decode_message(encoded_message, scratch)
+		route_registry_observe(&peer_state.reg_real, peer_state.ep_client, decoded)
+		if sm, ok := decoded.(Scene_Message); ok {
+			route_name := route_registry_resolve(
+				&peer_state.reg_real,
+				peer_state.ep_client,
+				sm.scene_handle,
+				sm.route_handle,
+			)
+			decoded = scene_message_with_route_body(decoded, route_name, scratch)
+		}
+		append(&decoded_messages, decoded)
+	}
+	defer delete(decoded_messages)
+	defer delete(response_messages)
+
+	simple_server_state := &g_server_state[client_id]
+	for decoded in decoded_messages {
+		simple_apply_decoded_message(client_id, label, decoded, verbose, simple_server_state)
+		partial_response_messages := simple_dispatch_decoded_message(
+			client_id,
+			label,
+			decoded,
+			verbose,
+			simple_server_state,
+		)
+		for response_message in partial_response_messages do append(&response_messages, response_message)
+	}
+
+	for response_message in response_messages {
+		route_registry_observe(&peer_state.reg_real, peer_state.ep_real, response_message, scratch)
+		simple_apply_decoded_message(client_id, label, response_message, verbose, simple_server_state)
+	}
+	if len(response_messages) > 0 {
+		live_send_decoded_messages(sock, wire, remote, response_messages[:], scratch)
+	}
+	simple_write_prediction_record(
+		simple_predict_log,
+		simple_predict_path,
+		label,
+		peer_state,
+		encoded_messages,
+		response_messages[:],
+	)
+	if verbose {
+		fmt.printfln(
+			"simple %s c2s_msgs=%d pred_msgs=%d",
+			label,
+			len(encoded_messages),
+			len(response_messages),
+		)
+	}
+}
+
 simple_net_globals_init :: proc() {
-	if client_list == nil do client_list = make(map[net.Endpoint]uint)
+	if client_list == nil do client_list = make(map[net.Endpoint]int)
 	if g_server_state == nil do g_server_state = make([dynamic]Simple_Server_State)
 	if len(g_server_state) == 0 do append(&g_server_state, Simple_Server_State{})
 }
 
-simple_net_client_id :: proc(remote: net.Endpoint) -> (uint, bool) {
+simple_net_client_id :: proc(remote: net.Endpoint) -> (client_id: int, is_new: bool) {
 	if id, ok := client_list[remote]; ok do return id, false
-	total_clients += 1
-	client_id := total_clients
+	client_id = len(g_server_state)
+	is_new = true
 	client_list[remote] = client_id
-	for len(g_server_state) <= int(client_id) do append(&g_server_state, Simple_Server_State{})
-	g_server_state[int(client_id)] = Simple_Server_State {
-		client_id = client_id,
-		remote    = remote,
-	}
-	return client_id, true
+	append(&g_server_state, Simple_Server_State {
+		remote = remote,
+	})
+	return
 }
 
-simple_dtlive_handle_one :: proc(sock: net.TCP_Socket, allocator := context.allocator) {
-	free_all(allocator)
-	client, remote, err := net.accept_tcp(sock)
-	if err != nil do return
-	defer net.close(client)
-
-	buf: [16 * 1024]byte
-	n, recv_err := net.recv_tcp(client, buf[:])
-	if recv_err != nil || n <= 0 do return
-	req := string(buf[:n])
-	path := http_request_path(req)
-	body, content_type := simple_dtlive_response_body(path, allocator)
-	resp := fmt.aprintf(
-		"HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\nServer: Kestrel\r\nCache-Control: no-cache\r\nx-version: 3\r\nConnection: close\r\n\r\n%s",
-		content_type,
-		len(body),
-		body,
-		allocator = allocator,
-	)
-	fmt.printfln("simple dtlive %s from %v -> %dB", path, remote, len(body))
-	net.send_tcp(client, transmute([]byte)resp)
-}
-
-simple_dtlive_response_body :: proc(
-	path: string,
-	allocator := context.allocator,
-) -> (
-	string,
-	string,
-) {
-	if path == "/_federation" {
-		return "{\"current\":{\"id\":\"passtech-live\",\"adminEndpoints\":[\"https://dt-live.passtechgames.com\"],\"endpoints\":[\"https://dt-live.passtechgames.com\"],\"tags\":[]},\"clusters\":[{\"id\":\"passtech-live\",\"adminEndpoints\":null,\"endpoints\":[\"https://dt-live.passtechgames.com\"],\"tags\":[]}]}",
-			"application/json"
+simple_scene_infos_load :: proc(allocator: mem.Allocator) -> Error {
+	g_simple_scene_infos = Predict_Caleb_Scene_Infos {
+		authenticator = os.read_entire_file_from_path("src/scenes/authenticator.infos.bin", allocator) or_return,
+		friends       = os.read_entire_file_from_path("src/scenes/friends.infos.bin", allocator) or_return,
+		party_manager = os.read_entire_file_from_path("src/scenes/party-manager.infos.bin", allocator) or_return,
+		party         = os.read_entire_file_from_path("src/scenes/party.infos.bin", allocator) or_return,
+		matchmaking   = os.read_entire_file_from_path("src/scenes/matchmaking.infos.bin", allocator) or_return,
+		gamesession   = os.read_entire_file_from_path("src/scenes/gamesession.infos.bin", allocator) or_return,
 	}
-	if string_has_suffix(path, "/token") {
-		raknet_endpoint := env_string("RAKNET_ENDPOINT", SIMPLE_DEFAULT_RAKNET_ENDPOINT, allocator)
-		return scene_token_json_endpoint("authenticator", raknet_endpoint, allocator),
-			"application/json; charset=utf-8"
+	steam_friends_bytes := os.read_entire_file_from_path("src/steam_friends.json", allocator) or_return
+	g_simple_steam_friends_text = string(steam_friends_bytes)
+	steam_user_id_bytes := os.read_entire_file_from_path("src/steam_user_ids.json", allocator) or_return
+	g_simple_user_ids_by_steam = make(map[string]string, allocator)
+	if json.unmarshal_string(string(steam_user_id_bytes), &g_simple_user_ids_by_steam, allocator = allocator) != nil {
+		fmt.eprintfln("simple_net: failed to parse src/steam_user_ids.json")
 	}
-	if path == "/" {
-		return "{\"name\":\"dt-live-1\",\"version\":\"9.3.0.2\",\"reportedStatus\":\"Leader\",\"leader\":{\"uid\":\"5w0GiaMkGUuN+QnuOyHTKQ\",\"name\":\"dt-live-1\",\"endpoint\":\"dt-live.passtechgames.com:40243\",\"cluster\":\"passtech-live\"},\"cluster\":\"passtech-live\",\"logLastCommittedEntryId\":19,\"logLastEntryId\":19,\"logLastSnapshot\":null,\"state\":\"Running\",\"id\":\"5w0GiaMkGUuN+QnuOyHTKQ\"}",
-			"application/json"
-	}
-	return `{}`, "application/json"
+	return nil
 }
 
 simple_net_stub :: proc(label, name: string, verbose: bool) {
 	if verbose do fmt.printfln("simple %s -> %s", label, name)
+}
+
+simple_write_prediction_record :: proc(
+	out: ^strings.Builder,
+	out_path: string,
+	label: string,
+	ps: ^Peer_State,
+	sent_msgs: [][]byte,
+	preds: []Decoded_Message,
+) {
+	allocator := context.temp_allocator
+	t, _ := time.time_to_rfc3339(time.now(), allocator = allocator)
+	sent_human := render_burst(&ps.reg_real, ps.ep_client, sent_msgs, allocator)
+	pred_human := render_decoded_burst(&ps.reg_pred, ps.ep_pred, preds, allocator)
+	pred_bytes := encode_decoded_messages(preds, allocator)
+	real_bytes := make([dynamic][]byte, allocator)
+	sync_write_record(
+		out,
+		t,
+		label,
+		false,
+		sent_msgs,
+		real_bytes[:],
+		pred_bytes,
+		sent_human,
+		"",
+		pred_human,
+	)
+	sync_write_out(out_path, strings.to_string(out^))
+	free_all(allocator)
+}
+
+simple_scene_message :: proc(
+	scene_handle: u8,
+	route_handle: u16,
+	body: []byte,
+	allocator := context.allocator,
+) -> Decoded_Message {
+	msg := make([dynamic]byte, allocator)
+	append(&msg, scene_handle)
+	write_u16_le(&msg, route_handle)
+	append(&msg, ..body)
+	return decode_message(msg[:], allocator)
+}
+
+simple_response_msg :: proc(req_id: u16, raw: []byte, allocator := context.allocator) -> Decoded_Message {
+	msg := make([dynamic]byte, allocator)
+	append(&msg, u8(Message_Id.Response_Msg))
+	write_u16_le(&msg, req_id)
+	append(&msg, ..raw)
+	return decode_message(msg[:], allocator)
+}
+
+simple_response_complete :: proc(
+	req_id: u16,
+	has_values: bool,
+	allocator := context.allocator,
+) -> Decoded_Message {
+	msg := make([dynamic]byte, allocator)
+	append(&msg, u8(Message_Id.Response_Complete))
+	write_u16_le(&msg, req_id)
+	append(&msg, has_values ? 1 : 0)
+	return decode_message(msg[:], allocator)
+}
+
+simple_bool_response_msg :: proc(
+	req_id: u16,
+	value: bool,
+	allocator := context.allocator,
+) -> Decoded_Message {
+	raw := mpe_map({mpe_str("v", allocator), mpe_bool(value, allocator)}, allocator)
+	return simple_response_msg(req_id, raw, allocator)
+}
+
+simple_session_token_response_msg :: proc(req_id: u16, allocator := context.allocator) -> Decoded_Message {
+	jwt := "eyJhbGciOiJub25lIiwidHlwIjoiSldUIiwiY2x1c3RlcklkIjoicGFzc3RlY2gtbGl2ZSJ9.eyJTdG9ybWFuY2VyL3Nlc3Npb25JZCI6ImJYMkZOMVdhS1Vxb3VCY2JVNTlWbVEiLCJuYmYiOjE3ODA1MzcyMTIsImV4cCI6MTc4MDYyMzYxMiwiaWF0IjoxNzgwNTM3MjEyLCJpc3MiOiJwYXNzdGVjaC1saXZlIn0."
+	sid := "bX2FN1WaKUqouBcbU59VmQ"
+	raw := mpe_concat(mpe_str(jwt, allocator), mpe_str(sid, allocator), allocator = allocator)
+	return simple_response_msg(req_id, raw, allocator)
+}
+
+simple_ping_response_msg :: proc(
+	req_id: u16,
+	echo_clock: u64,
+	allocator := context.allocator,
+) -> Decoded_Message {
+	raw := make([dynamic]byte, allocator)
+	write_u64_le(&raw, server_time_ms())
+	write_u64_le(&raw, echo_clock)
+	return simple_response_msg(req_id, raw[:], allocator)
+}
+
+simple_rpc_next_message :: proc(
+	scene_handle: u8,
+	route_handle: u16,
+	rpc_id: u16,
+	result: []byte,
+	allocator := context.allocator,
+) -> Decoded_Message {
+	body := make([dynamic]byte, allocator)
+	write_u16_le(&body, rpc_id)
+	append(&body, ..result)
+	return simple_scene_message(scene_handle, route_handle, body[:], allocator)
+}
+
+simple_rpc_completed_message :: proc(
+	scene_handle: u8,
+	route_handle: u16,
+	rpc_id: u16,
+	message_sent: bool,
+	allocator := context.allocator,
+) -> Decoded_Message {
+	body := make([dynamic]byte, allocator)
+	append(&body, message_sent ? 1 : 0)
+	write_u16_le(&body, rpc_id)
+	return simple_scene_message(scene_handle, route_handle, body[:], allocator)
+}
+
+simple_append_rpc_response :: proc(
+	messages: ^[dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
+	scene_handle: u8,
+	rpc_next_route: u16,
+	rpc_completed_route: u16,
+	rpc_id: u16,
+	result: []byte,
+	allocator := context.allocator,
+) {
+	if rpc_next_route != 0 {
+		append(
+			messages,
+			simple_rpc_next_message(scene_handle, rpc_next_route, rpc_id, result, allocator),
+		)
+	}
+	if rpc_completed_route != 0 {
+		append(
+			messages,
+			simple_rpc_completed_message(scene_handle, rpc_completed_route, rpc_id, true, allocator),
+		)
+	}
+}
+
+simple_append_rpc_complete :: proc(
+	messages: ^[dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
+	scene_handle: u8,
+	rpc_completed_route: u16,
+	rpc_id: u16,
+	message_sent: bool,
+	allocator := context.allocator,
+) {
+	if rpc_completed_route == 0 do return
+	append(
+		messages,
+		simple_rpc_completed_message(scene_handle, rpc_completed_route, rpc_id, message_sent, allocator),
+	)
+}
+
+simple_scene_token_response_for_suffix :: proc(scene_suffix: string, allocator := context.allocator) -> []byte {
+	raknet_endpoint := env_string("RAKNET_ENDPOINT", SIMPLE_DEFAULT_RAKNET_ENDPOINT, allocator)
+	return mpe_str(scene_token_json_endpoint(scene_suffix, raknet_endpoint, allocator), allocator)
+}
+
+simple_party_scene_for_invite :: proc(invitation_code, fallback_label: string) -> string {
+	if invitation_code == invite_code_for_peer("C1") do return party_scene_for_peer("C1")
+	if invitation_code == invite_code_for_peer("C2") do return party_scene_for_peer("C2")
+	return party_scene_for_peer(fallback_label)
+}
+
+simple_identity_label :: proc(simple_server_state: ^Simple_Server_State, fallback_label: string) -> string {
+	if simple_server_state.identity_label != "" do return simple_server_state.identity_label
+	return fallback_label
+}
+
+simple_party_userdata_json :: proc(
+	simple_server_state: ^Simple_Server_State,
+	identity: string,
+	initialized: bool,
+	lobby_state: int,
+) -> string {
+	if simple_server_state.party_update_user_data2.userdata_json != "" {
+		return simple_server_state.party_update_user_data2.userdata_json
+	}
+	if simple_server_state.party_create_session.userdata_json != "" {
+		return simple_server_state.party_create_session.userdata_json
+	}
+	return party_userdata_json(identity, initialized, lobby_state, 3)
 }
 
 get_route_from_handle :: proc(
@@ -306,11 +535,6 @@ get_route_from_handle :: proc(
 	return 0
 }
 
-steam_identity_for_peer :: proc(peer: string) -> string {
-	if peer == "C2" do return "steam:76561197977870267"
-	return "steam:76561199572083022"
-}
-
 steam_id_from_login_ticket :: proc(ticket: string, allocator := context.allocator) -> string {
 	data, ok := hex.decode(transmute([]byte)ticket, allocator)
 	if !ok || len(data) < 20 do return ""
@@ -318,18 +542,8 @@ steam_id_from_login_ticket :: proc(ticket: string, allocator := context.allocato
 	return fmt.aprintf("%d", read_u64_le(data, 12), allocator = allocator)
 }
 
-user_id_from_steam_id :: proc(steam_id: string) -> string {
-	switch steam_id {
-	case "76561197977870267":
-		return "4168ffb24de245f88060d27c9580685e"
-	case "76561199572083022":
-		return "9fe2fc1fa18643e2818bbd65198d4b00"
-	}
-	return ""
-}
-
 simple_apply_decoded_message :: proc(
-	client_id: uint,
+	client_id: int,
 	label: string,
 	message: Decoded_Message,
 	verbose: bool,
@@ -371,7 +585,7 @@ simple_apply_decoded_message :: proc(
 		simple_net_stub(label, "Connection_Result", verbose)
 	case Scene_Message:
 		simple_server_state.scene_message = m
-		simple_dispatch_scene_message(client_id, label, m, verbose, simple_server_state)
+		simple_net_stub(label, "Scene_Message", verbose)
 	case Malformed_Message:
 		simple_server_state.malformed_message = m
 		simple_net_stub(label, "Malformed_Message", verbose)
@@ -382,16 +596,28 @@ simple_apply_decoded_message :: proc(
 }
 
 simple_apply_system_request :: proc(
-	client_id: uint,
+	client_id: int,
 	label: string,
 	message: System_Request,
 	verbose: bool,
 	simple_server_state: ^Simple_Server_State,
-) {
+) -> (
+	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
+){
 	switch args in message.args {
 	case Connect_To_Scene_Args:
+//   "sent_human_readable": "System_Request msg_id=Connect_To_Scene req=7 args=Connect token=449B routes=[stormancer.rpc.completed#0, stormancer.rpc.next#0, gameVersion.update#0, stormancer.rpc.cancel#0, sendRequest#0, stormancer.rpc.error#0, serverVersion.update#0, users.renewCredentials#0] scene_meta={stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.nintendo=\"enabled\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\", stormancer.plugins.steam=\"4.2.1.42\", appId=\"live-1-05-00\", accountId=\"darktales\", stormancer.gameVersion=\"default\", stormancer.plugins.psn=\"202006171\"} conn_meta={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
+//   "real_human_readable": "Response_Msg req=7 data=Scene_Connection_Result handle=141 routes=[stormancer.rpc.completed#1, stormancer.rpc.next#2, gameVersion.update#3, stormancer.rpc.cancel#4, sendRequest#5, stormancer.rpc.error#6, serverVersion.update#7, users.renewCredentials#8] | Response_Complete req=7 has_values=true",
+ 
 		simple_server_state.connect_to_scene_args = args
-		simple_net_stub(label, "System_Request.Connect_To_Scene", verbose)
+        simple_server_state
+		append(&response_messages, Response_Msg {
+            req_id = message.req_id,
+            data = Scene_Connection_Result {
+                handle = 141,
+                routes = args.routes,
+            },
+        })
 	case Get_Scene_Infos_Args:
 		simple_server_state.get_scene_infos_args = args
 		simple_net_stub(label, "System_Request.Get_Scene_Infos", verbose)
@@ -420,13 +646,13 @@ simple_apply_system_request :: proc(
 }
 
 simple_dispatch_decoded_message :: proc(
-	client_id: uint,
+	client_id: int,
 	label: string,
 	message: Decoded_Message,
 	verbose: bool,
 	simple_server_state: ^Simple_Server_State,
 ) -> (
-	response_messages: [dynamic; 3]Decoded_Message,
+	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
 ) {
 	switch m in message {
 	case Connected_Ping:
@@ -459,19 +685,7 @@ simple_dispatch_decoded_message :: proc(
 		simple_net_stub(label, "Disconnection_Notification", verbose)
 	case System_Request:
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:49.582001573Z line=  "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
-		//   "real_human_readable": "Response_Msg req=1 data=Session_Token sid=\"la1AFGj1KUerZTS8aegRXw\" jwt=JWT{header={\"alg\":\"none\",\"typ\":\"JWT\",\"clusterId\":\"passtech-live\"} payload={\"Stormancer/sessionId\":\"la1AFGj1KUerZTS8aegRXw\",\"nbf\":1780707835,\"exp\":1780794235,\"iat\":1780707835,\"iss\":\"passtech-live\"} sig=0B} | Response_Complete req=1 has_values=true",
-
-        append(&response_messages, Decoded_Message(Response_Msg {
-            req_id = m.req_id,
-            data = Session_Token {
-                jwt = "",
-                session_id = "la1AFGj1KUerZTS8aegRXw",
-            },
-        }))
-        append(&response_messages, Decoded_Message(Response_Complete {
-            req_id = m.req_id,
-            has_values = true,
-        }))
+		return get_system_request_response(client_id, label, m, verbose, simple_server_state)
 	case Response_Msg:
 		simple_net_stub(label, "Response_Msg", verbose)
 		// predict_caleb sent_human_readable: not found in sent_human_readable
@@ -486,7 +700,7 @@ simple_dispatch_decoded_message :: proc(
 		simple_net_stub(label, "Connection_Result", verbose)
 	case Scene_Message:
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:54.547386728Z line=  "sent_human_readable": "Scene_Message handle=141 route=6(Authentication.Login) rpc=1 [[\"steam\", {\"gameVersion.clientVersion\": \"1.05.00.05\", \"provider\": \"steam\", \"ticket\": \"140000004F316731E9C817C7BB9F0C0101001001C24E236A180000000100000005000000C7D1724E00372436898F5A0AB9000000B20000003200000004000000BB9F0C0101001001F09A1F00A7599BB88101010A00000000BC531B6A3C03376A010059C2100000000000BA6E72D9F085C7D5CD2628D22C0C0D67544C6D4C162CA664248F076E7D4D8A1CED297A86B596A9A28B2CAF53E1FC7E91B8D486F59399B96EC6C110FED6589A3B49E0846268CCC94B17B81FEAF04BB0B0DC23263FFEEA5B70A43A1FA6CC3427AF84EC70F53AFED224AE327149656DEB25CDA05E87CDF2677BA72EE53B8F905BA0\", \"version\": \"v1\", \"appId\": \"2071280\"}]]",
-		simple_net_stub(label, "Scene_Message", verbose)
+		return simple_dispatch_scene_message(client_id, label, m, verbose, simple_server_state)
 	case Malformed_Message:
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Malformed_Message", verbose)
@@ -497,146 +711,201 @@ simple_dispatch_decoded_message :: proc(
 	return
 }
 
-simple_dispatch_system_request :: proc(
-	client_id: uint,
+get_system_request_response :: proc(
+	client_id: int,
 	label: string,
 	message: System_Request,
 	verbose: bool,
 	simple_server_state: ^Simple_Server_State,
 ) -> (
-	response_messages: [dynamic; 3]Decoded_Message,
+	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
 ) {
-	switch args in message.args {
-	case Connect_To_Scene_Args:
+	switch args in message.msg_id {
+	case Set_Metadata:
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:52.313899701Z line=  "sent_human_readable": "System_Request msg_id=Connect_To_Scene req=7 args=Connect token=449B routes=[stormancer.rpc.completed#0, stormancer.rpc.next#0, gameVersion.update#0, stormancer.rpc.cancel#0, sendRequest#0, stormancer.rpc.error#0, serverVersion.update#0, users.renewCredentials#0] scene_meta={stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.nintendo=\"enabled\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\", stormancer.plugins.steam=\"4.2.1.42\", appId=\"live-1-05-00\", accountId=\"darktales\", stormancer.gameVersion=\"default\", stormancer.plugins.psn=\"202006171\"} conn_meta={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
 		scene_handle := u64(SCENE_HANDLE_MIN + len(simple_server_state.scene_connection_result.scenes))
-		result := simple_server_state.scene_connection_result
-		for route, route_index in args.routes {
-			scene_connection_result_set_route(&result, scene_handle, u64(route_index + 1), route.name)
-		}
-		response_msg := Response_Msg {
-			req_id = message.req_id,
-			data   = result,
-		}
-		response_complete := Response_Complete {
-			req_id     = message.req_id,
-			has_values = true,
-		}
-		append(&response_messages, Decoded_Message(response_msg), Decoded_Message(response_complete))
-	case Get_Scene_Infos_Args:
-		// predict_caleb sent_human_readable t=2026-06-06T01:03:50.428809511Z line=  "sent_human_readable": "System_Request msg_id=Get_Scene_Infos req=2 args=Get_Scene_Infos token=449B metadata={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\"}",
-		response_msg := Response_Msg {
-            req_id = message.req_id,
-            //   "real_human_readable": "Response_Msg req=2 data=Scene_Infos shard=0 scene=\"authenticator\" serializer=\"msgpack/array\" meta={stormancer.plugins.nintendo=\"enabled\", stormancer.plugins.steam=\"4.2.1.42\", stormancer.gameVersion=\"default\", stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.psn=\"202006171\", accountId=\"darktales\", appId=\"live-1-05-00\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\"} routes=[stormancer.rpc.next#0, stormancer.rpc.cancel#1, stormancer.rpc.error#2, stormancer.rpc.completed#3, Authentication.GetMetadata#4, Authentication.Register#5, Authentication.Login#6, Authentication.GetStatus#7, Authentication.Unlink#8, sendRequest#9, sceneauthorization.gettoken#10, UserSession.GetAuthenticatedUsersCountPublic#11, UserSession.CreateUserBearerToken#12, UserSession.GetUserIdFromBearerToken#13, UserSession.GetUserOptions#14, UserSession.UpdateUserOptions#15, NX.GetAdvertisedParties#16, Steam.QueryUserIds#17, Steam.DecodePartyDataBearerTokens#18, Locator.GetSceneConnectionToken#19] | Response_Complete req=2 has_values=true",
-            data = Scene_Infos {
-                shard_id = 0,
-                scene_id = "authenticator",
-				account_id = "darktales",
-				app_id = "live-1-05-00",
-                darktales_gamesession = "",
-                stormancer_friends = "",
-                stormancer_gamesession = "",
-				stormancer_game_version = "default",
-                stormancer_party = "",
-                stormancer_partymanagement = "",
-                stormancer_party_merging = "",
-                stormancer_party_revision = "",
-                stormancer_plugins_gamefinder = "",
-                stormancer_plugins_gamefinder_protocol = "",
-                stormancer_plugins_nintendo = "enabled",
-				stormancer_plugins_psn = "202006171",
-				stormancer_plugins_rpc = "1.1.0",
-				stormancer_plugins_steam = "4.2.1.42",
-				stormancer_plugins_xbl_use_modern_gamertag = "false",
-				routes = []Scene_Route {
-					Scene_Route{name = "stormancer.rpc.next", handle = 0},
-					Scene_Route{name = "stormancer.rpc.cancel", handle = 1},
-					Scene_Route{name = "stormancer.rpc.error", handle = 2},
-					Scene_Route{name = "stormancer.rpc.completed", handle = 3},
-					Scene_Route{name = "Authentication.GetMetadata", handle = 4},
-					Scene_Route{name = "Authentication.Register", handle = 5},
-					Scene_Route{name = "Authentication.Login", handle = 6},
-					Scene_Route{name = "Authentication.GetStatus", handle = 7},
-					Scene_Route{name = "Authentication.Unlink", handle = 8},
-					Scene_Route{name = "sendRequest", handle = 9},
-					Scene_Route{name = "sceneauthorization.gettoken", handle = 10},
-					Scene_Route{name = "UserSession.GetAuthenticatedUsersCountPublic", handle = 11},
-					Scene_Route{name = "UserSession.CreateUserBearerToken", handle = 12},
-					Scene_Route{name = "UserSession.GetUserIdFromBearerToken", handle = 13},
-					Scene_Route{name = "UserSession.GetUserOptions", handle = 14},
-					Scene_Route{name = "UserSession.UpdateUserOptions", handle = 15},
-					Scene_Route{name = "NX.GetAdvertisedParties", handle = 16},
-					Scene_Route{name = "Steam.QueryUserIds", handle = 17},
-					Scene_Route{name = "Steam.DecodePartyDataBearerTokens", handle = 18},
-					Scene_Route{name = "Locator.GetSceneConnectionToken", handle = 19},
-				},
-				selected_serializer = "msgpack/array",
-            },
-        }
-		response_complete := Response_Complete {
-            req_id     = message.req_id,
-            has_values = true,
-        }
-		append(&response_messages, Decoded_Message(response_msg), Decoded_Message(response_complete))
-	case Set_Metadata_Args:
-		response_complete := Response_Complete {
-            req_id     = message.req_id,
-            has_values = false,
-        }
-		append(&response_messages, Decoded_Message(response_complete))
+		raw := build_scene_connection_result_raw(scene_handle, args.routes, context.allocator)
+		append(
+			&response_messages,
+			simple_response_msg(message.req_id, raw),
+			simple_response_complete(message.req_id, true),
+		)
+	case Scene_Ready:
+
+	case Ping:
+		append(&response_messages, simple_response_complete(message.req_id, false))
 	case Scene_Ready_Args:
-        //  "real_human_readable": "Response_Msg req=9 data=Bool_Result v=true | Scene_Message handle=141 route=3(gameVersion.update) [\"bot,1.05.*\"] | Response_Complete req=9 has_values=true | Response_Complete req=12 has_values=true",
-		response_msg := Response_Msg {
-            req_id = message.req_id,
-			data   = Bool_Result{value = true},
-        }
-		append(&response_messages, Decoded_Message(response_msg))
-        if simple_server_state.scene_ready_args.sent_game_version_update == false {
-			scene_message := Scene_Message {
-                scene_handle = u8(args.scene_handle),
-				route_handle = get_route_from_handle(simple_server_state, args.scene_handle, "gameVersion.update"),
-                body = GameVersion_Update_Body {
-					accepted_version = "bot,1.05.*",
+		//  "real_human_readable": "Response_Msg req=9 data=Bool_Result v=true | Scene_Message handle=141 route=3(gameVersion.update) [\"bot,1.05.*\"] | Response_Complete req=9 has_values=true | Response_Complete req=12 has_values=true",
+		steam_create_lobby_route := get_route_from_handle(
+			simple_server_state,
+			args.scene_handle,
+			"Steam.CreateLobby",
+		)
+		identity := simple_identity_label(simple_server_state, label)
+		if steam_create_lobby_route != 0 {
+			append(
+				&response_messages,
+				simple_scene_message(
+					u8(args.scene_handle),
+					steam_create_lobby_route,
+					steam_create_lobby_body(identity, 1, party_scene_for_peer(identity)),
+				),
+			)
+		}
+		append(&response_messages, simple_bool_response_msg(message.req_id, true))
+		if simple_server_state.scene_ready_args.sent_game_version_update == false {
+			append(
+				&response_messages,
+				simple_scene_message(
+					u8(args.scene_handle),
+					get_route_from_handle(simple_server_state, args.scene_handle, "gameVersion.update"),
+					mpe_str("bot,1.05.*"),
+				),
+			)
+			simple_server_state.scene_ready_args.sent_game_version_update = true
+		}
+		append(&response_messages, simple_response_complete(message.req_id, true))
+		if steam_create_lobby_route != 0 {
+			settings_route := get_route_from_handle(
+				simple_server_state,
+				args.scene_handle,
+				"party.settingsUpdated",
+			)
+			member_data_route := get_route_from_handle(
+				simple_server_state,
+				args.scene_handle,
+				"party.memberDataUpdated",
+			)
+			if settings_route != 0 {
+				append(
+					&response_messages,
+					simple_scene_message(
+						u8(args.scene_handle),
+						settings_route,
+						party_settings_body(identity, 3, 1, ""),
+					),
+				)
+			}
+			if member_data_route != 0 {
+				append(
+					&response_messages,
+					simple_scene_message(
+						u8(args.scene_handle),
+						member_data_route,
+						party_memberdata_body(identity, 4, 4, false, 3),
+					),
+				)
+			}
+			if settings_route != 0 {
+				append(
+					&response_messages,
+					simple_scene_message(
+						u8(args.scene_handle),
+						settings_route,
+						party_settings_body(identity, 5, 3, ""),
+					),
+				)
+			}
+			if member_data_route != 0 {
+				append(
+					&response_messages,
+					simple_scene_message(
+						u8(args.scene_handle),
+						member_data_route,
+						party_memberdata_body(identity, 6, 6, true, 3),
+					),
+				)
+			}
+		}
+	case Get_Session_Token:
+// "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
+// "real_human_readable": "Response_Msg req=1 data=Session_Token sid=\"mK3b_FfCGU6pNfjn4w8Pxg\" jwt=JWT{header={\"alg\":\"none\",\"typ\":\"JWT\",\"clusterId\":\"passtech-live\"} payload={\"Stormancer/sessionId\":\"mK3b_FfCGU6pNfjn4w8Pxg\",\"nbf\":1780707829,\"exp\":1780794229,\"iat\":1780707829,\"iss\":\"passtech-live\"} sig=0B} | Response_Complete req=1 has_values=true",
+ 
+		append(
+			&response_messages,
+			Response_Msg{
+                req_id = message.req_id,
+                data = Session_Token {
+                    jwt = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIiwiY2x1c3RlcklkIjoicGFzc3RlY2gtbGl2ZSJ9.eyJTdG9ybWFuY2VyL3Nlc3Npb25JZCI6Im1LM2JfRmZDRVU2cE5fjn4w8PxgIiwibmJmIjoxNzgwNzA3ODI5LCJleHAiOjE3ODA3OTQyMjksImlhdCI6MTc4MDcwNzgyOSwiaXNzIjoicGFzc3RlY2gtbGl2ZSJ9.",
+                    sid = "mK3b_FfCGU6pNfjn4w8Pxg",
                 },
-            }
-			append(&response_messages, Decoded_Message(scene_message))
-        }
-		response_complete := Response_Complete {
-            req_id     = message.req_id,
-            has_values = true,
-        }
-		append(&response_messages, Decoded_Message(response_complete))
-	case Disconnect_From_Scene_Args:
-		// predict_caleb sent_human_readable t=2026-06-06T01:04:26.261603647Z line=  "sent_human_readable": "System_Request msg_id=Disconnect_From_Scene req=36 args=Disconnect handle=144",
-		simple_net_stub(label, "System_Request.Disconnect_From_Scene", verbose)
-	case Ping_Args:
-		// predict_caleb sent_human_readable: not found in sent_human_readable
-		simple_net_stub(label, "System_Request.Ping", verbose)
-	case No_Args:
-		// predict_caleb sent_human_readable t=2026-06-06T01:03:49.582001573Z line=  "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
-		response_msg := Response_Msg {
-			req_id = message.req_id,
-			data = Session_Token {
-				jwt = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIiwiY2x1c3RlcklkIjoicGFzc3RlY2gtbGl2ZSJ9.eyJTdG9ybWFuY2VyL3Nlc3Npb25JZCI6ImJYMkZOMVdhS1Vxb3VCY2JVNTlWbVEiLCJuYmYiOjE3ODA1MzcyMTIsImV4cCI6MTc4MDYyMzYxMiwiaWF0IjoxNzgwNTM3MjEyLCJpc3MiOiJwYXNzdGVjaC1saXZlIn0.",
-				session_id = "bX2FN1WaKUqouBcbU59VmQ",
-			},
-		}
-		response_complete := Response_Complete {
-			req_id     = message.req_id,
-			has_values = true,
-		}
-		append(&response_messages, Decoded_Message(response_msg), Decoded_Message(response_complete))
+            },
+            simple_response_complete(message.req_id, true),
+		)
 		simple_net_stub(label, "System_Request.No_Args", verbose)
-		return
-	case Unparsed_Args:
+
+	case Scene_Ready2:
 		// predict_caleb sent_human_readable: not found in sent_human_readable
-		simple_net_stub(label, "System_Request.Unparsed_Args", verbose)
-	}
+		append(
+			&response_messages,
+			simple_ping_response_msg(message.req_id, args.clock),
+			simple_response_complete(message.req_id, true),
+		)
+		simple_net_stub(label, "System_Request.Ping", verbose)
+	case Connect_To_Scene:
+		// predict_caleb sent_human_readable t=2026-06-06T01:03:49.582001573Z line=  "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
+
+		return
+	case Disconnect_From_Scene:
+        // predict_caleb sent_human_readable t=2026-06-06T01:04:26.261603647Z line=  "sent_human_readable": "System_Request msg_id=Disconnect_From_Scene req=36 args=Disconnect handle=144",
+		append(
+			&response_messages,
+			simple_bool_response_msg(message.req_id, true),
+			simple_response_complete(message.req_id, true),
+		)
+		simple_net_stub(label, "System_Request.Disconnect_From_Scene", verbose)
+	
+	case Get_Scene_Infos:
+// "sent_human_readable": "System_Request msg_id=Get_Scene_Infos req=2 args=Get_Scene_Infos token=449B metadata={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\"}",
+//   "real_human_readable": "Response_Msg req=2 data=Scene_Infos shard=0 scene=\"authenticator\" serializer=\"msgpack/array\" meta={stormancer.plugins.nintendo=\"enabled\", stormancer.plugins.steam=\"4.2.1.42\", stormancer.gameVersion=\"default\", stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.psn=\"202006171\", accountId=\"darktales\", appId=\"live-1-05-00\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\"} routes=[stormancer.rpc.next#0, stormancer.rpc.cancel#1, stormancer.rpc.error#2, stormancer.rpc.completed#3, Authentication.GetMetadata#4, Authentication.Register#5, Authentication.Login#6, Authentication.GetStatus#7, Authentication.Unlink#8, sendRequest#9, sceneauthorization.gettoken#10, UserSession.GetAuthenticatedUsersCountPublic#11, UserSession.CreateUserBearerToken#12, UserSession.GetUserIdFromBearerToken#13, UserSession.GetUserOptions#14, UserSession.UpdateUserOptions#15, NX.GetAdvertisedParties#16, Steam.QueryUserIds#17, Steam.DecodePartyDataBearerTokens#18, Locator.GetSceneConnectionToken#19] | Response_Complete req=2 has_values=true",
+        simple_server_state.get_scene_infos_args = args
+        append(
+			&response_messages,
+			Request_Msg{
+                req_id = message.req_id,
+                data = Scene_Infos {
+                    shard = 0,
+                    scene = "authenticator",
+                    serializer = "msgpack/array",
+                    stormancer_plugins_nintendo = "enabled",
+                    stormancer_plugins_steam = "4.2.1.42",
+                    stormancer_gameVersion = "default",
+                    stormancer_plugins_rpc = "1.1.0",
+                    stormancer_plugins_psn = "202006171",
+                    accountId = "darktales",
+                    appId = "live-1-05-00",
+                    stormancer_plugins_XBLServices_useModernGamerTag = "false",
+                    routes = []Scene_Route {
+                        Scene_Route{name = "stormancer.rpc.next", index = 0},
+                        Scene_Route{name = "stormancer.rpc.cancel", index = 1},
+                        Scene_Route{name = "stormancer.rpc.error", index = 2},
+                        Scene_Route{name = "stormancer.rpc.completed", index = 3},
+                        Scene_Route{name = "Authentication.GetMetadata", index = 4},
+                        Scene_Route{name = "Authentication.Register", index = 5},
+                        Scene_Route{name = "Authentication.Login", index = 6},
+                        Scene_Route{name = "Authentication.GetStatus", index = 7},
+                        Scene_Route{name = "Authentication.Unlink", index = 8},
+                        Scene_Route{name = "sendRequest", index = 9},
+                        Scene_Route{name = "sceneauthorization.gettoken", index = 10},
+                        Scene_Route{name = "UserSession.GetAuthenticatedUsersCountPublic", index = 11},
+                        Scene_Route{name = "UserSession.CreateUserBearerToken", index = 12},
+                        Scene_Route{name = "UserSession.GetUserIdFromBearerToken", index = 13},
+                        Scene_Route{name = "UserSession.GetUserOptions", index = 14},
+                        Scene_Route{name = "UserSession.UpdateUserOptions", index = 15},
+                        Scene_Route{name = "NX.GetAdvertisedParties", index = 16},
+                        Scene_Route{name = "Steam.QueryUserIds", index = 17},
+                        Scene_Route{name = "Steam.DecodePartyDataBearerTokens", index = 18},
+                        Scene_Route{name = "Locator.GetSceneConnectionToken", index = 19},
+                    }
+                }
+            }
+        )
+        append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
 	return
 }
 
 simple_dispatch_response_msg :: proc(
-	client_id: uint,
+	client_id: int,
 	label: string,
 	message: Response_Msg,
 	verbose: bool,
@@ -671,13 +940,13 @@ simple_dispatch_response_msg :: proc(
 }
 
 simple_dispatch_scene_message :: proc(
-	client_id: uint,
+	client_id: int,
 	label: string,
 	message: Scene_Message,
 	verbose: bool,
 	simple_server_state: ^Simple_Server_State,
 ) -> (
-	response_messages: [dynamic; 3]Decoded_Message) {
+	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message) {
 	switch body in message.body {
 	case Scene_Raw_Body:
 		simple_server_state.scene_raw_body = body
@@ -686,10 +955,53 @@ simple_dispatch_scene_message :: proc(
 	case Stormancer_Rpc_Completed_Body:
 		simple_server_state.stormancer_rpc_completed = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:02.935732632Z line=  "sent_human_readable": "Scene_Message handle=144 route=3(stormancer.rpc.completed) rpc=257 [0]",
+		if body.rpc_id == 257 {
+			identity := simple_identity_label(simple_server_state, label)
+			if member_connected_route := get_route_from_handle(
+				simple_server_state,
+				u64(message.scene_handle),
+				"party.memberConnected",
+			); member_connected_route != 0 {
+				append(
+					&response_messages,
+					simple_scene_message(
+						message.scene_handle,
+						member_connected_route,
+						party_member_connected_body_with_userdata(
+							identity,
+							2,
+							2,
+							0,
+							simple_party_userdata_json(simple_server_state, identity, false, 1),
+						),
+					),
+				)
+			}
+		}
 		simple_net_stub(label, "Scene_Message.Stormancer_Rpc_Completed", verbose)
 	case Stormancer_Rpc_Next_Body:
 		simple_server_state.stormancer_rpc_next = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:02.920778728Z line=  "sent_human_readable": "Scene_Message handle=144 route=0(stormancer.rpc.next) rpc=1 [[true, \"\", \"\", 109775243056466233]]",
+		if body.rpc_id == 1 {
+			identity := simple_identity_label(simple_server_state, label)
+			simple_server_state.steam_lobby_id = scene_route0_lobby_id(message.decoded)
+			simple_append_rpc_response(
+				&response_messages,
+				message.scene_handle,
+				get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+				get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+				body.rpc_id,
+				party_state_response_learned(party_scene_for_peer(identity), identity, 3),
+			)
+		} else if message.scene_handle >= SCENE_HANDLE_MIN + 3 {
+			simple_append_rpc_complete(
+				&response_messages,
+				message.scene_handle,
+				get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+				body.rpc_id,
+				false,
+			)
+		}
 		simple_net_stub(label, "Scene_Message.Stormancer_Rpc_Next", verbose)
 	case Stormancer_Rpc_Error_Body:
 		simple_server_state.stormancer_rpc_error = body
@@ -697,36 +1009,57 @@ simple_dispatch_scene_message :: proc(
 		simple_net_stub(label, "Scene_Message.Stormancer_Rpc_Error", verbose)
 	case Authentication_Login_Body:
 		simple_server_state.authentication_login = body
+		peer := login_canonical_label_from_ticket(transmute([]byte)body.ticket)
+		if len(peer) == 0 do peer = label
 		steam_id := steam_id_from_login_ticket(body.ticket)
-		user_id := user_id_from_steam_id(steam_id)
+		if len(steam_id) == 0 do steam_id = party_member_steam_id_for_peer(peer)
+		simple_server_state.identity_label = peer
+		simple_server_state.steam_id = steam_id
+		user_id := ""
+		if id, ok := g_simple_user_ids_by_steam[steam_id]; ok do user_id = id
+		if len(user_id) == 0 do user_id = user_id_for_peer(peer)
 		steam_identity := fmt.aprintf("steam:%s", steam_id)
-		// "Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=1 [[nil, true, \"4168ffb24de245f88060d27c9580685e\", \"\", {\"steam\": \"steam:76561197977870267\"}, {}]]"
-		append(&response_messages, Decoded_Message(Scene_Message {
-			scene_handle = message.scene_handle,
-			route_handle = get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
-			body = Stormancer_Rpc_Next_Body {
-				rpc_id         = 1,
-				result_is_nil  = true,
-				success        = true,
-				user_id        = user_id,
-				error_message  = "",
-				identity_count = 1,
-				steam_identity = steam_identity,
-				steam_id       = steam_id,
-				metadata_count = 0,
+		login_result := mpe_array(
+			{
+				mpe_nil(),
+				mpe_bool(true),
+				mpe_str(user_id),
+				mpe_str(""),
+				mpe_map({mpe_str("steam"), mpe_str(steam_identity)}),
+				mpe_byte(MP_EMPTY_MAP),
 			},
-		}))
-        append(&response_messages, Decoded_Message(Scene_Message {
-            scene_handle = message.scene_handle,
-            route_handle = get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
-            body = Stormancer_Rpc_Completed_Body {
-                rpc_id = 257,
-                message_sent = false,
-            },
-        }))
+		)
+		// "Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=1 [[nil, true, \"4168ffb24de245f88060d27c9580685e\", \"\", {\"steam\": \"steam:76561197977870267\"}, {}]]"
+		simple_append_rpc_response(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			login_result,
+		)
 	case Friends_Subscribe_Body:
 		simple_server_state.friends_subscribe = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:58.633021004Z line=  "sent_human_readable": "Scene_Message handle=142 route=5(Friends.Subscribe) rpc=1 []",
+		if notification_body := captured_friend_notification(g_simple_steam_friends_text, label, 0); notification_body != nil {
+			if notification_route := get_route_from_handle(
+				simple_server_state,
+				u64(message.scene_handle),
+				"friends.notification",
+			); notification_route != 0 {
+				append(
+					&response_messages,
+					simple_scene_message(message.scene_handle, notification_route, notification_body),
+				)
+			}
+		}
+		simple_append_rpc_complete(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			false,
+		)
 		simple_net_stub(label, "Scene_Message.Friends_Subscribe", verbose)
 	case Friends_UpdateFriendList_Body:
 		simple_server_state.friends_update_friend_list = body
@@ -752,14 +1085,43 @@ simple_dispatch_scene_message :: proc(
 	case Locator_GetSceneConnectionToken_Body:
 		simple_server_state.locator_get_scene_token = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:55.897566898Z line=  "sent_human_readable": "Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=2 [\"stormancer.friends\", \"\"] | Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=3 [\"stormancer.plugins.partyManagement\", \"\"] | Scene_Message handle=141 route=15(UserSession.UpdateUserOptions) rpc=4 [\"crossplay\", {\"enabled\": true}]",
+		suffix := scene_suffix_for_service(body.scene_type, body.scene_id)
+		simple_append_rpc_response(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			simple_scene_token_response_for_suffix(suffix),
+		)
 		simple_net_stub(label, "Scene_Message.Locator_GetSceneConnectionToken", verbose)
 	case Party_CreateInvitationCode_Body:
 		simple_server_state.party_create_invitation = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:05.82094369Z line=  "sent_human_readable": "Scene_Message handle=144 route=13(Party.CreateInvitationCode) rpc=4 []",
+		simple_append_rpc_response(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			mpe_str(invite_code_for_peer(simple_identity_label(simple_server_state, label))),
+		)
 		simple_net_stub(label, "Scene_Message.Party_CreateInvitationCode", verbose)
 	case Party_GetPartyState2_Body:
 		simple_server_state.party_get_party_state2 = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:03.832602873Z line=  "sent_human_readable": "Scene_Message handle=144 route=11(party.getpartystate2) rpc=1 [] | Scene_Message handle=144 route=3(stormancer.rpc.completed) rpc=512 [0]",
+		simple_append_rpc_response(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			party_state_response_learned(
+				party_scene_for_peer(simple_identity_label(simple_server_state, label)),
+				simple_identity_label(simple_server_state, label),
+				3,
+			),
+		)
 		simple_net_stub(label, "Scene_Message.Party_GetPartyState2", verbose)
 	case Party_MemberConnected_Body:
 		simple_server_state.party_member_connected = body
@@ -784,14 +1146,35 @@ simple_dispatch_scene_message :: proc(
 	case Party_UpdateGameFinderPlayerStatus_Body:
 		simple_server_state.party_update_gf_status = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:36.733189817Z line=  "sent_human_readable": "Scene_Message handle=146 route=9(party.updategamefinderplayerstatus) rpc=4 [[1, 5]]",
+		simple_append_rpc_complete(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			false,
+		)
 		simple_net_stub(label, "Scene_Message.Party_UpdateGameFinderPlayerStatus", verbose)
 	case Party_UpdatePartySettings_Body:
 		simple_server_state.party_update_settings = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:05.780613393Z line=  "sent_human_readable": "Scene_Message handle=144 route=6(Party.UpdatePartyUserData2) rpc=2 [json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", \"\", 0]]] | Scene_Message handle=144 route=4(party.updatepartysettings) rpc=3 [[\"matchmaking\", json:{\"InvitationCode\":\"\",\"GameMode\":0,\"GameDifficulty\":0,\"GameModifiers\":[],\"MergerDifficulty\":0}, true, true, \"\", \"\"]]",
+		simple_append_rpc_complete(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			false,
+		)
 		simple_net_stub(label, "Scene_Message.Party_UpdatePartySettings", verbose)
 	case Party_UpdatePartyUserData2_Body:
 		simple_server_state.party_update_user_data2 = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:05.780613393Z line=  "sent_human_readable": "Scene_Message handle=144 route=6(Party.UpdatePartyUserData2) rpc=2 [json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", \"\", 0]]] | Scene_Message handle=144 route=4(party.updatepartysettings) rpc=3 [[\"matchmaking\", json:{\"InvitationCode\":\"\",\"GameMode\":0,\"GameDifficulty\":0,\"GameModifiers\":[],\"MergerDifficulty\":0}, true, true, \"\", \"\"]]",
+		simple_append_rpc_complete(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			false,
+		)
 		simple_net_stub(label, "Scene_Message.Party_UpdatePartyUserData2", verbose)
 	case PartyManagement_CreateConnectionTokenFromInvitationCode_Body:
 		simple_server_state.party_conn_token_from_code = body
@@ -801,13 +1184,44 @@ simple_dispatch_scene_message :: proc(
 			"Scene_Message.PartyManagement_CreateConnectionTokenFromInvitationCode",
 			verbose,
 		)
+		simple_append_rpc_response(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			simple_scene_token_response_for_suffix(
+				simple_party_scene_for_invite(
+					body.invitation_code,
+					simple_identity_label(simple_server_state, label),
+				),
+			),
+		)
 	case PartyManagement_CreateSession_Body:
 		simple_server_state.party_create_session = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:58.819997978Z line=  "sent_human_readable": "Scene_Message handle=143 route=4(partymanagement.createsession) rpc=1 [[\"\", \"matchmaking\", \"\", {}, true, true, false, json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}]]",
+		simple_append_rpc_response(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			simple_scene_token_response_for_suffix(
+				party_scene_for_peer(simple_identity_label(simple_server_state, label)),
+			),
+		)
 		simple_net_stub(label, "Scene_Message.PartyManagement_CreateSession", verbose)
 	case PartyMerging_GetMergerStatus_Body:
 		simple_server_state.party_merging_status = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:04:11.383956296Z line=  "sent_human_readable": "Scene_Message handle=144 route=16(PartyMerging.GetMergerStatus) rpc=7 [\"default\"] | Scene_Message handle=144 route=4(party.updatepartysettings) rpc=8 [[\"matchmaking\", json:{\"InvitationCode\":\"448157\",\"GameMode\":0,\"GameDifficulty\":0,\"GameModifiers\":[],\"MergerDifficulty\":0}, true, true, \"\", \"\"]]",
+		simple_append_rpc_response(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			merger_status_raw(0),
+		)
 		simple_net_stub(label, "Scene_Message.PartyMerging_GetMergerStatus", verbose)
 	case Player_Update_Body:
 		simple_server_state.player_update = body
@@ -828,6 +1242,13 @@ simple_dispatch_scene_message :: proc(
 	case UserSession_UpdateUserOptions_Body:
 		simple_server_state.user_session_update_options = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:55.897566898Z line=  "sent_human_readable": "Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=2 [\"stormancer.friends\", \"\"] | Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=3 [\"stormancer.plugins.partyManagement\", \"\"] | Scene_Message handle=141 route=15(UserSession.UpdateUserOptions) rpc=4 [\"crossplay\", {\"enabled\": true}]",
+		simple_append_rpc_complete(
+			&response_messages,
+			message.scene_handle,
+			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body.rpc_id,
+			false,
+		)
 		simple_net_stub(label, "Scene_Message.UserSession_UpdateUserOptions", verbose)
 	}
 	return
