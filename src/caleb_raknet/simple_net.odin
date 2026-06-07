@@ -20,6 +20,7 @@ import "core:time"
 SIMPLE_DEFAULT_RAKNET_ENDPOINT :: "10.1.1.129:30100"
 SIMPLE_DEFAULT_DTLIVE_PORT :: 8080
 SIMPLE_DEFAULT_PREDICT_FILE :: "/tmp/pdlog/probe/simple_predict.json"
+SIMPLE_DEFAULT_RELAY_PREDICT_FILE :: "/tmp/pdlog/probe/simple_relay_predict.json"
 SIMPLE_POLL_TIMEOUT_MS :: 1000
 SIMPLE_MAX_RESPONSES :: 12
 
@@ -102,6 +103,14 @@ Simple_Cross_Message :: struct {
 	msg:    Decoded_Message,
 }
 
+Simple_Relay_Shadow :: struct {
+	enabled:  bool,
+	out_path: string,
+	log:      strings.Builder,
+	peers:    [dynamic]^Peer_State,
+	nidx:     int,
+}
+
 client_list: map[net.Endpoint]int
 g_server_state: [dynamic]Simple_Server_State
 g_simple_scene_infos: Predict_Caleb_Scene_Infos
@@ -116,7 +125,7 @@ g_simple_steam_lobby_by_invite: map[string]u64
 g_simple_latest_party_steam_lobby_id: u64
 g_simple_cross_messages: [dynamic]Simple_Cross_Message
 g_simple_party_join_announced: map[string]bool
-	g_simple_party_join_ready_announced: map[string]bool
+g_simple_party_join_ready_announced: map[string]bool
 
 simple_net :: proc(
 	dgrams: ^UDP_Datagram_Store,
@@ -319,7 +328,16 @@ simple_handle_udp_datagram :: proc(
 	if len(response_messages) > 0 {
 		live_send_decoded_messages(sock, wire, remote, response_messages[:], scratch)
 	}
-	simple_net_flush_cross_messages(sock, wire, scratch)
+	simple_net_flush_cross_messages(
+		sock,
+		wire,
+		live_peers,
+		peers,
+		nidx,
+		simple_predict_log,
+		simple_predict_path,
+		scratch,
+	)
 
 	if verbose && env_truthy("SIMPLE_NET_TRACE_COUNTS") {
 		fmt.printfln(
@@ -339,6 +357,11 @@ simple_queue_cross_message :: proc(remote: net.Endpoint, msg: Decoded_Message) {
 simple_net_flush_cross_messages :: proc(
 	sock: net.UDP_Socket,
 	wire: ^World,
+	live_peers: ^[dynamic]Live_Peer_Wire,
+	peers: ^[dynamic]^Peer_State,
+	nidx: ^int,
+	simple_predict_log: ^strings.Builder,
+	simple_predict_path: string,
 	scratch: mem.Allocator,
 ) {
 	if g_simple_cross_messages == nil || len(g_simple_cross_messages) == 0 do return
@@ -359,10 +382,128 @@ simple_net_flush_cross_messages :: proc(
 			flushed[j] = true
 		}
 		if env_truthy("SIMPLE_NET_VERBOSE") do fmt.printfln("simple cross flush -> %v msgs=%d", remote, len(msgs))
+		if label, ok := simple_live_label_for_remote(live_peers^[:], remote); ok {
+			peer_state := find_peer(peers, label, nidx)
+			simple_net_write_live_record(
+				simple_predict_log,
+				simple_predict_path,
+				&peer_state.reg_real,
+				peer_state.ep_client,
+				peer_state.ep_real,
+				label,
+				{},
+				{},
+				msgs[:],
+				scratch,
+			)
+		}
 		live_send_decoded_messages(sock, wire, remote, msgs[:], scratch)
 	}
 	clear(&g_simple_cross_messages)
 	for cross in kept do append(&g_simple_cross_messages, cross)
+}
+
+simple_live_label_for_remote :: proc(peers: []Live_Peer_Wire, remote: net.Endpoint) -> (string, bool) {
+	for peer in peers {
+		if peer.remote == remote do return peer.label, true
+	}
+	return "", false
+}
+
+simple_relay_shadow_step :: proc(
+	shadow: ^Simple_Relay_Shadow,
+	clients: []Relay_Client,
+	label: string,
+	remote: net.Endpoint,
+	sent_msgs: [][]byte,
+	allocator := context.allocator,
+) {
+	if shadow == nil || !shadow.enabled || len(sent_msgs) == 0 do return
+	client_id, _ := simple_net_client_id(remote)
+	peer_state := find_peer(&shadow.peers, label, &shadow.nidx)
+	simple_server_state := &g_server_state[client_id]
+
+	decoded_messages := make([dynamic]Decoded_Message, allocator)
+	response_messages := make([dynamic]Decoded_Message, allocator)
+
+	for msg in sent_msgs {
+		decoded := decode_message(msg, allocator)
+		route_registry_observe(&peer_state.reg_real, peer_state.ep_client, decoded)
+		if sm, ok := decoded.(Scene_Message); ok {
+			route_name := route_registry_resolve(
+				&peer_state.reg_real,
+				peer_state.ep_client,
+				sm.scene_handle,
+				sm.route_handle,
+			)
+			decoded = scene_message_with_route_body(decoded, route_name, allocator)
+		}
+		append(&decoded_messages, decoded)
+	}
+
+	for decoded in decoded_messages {
+		partial_response_messages := get_response_from_request(
+			client_id,
+			label,
+			decoded,
+			false,
+			simple_server_state,
+		) or_continue
+		for response_message in partial_response_messages do append(&response_messages, response_message)
+	}
+
+	for response_message in response_messages {
+		route_registry_observe(&peer_state.reg_real, peer_state.ep_real, response_message, allocator)
+	}
+	if len(decoded_messages) > 0 || len(response_messages) > 0 {
+		simple_net_write_live_record(
+			&shadow.log,
+			shadow.out_path,
+			&peer_state.reg_real,
+			peer_state.ep_client,
+			peer_state.ep_real,
+			label,
+			sent_msgs,
+			decoded_messages[:],
+			response_messages[:],
+			allocator,
+		)
+	}
+	simple_relay_shadow_flush_cross(shadow, clients, allocator)
+}
+
+simple_relay_shadow_flush_cross :: proc(
+	shadow: ^Simple_Relay_Shadow,
+	clients: []Relay_Client,
+	allocator := context.allocator,
+) {
+	if shadow == nil || !shadow.enabled || g_simple_cross_messages == nil || len(g_simple_cross_messages) == 0 do return
+	for cross in g_simple_cross_messages {
+		label, ok := simple_relay_label_for_remote(clients, cross.remote)
+		if !ok do continue
+		peer_state := find_peer(&shadow.peers, label, &shadow.nidx)
+		msgs := [?]Decoded_Message{cross.msg}
+		simple_net_write_live_record(
+			&shadow.log,
+			shadow.out_path,
+			&peer_state.reg_real,
+			peer_state.ep_client,
+			peer_state.ep_real,
+			label,
+			{},
+			{},
+			msgs[:],
+			allocator,
+		)
+	}
+	clear(&g_simple_cross_messages)
+}
+
+simple_relay_label_for_remote :: proc(clients: []Relay_Client, remote: net.Endpoint) -> (string, bool) {
+	for client in clients {
+		if client.client == remote do return client.peer, true
+	}
+	return "", false
 }
 
 simple_net_write_live_record :: proc(

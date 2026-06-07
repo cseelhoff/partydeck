@@ -421,6 +421,9 @@ scene_message_with_route_body :: proc(
 	allocator := context.allocator,
 ) -> Decoded_Message {
 	if sm, ok := message.(Scene_Message); ok {
+		if len(sm.raw_body) == 0 {
+			if _, is_raw := sm.body.(Scene_Raw_Body); !is_raw do return sm
+		}
 		sm.body = parse_scene_message_body(route_name, sm.raw_body, sm.decoded, allocator)
 		return sm
 	}

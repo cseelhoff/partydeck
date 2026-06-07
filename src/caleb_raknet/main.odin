@@ -265,6 +265,16 @@ net_relay_listen :: proc(
 
 	live: Predict_Caleb_Live
 	predict_caleb_live_init(&live, predict_scratch, write_scratch) or_return
+	simple_shadow := Simple_Relay_Shadow{enabled = env_truthy("SIMPLE_RELAY_PREDICT")}
+	if simple_shadow.enabled {
+		simple_shadow.out_path = env_string("SIMPLE_RELAY_PREDICT_FILE", SIMPLE_DEFAULT_RELAY_PREDICT_FILE, write_scratch)
+		simple_shadow.log = strings.builder_make()
+		simple_shadow.nidx = 1
+		simple_net_globals_init()
+		simple_scene_infos_load(predict_scratch) or_return
+		sync_write_out(simple_shadow.out_path, "")
+		defer strings.builder_destroy(&simple_shadow.log)
+	}
 
 	upstream_text := env_string("RAKNET_RELAY_UPSTREAM", DEFAULT_RELAY_UPSTREAM)
 	upstream := net.resolve_ip4(upstream_text) or_return
@@ -301,6 +311,7 @@ net_relay_listen :: proc(
 		relay_gate_ms,
 		relay_gate_ms > 0 ? "on" : "off",
 	)
+	if simple_shadow.enabled do fmt.printfln("simple relay shadow predict -> %s", simple_shadow.out_path)
 
 	buf: [MAX_UDP_SIZE]byte
 	polls: [128]posix.pollfd
@@ -322,6 +333,7 @@ net_relay_listen :: proc(
 				msgs,
 				reasm,
 				&live,
+				&simple_shadow,
 				predict_out_path,
 				capture,
 				log_scratch,
@@ -361,8 +373,10 @@ net_relay_listen :: proc(
 			for i in 0 ..< len(clients) {
 				if relay_release_due(
 					&clients[i],
+					clients[:],
 					now_tick,
 					&live,
+					&simple_shadow,
 					upstream,
 					dgrams,
 					msgs,
@@ -432,6 +446,7 @@ net_relay_listen :: proc(
 				msgs,
 				reasm,
 				&live,
+				&simple_shadow,
 				predict_out_path,
 				capture,
 				log_scratch,
@@ -516,6 +531,7 @@ relay_handle_c2s :: proc(
 	msgs: ^RakNet_Message_Store,
 	reasm: ^Reassembly,
 	live: ^Predict_Caleb_Live,
+	simple_shadow: ^Simple_Relay_Shadow,
 	predict_out_path: string,
 	capture: ^os.File,
 	log_scratch: mem.Allocator,
@@ -549,6 +565,7 @@ relay_handle_c2s :: proc(
 		)
 		if len(sent_msgs) == 0 do return false
 		predict_caleb_step(live, client.peer, client.client, sent_msgs)
+		simple_relay_shadow_step(simple_shadow, clients^[:], client.peer, client.client, sent_msgs, predict_scratch)
 		return true
 	}
 
@@ -595,8 +612,10 @@ relay_handle_c2s :: proc(
 // datagram was released. Health-only datagrams are forwarded but produce no record.
 relay_release_due :: proc(
 	client: ^Relay_Client,
+	clients: []Relay_Client,
 	now_tick: i64,
 	live: ^Predict_Caleb_Live,
+	simple_shadow: ^Simple_Relay_Shadow,
 	upstream: net.Endpoint,
 	dgrams: ^UDP_Datagram_Store,
 	msgs: ^RakNet_Message_Store,
@@ -627,6 +646,7 @@ relay_release_due :: proc(
 				process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
 			}
 			predict_caleb_step(live, client.peer, client.client, sent_msgs)
+			simple_relay_shadow_step(simple_shadow, clients, client.peer, client.client, sent_msgs, predict_scratch)
 		}
 		delete(held.data)
 		released = true

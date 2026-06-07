@@ -793,6 +793,17 @@ simple_party_member_data_updated_from_state :: proc(
 	}
 }
 
+simple_member_data_join_tail :: proc(allocator := context.allocator) -> []Party_MemberData_Tail_Value {
+	values := make([dynamic]Party_MemberData_Tail_Value, allocator)
+	code := "6561198839422336"
+	for ch in transmute([]byte)code {
+		append(&values, Party_MemberData_Tail_Value{kind = .Uint, uint_value = u64(ch)})
+	}
+	append(&values, Party_MemberData_Tail_Value{kind = .Str, text = ""})
+	append(&values, Party_MemberData_Tail_Value{kind = .Uint, uint_value = 0})
+	return values[:]
+}
+
 simple_member_data_zero_tail :: proc(count: int, allocator := context.allocator) -> []Party_MemberData_Tail_Value {
 	values := make([dynamic]Party_MemberData_Tail_Value, allocator)
 	for _ in 0 ..< count do append(&values, Party_MemberData_Tail_Value{kind = .Uint, uint_value = 0})
@@ -924,9 +935,25 @@ simple_party_member_connected_sample_body :: proc(
 		allocator,
 	)
 	if !ok || len(body) < 2 do return nil, false
-	body[0] = u8(rpc_id)
-	body[1] = u8(rpc_id >> 8)
-	return body, true
+	decoded := decode_scene_body(body, allocator)
+	sample_connected := parse_party_member_connected_body(decoded, allocator)
+	version := scene_root_uint(decoded, 0)
+	if version == 0 do version = 8
+	connected := simple_party_member_connected_body_version(rpc_id, version, simple_server_state, true, allocator)
+	if len(sample_connected.member.session_token) > 0 {
+		connected.member.session_token = sample_connected.member.session_token
+	}
+	dynamic_body := encode_party_member_connected_body(
+		connected,
+		allocator,
+	)
+	if len(decoded.raw_tail) > 0 {
+		out := make([dynamic]byte, allocator)
+		append(&out, ..dynamic_body)
+		append(&out, ..decoded.raw_tail)
+		return out[:], true
+	}
+	return dynamic_body, true
 }
 
 simple_party_join_announce_key :: proc(
@@ -944,30 +971,15 @@ simple_queue_owner_party_join_messages :: proc(
 ) {
 	if owner_state == nil || joiner_state == nil || owner_state.remote.port == 0 do return
 	owner_party_scene, _ := simple_scene_from_handle(owner_state, owner_party_handle)
-	member_connected_body := simple_party_member_connected_body_version(10, 8, joiner_state, true)
-	member_connected_raw, member_connected_raw_ok := simple_party_member_connected_sample_body(10, joiner_state)
+	member_connected_body := simple_party_member_connected_body_version(9, 8, joiner_state, true)
+	member_connected_raw, member_connected_raw_ok := simple_party_member_connected_sample_body(9, joiner_state)
+	joiner_member_update := simple_party_member_data_updated_body_with_lobby_state(11, 9, joiner_state, true, 1, 18)
 	simple_queue_cross_message(
 		owner_state.remote,
 		Scene_Message{
 			scene_handle = u8(owner_party_handle),
 			route_handle = get_route_num_from_handle(owner_state, owner_party_handle, "party.memberDataUpdated"),
-			body = simple_party_member_data_updated_body_with_lobby_state(12, 9, joiner_state, true, 1, 0),
-		},
-	)
-	simple_queue_cross_message(
-		owner_state.remote,
-		Scene_Message{
-			scene_handle = u8(owner_party_handle),
-			route_handle = get_route_num_from_handle(owner_state, owner_party_handle, "party.memberDataUpdated"),
-			body = simple_party_member_data_updated_body_with_lobby_state(20, 13, joiner_state, true, 2, 18),
-		},
-	)
-	simple_queue_cross_message(
-		owner_state.remote,
-		Scene_Message{
-			scene_handle = u8(owner_party_handle),
-			route_handle = get_route_num_from_handle(owner_state, owner_party_handle, "party.memberDataUpdated"),
-			body = simple_party_member_data_updated_body_with_lobby_state(22, 14, owner_state, true, 2, 22),
+			body = joiner_member_update,
 		},
 	)
 	if member_connected_raw_ok {
@@ -1025,7 +1037,7 @@ simple_queue_owner_party_join_ready_messages :: proc(joiner_state: ^Simple_Serve
 	if !owner_ok || owner_state.remote.port == 0 do return false
 	owner_party_handle, owner_party_ok := simple_first_party_scene_handle(owner_state)
 	if !owner_party_ok do return false
-	simple_queue_owner_party_join_messages(owner_state, joiner_state, owner_party_handle, true)
+	simple_queue_owner_party_join_messages(owner_state, joiner_state, owner_party_handle, false)
 	if g_simple_party_join_ready_announced != nil do g_simple_party_join_ready_announced[ready_key] = true
 	return true
 }
