@@ -19,6 +19,7 @@ Stormancer_Rpc_Next_Kind :: enum u8 {
 	Unknown,
 	Authentication_Login_Result,
 	Scene_Connection_Token,
+	GameSession_P2PToken_Result,
 }
 
 Stormancer_Rpc_Next_Body :: struct {
@@ -181,10 +182,9 @@ Party_MemberData_Tail_Value :: struct {
 }
 
 Party_MemberConnected_Body :: struct {
-	rpc_id:   u16,
-	version:  u64,
-	member:   Scene_Party_Member_Connected,
-	raw_tail: []byte,
+	rpc_id:  u16,
+	version: u64,
+	member:  Scene_Party_Member_Connected,
 }
 
 Party_MemberDataUpdated_Body :: struct {
@@ -530,7 +530,6 @@ parse_party_member_connected_body :: proc(
 		rpc_id = body.rpc_id,
 		version = scene_root_uint(body, 0),
 		member = scene_parse_party_member_connected(nodes, scene_seq_root(body, 1), allocator),
-		raw_tail = body.raw_tail,
 	}
 }
 

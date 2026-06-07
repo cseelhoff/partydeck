@@ -419,6 +419,16 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message, ro
 	case Scene_Message:
 		fmt.sbprintf(sb, "Scene_Message handle=%d route=%d", f.scene_handle, f.route_handle)
 		if route_name != "" do fmt.sbprintf(sb, "(%s)", route_name)
+		if strings.contains(route_name, "party.memberConnected") {
+			if body, ok := f.body.(Party_MemberConnected_Body); ok {
+				strings.write_byte(sb, ' ')
+				write_party_member_connected_body(sb, body)
+				return
+			}
+			strings.write_byte(sb, ' ')
+			write_party_member_connected_body(sb, parse_party_member_connected_body(f.decoded, context.temp_allocator))
+			return
+		}
 		if route_name == "party.memberDataUpdated" {
 			if body, ok := f.body.(Party_MemberDataUpdated_Body); ok {
 				strings.write_byte(sb, ' ')
@@ -444,6 +454,23 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message, ro
 	case:
 		fmt.sbprintf(sb, "nil")
 	}
+}
+
+write_party_member_connected_body :: proc(sb: ^strings.Builder, body: Party_MemberConnected_Body) {
+	fmt.sbprintf(sb, "rpc=%d [%d, ", body.rpc_id, body.version)
+	write_party_connected_member(sb, body.member)
+	strings.write_byte(sb, ']')
+}
+
+write_party_connected_member :: proc(sb: ^strings.Builder, member: Scene_Party_Member_Connected) {
+	strings.write_byte(sb, '[')
+	fmt.sbprintf(sb, "%q, %d, ", member.user_id, member.connection_state)
+	write_scene_string(sb, member.userdata_json)
+	strings.write_string(sb, ", ")
+	write_scene_bin(sb, member.session_token)
+	strings.write_string(sb, ", ")
+	write_scene_platforms(sb, member.platforms)
+	fmt.sbprintf(sb, ", %d]", member.state)
 }
 
 write_party_member_data_updated_body :: proc(sb: ^strings.Builder, body: Party_MemberDataUpdated_Body) {

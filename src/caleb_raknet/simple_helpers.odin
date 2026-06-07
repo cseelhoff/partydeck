@@ -39,6 +39,41 @@ simple_first_party_scene_handle :: proc(simple_server_state: ^Simple_Server_Stat
 	return 0, false
 }
 
+simple_joined_party_scene_handle :: proc(simple_server_state: ^Simple_Server_State) -> (u64, bool) {
+	first_handle, first_ok := simple_first_party_scene_handle(simple_server_state)
+	for scene, scene_index in simple_server_state.scenes {
+		handle := u64(scene_index + SCENE_HANDLE_MIN)
+		if simple_scene_is_party(scene) && (!first_ok || handle != first_handle) do return handle, true
+	}
+	return 0, false
+}
+
+simple_initial_matchmaking_scene_handle :: proc(simple_server_state: ^Simple_Server_State) -> (u64, bool) {
+	first_party_handle, first_party_ok := simple_first_party_scene_handle(simple_server_state)
+	for scene, scene_index in simple_server_state.scenes {
+		handle := u64(scene_index + SCENE_HANDLE_MIN)
+		if scene_suffix(scene.scene_id) == "matchmaking" && (!first_party_ok || handle > first_party_handle) do return handle, true
+	}
+	return 0, false
+}
+
+simple_joined_matchmaking_scene_handle :: proc(simple_server_state: ^Simple_Server_State) -> (u64, bool) {
+	joined_party_handle, joined_party_ok := simple_joined_party_scene_handle(simple_server_state)
+	for scene, scene_index in simple_server_state.scenes {
+		handle := u64(scene_index + SCENE_HANDLE_MIN)
+		if scene_suffix(scene.scene_id) == "matchmaking" && (!joined_party_ok || handle > joined_party_handle) do return handle, true
+	}
+	return 0, false
+}
+
+simple_gamesession_scene_handle :: proc(simple_server_state: ^Simple_Server_State) -> (u64, bool) {
+	for scene, scene_index in simple_server_state.scenes {
+		suffix := scene_suffix(scene.scene_id)
+		if looks_uuid(suffix) || strings.has_prefix(suffix, "gamesession") do return u64(scene_index + SCENE_HANDLE_MIN), true
+	}
+	return 0, false
+}
+
 simple_scene_client_route_name :: proc(scene: Simple_Scene, route_handle: u16) -> string {
 	routes := simple_scene_client_routes(scene_suffix(scene.scene_id))
 	if route_handle >= u16(len(routes)) do return ""
@@ -109,6 +144,25 @@ simple_scene_client_routes :: proc(scene_id: string) -> Routes {
 			"stormancer.rpc.completed",
 			"gamefinder.cancel",
 			"GameFinder.GetPublicStatus",
+		}
+	}
+	if looks_uuid(scene_id) || strings.has_prefix(scene_id, "gamesession") {
+		return Routes{
+			"stormancer.rpc.next",
+			"stormancer.rpc.cancel",
+			"stormancer.rpc.error",
+			"stormancer.rpc.completed",
+			"player.ready",
+			"player.faulted",
+			"DtGameSession.GetConnectionInfosForPlayer",
+			"gamesession.postresults",
+			"GameSession.GetP2PToken",
+			"gamesession.reset",
+			"gamesession.updateshutdownmode",
+			"gamesession.getgamesessionsettings",
+			"GameSession.GetGameSessionConnectionUrl",
+			"GameSession.GetTeams",
+			"GameSession.CreateP2PToken",
 		}
 	}
 	if len(scene_id) >= 6 && scene_id[:6] == "party-" {
@@ -205,6 +259,186 @@ simple_party_state_response :: proc(
 	}
 }
 
+simple_joined_party_state_response :: proc(
+	rpc_id: u16,
+	simple_server_state: ^Simple_Server_State,
+	scene: Simple_Scene,
+	allocator := context.allocator,
+) -> Party_State_Response_Body {
+	invitation_code := simple_server_state.party_conn_token_from_code.invitation_code
+	custom_data_json := ""
+	if invitation_code != "" do custom_data_json = simple_party_settings_custom_json(invitation_code, allocator)
+
+	owner_id := ""
+	if invitation_code != "" && g_simple_party_owner_by_invite != nil {
+		if known_owner, ok := g_simple_party_owner_by_invite[invitation_code]; ok do owner_id = known_owner
+	}
+	if owner_id == "" && g_simple_state_by_user_id != nil {
+		for known_user_id, _ in g_simple_state_by_user_id {
+			if known_user_id != simple_server_state.user_id {
+				owner_id = known_user_id
+				break
+			}
+		}
+	}
+	if owner_id == "" do owner_id = simple_other_known_user_id(simple_server_state.user_id)
+	if owner_id == "" do owner_id = simple_server_state.user_id
+
+	members := make([dynamic]Party_State_Member, allocator)
+	owner_appended := false
+	if owner_id != "" && g_simple_state_by_user_id != nil {
+		if owner_state, ok := g_simple_state_by_user_id[owner_id]; ok {
+			append(&members, simple_party_member(owner_state, false, allocator))
+			owner_appended = true
+		}
+	}
+	if !owner_appended && owner_id != "" {
+		if owner_member, ok := simple_known_party_member(owner_id, true, allocator); ok {
+			append(&members, owner_member)
+			owner_appended = true
+		}
+	}
+	if simple_server_state.user_id != owner_id do append(&members, simple_party_member(simple_server_state, false, allocator))
+	if len(members) == 0 do append(&members, simple_party_member(simple_server_state, false, allocator))
+
+	party_id := scene_suffix(scene.scene_id)
+	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
+	return Party_State_Response_Body {
+		rpc_id = rpc_id,
+		settings = Scene_Party_Settings {
+			game_finder = "matchmaking",
+			custom_data_json = custom_data_json,
+			revision = 5,
+			only_leader_invite = false,
+			is_joinable = true,
+			public_data = "",
+			party_id = party_id,
+		},
+		leader_user_id = owner_id,
+		members = members[:],
+		revision = 8,
+	}
+}
+
+simple_other_known_user_id :: proc(user_id: string) -> string {
+	if g_simple_state_by_user_id != nil {
+		known := make([dynamic]string, context.temp_allocator)
+		for known_user_id, _ in g_simple_state_by_user_id {
+			if known_user_id != "" && known_user_id != user_id do append(&known, known_user_id)
+		}
+		simple_sort_strings(known[:])
+		if len(known) > 0 do return known[0]
+	}
+	if g_simple_user_ids_by_steam != nil {
+		known := make([dynamic]string, context.temp_allocator)
+		for _, known_user_id in g_simple_user_ids_by_steam {
+			if known_user_id != "" && known_user_id != user_id do append(&known, known_user_id)
+		}
+		simple_sort_strings(known[:])
+		if len(known) > 0 do return known[0]
+	}
+	return ""
+}
+
+simple_known_party_member :: proc(
+	user_id: string,
+	initialized: bool,
+	allocator := context.allocator,
+) -> (Party_State_Member, bool) {
+	return simple_known_party_member_with_lobby_state(user_id, initialized, 1, allocator)
+}
+
+simple_known_party_member_with_lobby_state :: proc(
+	user_id: string,
+	initialized: bool,
+	lobby_state: int,
+	allocator := context.allocator,
+) -> (Party_State_Member, bool) {
+	steam_id := simple_steam_id_for_user_id(user_id)
+	if steam_id == "" do return {}, false
+	userdata_json := simple_party_userdata_json_for_steam_lobby_state(steam_id, initialized, lobby_state, allocator)
+	platforms := make([dynamic]Scene_Platform_Identity, allocator)
+	append(&platforms, Scene_Platform_Identity {
+		provider = "steam",
+		user_id = user_id,
+		visibility = "anonymous",
+		platform_id = steam_id,
+		extra = "",
+		extra_is_nil = true,
+		flags = 0,
+	})
+	session_token := simple_party_session_token_for_steam(steam_id, allocator)
+	return Party_State_Member {
+		user_id = user_id,
+		connection_state = 0,
+		userdata_json = userdata_json,
+		userdata = parse_party_member_userdata(userdata_json),
+		session_token_hex = string(hex.encode(session_token, allocator)),
+		platforms = platforms[:],
+		state = 2,
+	}, true
+}
+
+simple_steam_id_for_user_id :: proc(user_id: string) -> string {
+	if g_simple_user_ids_by_steam != nil {
+		for steam_id, known_user_id in g_simple_user_ids_by_steam {
+			if known_user_id == user_id do return steam_id
+		}
+	}
+	return ""
+}
+
+simple_party_session_token_for_steam :: proc(steam_id: string, allocator := context.allocator) -> []byte {
+	out := make([]byte, 16, allocator)
+	seed: u8 = 0x11
+	if len(steam_id) > 0 do seed = steam_id[len(steam_id) - 1]
+	for i in 0 ..< len(out) do out[i] = seed + u8(i)
+	return out
+}
+
+simple_party_userdata_json_for_steam :: proc(
+	steam_id: string,
+	initialized: bool,
+	allocator := context.allocator,
+) -> string {
+	return simple_party_userdata_json_for_steam_lobby_state(steam_id, initialized, 1, allocator)
+}
+
+simple_party_userdata_json_for_steam_lobby_state :: proc(
+	steam_id: string,
+	initialized: bool,
+	lobby_state: int,
+	allocator := context.allocator,
+) -> string {
+	hero := 1
+	player_name := simple_friend_pseudo(steam_id)
+	unlocked_hero_flag := simple_unlocked_hero_flag(steam_id)
+	eos_user_id := simple_eos_user_id(steam_id)
+	hero_text := fmt.aprintf("%d", hero, allocator = allocator)
+	flag_text := fmt.aprintf("%d", unlocked_hero_flag, allocator = allocator)
+	lobby_state_text := fmt.aprintf("%d", lobby_state, allocator = allocator)
+	return strings.concatenate(
+		{
+			`{"RequestedHero":`,
+			hero_text,
+			`,"RequestedSkin":0,"InLobby":true,"PlayerName":"`,
+			player_name,
+			`","LobbyState":`,
+			lobby_state_text,
+			`,"UnlockedGameDifficulty":0,"MemberDataInitialized":`,
+			initialized ? "true" : "false",
+			`,"UnlockedHeroFlag":`,
+			flag_text,
+			`,"m_sEosUserId":"`,
+			eos_user_id,
+			`","m_sSteamUserId":`,
+			steam_id,
+			`,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`,
+		},
+		allocator,
+	)
+}
+
 simple_party_settings_updated_snapshot :: proc(
 	rpc_id: u16,
 	version: u64,
@@ -263,6 +497,62 @@ simple_party_member_data_updated_body :: proc(
 			state = state_member.state,
 		},
 	}
+}
+
+simple_party_member_data_updated_body_with_lobby_state :: proc(
+	rpc_id: u16,
+	version: u64,
+	simple_server_state: ^Simple_Server_State,
+	initialized: bool,
+	lobby_state: int,
+	tail_zero_count: int,
+	allocator := context.allocator,
+) -> Party_MemberDataUpdated_Body {
+	state_member := simple_party_member(simple_server_state, true, allocator)
+	state_member.userdata_json = simple_party_userdata_json_with_lobby_state(simple_server_state, initialized, lobby_state, allocator)
+	state_member.userdata = parse_party_member_userdata(state_member.userdata_json)
+	return simple_party_member_data_updated_from_state(rpc_id, version, state_member, tail_zero_count, allocator)
+}
+
+simple_party_member_data_updated_body_for_user :: proc(
+	rpc_id: u16,
+	version: u64,
+	user_id: string,
+	initialized: bool,
+	lobby_state: int,
+	tail_zero_count: int,
+	allocator := context.allocator,
+) -> Party_MemberDataUpdated_Body {
+	member, ok := simple_known_party_member_with_lobby_state(user_id, initialized, lobby_state, allocator)
+	if !ok do return Party_MemberDataUpdated_Body{rpc_id = rpc_id, version = version}
+	return simple_party_member_data_updated_from_state(rpc_id, version, member, tail_zero_count, allocator)
+}
+
+simple_party_member_data_updated_from_state :: proc(
+	rpc_id: u16,
+	version: u64,
+	state_member: Party_State_Member,
+	tail_zero_count: int,
+	allocator := context.allocator,
+) -> Party_MemberDataUpdated_Body {
+	return Party_MemberDataUpdated_Body {
+		rpc_id = rpc_id,
+		version = version,
+		member = Scene_Party_Member_Data {
+			user_id = state_member.user_id,
+			userdata_json = state_member.userdata_json,
+			userdata = state_member.userdata,
+			platforms = state_member.platforms,
+			state = state_member.state,
+		},
+		tail_values = simple_member_data_zero_tail(tail_zero_count, allocator),
+	}
+}
+
+simple_member_data_zero_tail :: proc(count: int, allocator := context.allocator) -> []Party_MemberData_Tail_Value {
+	values := make([dynamic]Party_MemberData_Tail_Value, allocator)
+	for _ in 0 ..< count do append(&values, Party_MemberData_Tail_Value{kind = .Uint, uint_value = 0})
+	return values[:]
 }
 
 simple_party_settings_updated_body :: proc(
@@ -367,17 +657,101 @@ simple_party_member_connected_body :: proc(
 	}
 }
 
+simple_party_member_status_updated_body :: proc(
+	rpc_id: u16,
+	version: u64,
+	user_id: string,
+	status: u64,
+	allocator := context.allocator,
+) -> Party_MemberStatusUpdated_Body {
+	members := make([dynamic]Scene_Party_Member_Status, allocator)
+	append(&members, Scene_Party_Member_Status{user_id = user_id, status = status})
+	return Party_MemberStatusUpdated_Body{
+		rpc_id = rpc_id,
+		version = version,
+		members = members[:],
+	}
+}
+
+simple_party_member_status_pair_updated_body :: proc(
+	rpc_id: u16,
+	version: u64,
+	user_a: string,
+	status_a: u64,
+	user_b: string,
+	status_b: u64,
+	allocator := context.allocator,
+) -> Party_MemberStatusUpdated_Body {
+	members := make([dynamic]Scene_Party_Member_Status, allocator)
+	append(&members, Scene_Party_Member_Status{user_id = user_a, status = status_a})
+	append(&members, Scene_Party_Member_Status{user_id = user_b, status = status_b})
+	return Party_MemberStatusUpdated_Body{
+		rpc_id = rpc_id,
+		version = version,
+		members = members[:],
+	}
+}
+
+simple_party_member_status_known_members_body :: proc(
+	rpc_id: u16,
+	version: u64,
+	simple_server_state: ^Simple_Server_State,
+	status: u64,
+	allocator := context.allocator,
+) -> Party_MemberStatusUpdated_Body {
+	user_ids := make([dynamic]string, allocator)
+	if simple_server_state.user_id != "" do append(&user_ids, simple_server_state.user_id)
+	if g_simple_state_by_user_id != nil {
+		others := make([dynamic]string, allocator)
+		for user_id, _ in g_simple_state_by_user_id {
+			if user_id != "" && user_id != simple_server_state.user_id do append(&others, user_id)
+		}
+		simple_sort_strings(others[:])
+		for user_id in others do append(&user_ids, user_id)
+	}
+	if len(user_ids) < 2 && g_simple_user_ids_by_steam != nil {
+		fallback := make([dynamic]string, allocator)
+		for _, user_id in g_simple_user_ids_by_steam {
+			if user_id != "" && !simple_string_in_slice(user_id, user_ids[:]) do append(&fallback, user_id)
+		}
+		simple_sort_strings(fallback[:])
+		for user_id in fallback {
+			if !simple_string_in_slice(user_id, user_ids[:]) do append(&user_ids, user_id)
+		}
+	}
+
+	members := make([dynamic]Scene_Party_Member_Status, allocator)
+	for user_id in user_ids do append(&members, Scene_Party_Member_Status{user_id = user_id, status = status})
+	return Party_MemberStatusUpdated_Body{
+		rpc_id = rpc_id,
+		version = version,
+		members = members[:],
+	}
+}
+
+simple_string_in_slice :: proc(needle: string, values: []string) -> bool {
+	for value in values {
+		if value == needle do return true
+	}
+	return false
+}
+
 simple_party_session_token :: proc(simple_server_state: ^Simple_Server_State, allocator := context.allocator) -> []byte {
-	out := make([]byte, 16, allocator)
-	seed: u8 = 0x11
-	if len(simple_server_state.steam_id) > 0 do seed = simple_server_state.steam_id[len(simple_server_state.steam_id) - 1]
-	for i in 0 ..< len(out) do out[i] = seed + u8(i)
-	return out
+	return simple_party_session_token_for_steam(simple_server_state.steam_id, allocator)
 }
 
 simple_party_userdata_json :: proc(
 	simple_server_state: ^Simple_Server_State,
 	initialized: bool,
+	allocator := context.allocator,
+) -> string {
+	return simple_party_userdata_json_with_lobby_state(simple_server_state, initialized, 1, allocator)
+}
+
+simple_party_userdata_json_with_lobby_state :: proc(
+	simple_server_state: ^Simple_Server_State,
+	initialized: bool,
+	lobby_state: int,
 	allocator := context.allocator,
 ) -> string {
 	userdata := simple_server_state.party_create_session.userdata
@@ -391,13 +765,16 @@ simple_party_userdata_json :: proc(
 	if len(eos_user_id) == 0 do eos_user_id = simple_eos_user_id(simple_server_state.steam_id)
 	hero_text := fmt.aprintf("%d", hero, allocator = allocator)
 	flag_text := fmt.aprintf("%d", unlocked_hero_flag, allocator = allocator)
+	lobby_state_text := fmt.aprintf("%d", lobby_state, allocator = allocator)
 	return strings.concatenate(
 		{
 			`{"RequestedHero":`,
 			hero_text,
 			`,"RequestedSkin":0,"InLobby":true,"PlayerName":"`,
 			player_name,
-			`","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":`,
+			`","LobbyState":`,
+			lobby_state_text,
+			`,"UnlockedGameDifficulty":0,"MemberDataInitialized":`,
 			initialized ? "true" : "false",
 			`,"UnlockedHeroFlag":`,
 			flag_text,

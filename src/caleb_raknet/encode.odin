@@ -239,10 +239,16 @@ encode_scene_message_body :: proc(
 		return out[:]
 	case Stormancer_Rpc_Next_Body:
 		return encode_stormancer_rpc_next_body(b, allocator)
+	case Stormancer_Rpc_Error_Body:
+		return encode_stormancer_rpc_error_body(b, allocator)
 	case Party_CreateInvitationCode_Result_Body:
 		return encode_party_create_invitation_code_result_body(b, allocator)
 	case GameVersion_Update_Body:
 		return mpe_str(b.accepted_version, allocator)
+	case Gamefinder_Update_Body:
+		return encode_gamefinder_update_body(b, allocator)
+	case Player_Update_Body:
+		return encode_player_update_body(b, allocator)
 	case Friends_Notification_Body:
 		if len(b.friends) > 0 do return encode_friends_notification_body(b, allocator)
 	case Steam_CreateLobby_Body:
@@ -255,12 +261,61 @@ encode_scene_message_body :: proc(
 		return encode_party_settings_updated_body(b, allocator)
 	case Party_MemberDataUpdated_Body:
 		return encode_party_member_data_updated_body(b, allocator)
+	case Party_MemberStatusUpdated_Body:
+		return encode_party_member_status_updated_body(b, allocator)
 	case PartyMerging_GetMergerStatus_Result_Body:
 		return encode_party_merging_get_merger_status_result_body(b, allocator)
 	case Party_MemberConnected_Body:
 		return encode_party_member_connected_body(b, allocator)
 	}
 	return fallback_raw_body
+}
+
+encode_stormancer_rpc_error_body :: proc(body: Stormancer_Rpc_Error_Body, allocator := context.allocator) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	append(&out, ..mpe_str(body.message, allocator))
+	return out[:]
+}
+
+encode_gamefinder_update_body :: proc(body: Gamefinder_Update_Body, allocator := context.allocator) -> []byte {
+	out := make([dynamic]byte, allocator)
+	append(&out, ..mpe_uint(body.status, allocator))
+	if len(body.token_json) > 0 do append(&out, ..mpe_str(body.token_json, allocator))
+	return out[:]
+}
+
+encode_player_update_body :: proc(body: Player_Update_Body, allocator := context.allocator) -> []byte {
+	return mpe_array(
+		{
+			mpe_str(body.user_id, allocator),
+			mpe_uint(body.state, allocator),
+			mpe_str(body.data, allocator),
+			mpe_bool(body.ready, allocator),
+		},
+		allocator,
+	)
+}
+
+encode_party_member_status_updated_body :: proc(
+	body: Party_MemberStatusUpdated_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	append(&out, ..mpe_uint(body.version, allocator))
+	updates := make([dynamic][]byte, allocator)
+	for member in body.members {
+		append(
+			&updates,
+			mpe_array(
+				{mpe_str(member.user_id, allocator), mpe_uint(member.status, allocator)},
+				allocator,
+			),
+		)
+	}
+	append(&out, ..mpe_array({mpe_array(updates[:], allocator)}, allocator))
+	return out[:]
 }
 
 encode_party_merging_get_merger_status_result_body :: proc(
@@ -385,7 +440,6 @@ encode_party_member_connected_body :: proc(
 	write_u16_le(&out, body.rpc_id)
 	append(&out, ..mpe_uint(body.version, allocator))
 	append(&out, ..encode_party_connected_member(body.member, allocator))
-	append(&out, ..body.raw_tail)
 	return out[:]
 }
 
@@ -539,6 +593,14 @@ encode_stormancer_rpc_next_body :: proc(
 					identities,
 					mpe_byte(MP_EMPTY_MAP, allocator),
 				},
+				allocator,
+			),
+		)
+	case .GameSession_P2PToken_Result:
+		append(
+			&out,
+			..mpe_array(
+				{mpe_nil(allocator), mpe_bool(false, allocator), mpe_nil(allocator)},
 				allocator,
 			),
 		)

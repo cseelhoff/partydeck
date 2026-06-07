@@ -21,6 +21,7 @@ get_response_from_scene_message :: proc(
 	switch route {
 	case "stormancer.rpc.completed":
 		body := message.body.(Stormancer_Rpc_Completed_Body) or_return
+		party_handle, party_handle_ok := simple_first_party_scene_handle(simple_server_state)
 		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(1, true) {
 			append(
 				&response_messages,
@@ -28,6 +29,18 @@ get_response_from_scene_message :: proc(
 					scene_handle = message.scene_handle,
 					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberConnected"),
 					body = simple_party_member_connected_body(2, simple_server_state, false),
+				},
+			)
+		}
+		if simple_scene_is_party(scene) &&
+		   (!party_handle_ok || u64(message.scene_handle) != party_handle) &&
+		   body.rpc_id == stormancer_rpc_completed_id(8, true) {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberConnected"),
+					body = simple_party_member_connected_body(9, simple_server_state, true),
 				},
 			)
 		}
@@ -43,6 +56,102 @@ get_response_from_scene_message :: proc(
 					body = simple_party_member_connected_body(10, simple_server_state, true),
 				},
 			)
+		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(12, false) {
+			status_user_id := simple_other_known_user_id(simple_server_state.user_id)
+			if status_user_id == "" do status_user_id = simple_server_state.user_id
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberStatusUpdated"),
+					body = simple_party_member_status_updated_body(14, 10, status_user_id, 1),
+				},
+			)
+		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(13, false) {
+			status_user_id := simple_other_known_user_id(simple_server_state.user_id)
+			if status_user_id == "" do status_user_id = simple_server_state.user_id
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberStatusUpdated"),
+					body = simple_party_member_status_updated_body(15, 11, status_user_id, 1),
+				},
+			)
+		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(14, false) {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberStatusUpdated"),
+					body = simple_party_member_status_updated_body(16, 11, simple_server_state.user_id, 1),
+				},
+			)
+		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(15, false) {
+			if matchmaking_handle, ok := simple_joined_matchmaking_scene_handle(simple_server_state); ok {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(matchmaking_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, matchmaking_handle, "gamefinder.update"),
+						body = Gamefinder_Update_Body{status = 0},
+					},
+				)
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(matchmaking_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, matchmaking_handle, "gamefinder.update"),
+						body = Gamefinder_Update_Body{status = 3},
+					},
+				)
+			}
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberStatusUpdated"),
+					body = simple_party_member_status_known_members_body(17, 12, simple_server_state, 0),
+				},
+			)
+		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(16, false) {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.error"),
+					body = Stormancer_Rpc_Error_Body{rpc_id = 8, message = "Cannot update data when member is ready."},
+				},
+			)
+			if matchmaking_handle, ok := simple_initial_matchmaking_scene_handle(simple_server_state); ok {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(matchmaking_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, matchmaking_handle, "gamefinder.update"),
+						body = Gamefinder_Update_Body{status = 0},
+					},
+				)
+			}
+		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(20, false) {
+			update_user_id := simple_other_known_user_id(simple_server_state.user_id)
+			if update_user_id == "" do update_user_id = simple_server_state.user_id
+			if gamesession_handle, ok := simple_gamesession_scene_handle(simple_server_state); ok && len(update_user_id) > 0 {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(gamesession_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, gamesession_handle, "player.update"),
+						body = Player_Update_Body{user_id = update_user_id, state = 1},
+					},
+				)
+			}
 		}
 	case "stormancer.rpc.next":
 // 	"sent_human_readable": "Scene_Message handle=144 route=0(stormancer.rpc.next) rpc=1 [[true, \"\", \"\", 109775243056466233]]",
@@ -90,6 +199,7 @@ get_response_from_scene_message :: proc(
         if len(simple_server_state.user_id) == 0 {
             simple_server_state.user_id = fmt.aprintf("%032s", simple_server_state.steam_id)
         }
+		if g_simple_state_by_user_id != nil do g_simple_state_by_user_id[simple_server_state.user_id] = simple_server_state
 		steam_identity := fmt.aprintf("steam:%s", simple_server_state.steam_id)
 		append(
             &response_messages,
@@ -224,6 +334,7 @@ get_response_from_scene_message :: proc(
 	case "Party.UpdatePartyUserData2":
 		body := message.body.(Party_UpdatePartyUserData2_Body) or_return
 		simple_server_state.party_update_user_data2 = body
+		if body.rpc_id == 8 && simple_server_state.party_update_gf_status.rpc_id == 7 do break
 		append(
 			&response_messages,
 			Scene_Message{
@@ -241,6 +352,7 @@ get_response_from_scene_message :: proc(
 		simple_server_state.party_update_settings = body
 		if invitation_code := json_string_value(body.custom_data_json, "InvitationCode"); invitation_code != "" {
 			if g_simple_party_scene_by_invite != nil do g_simple_party_scene_by_invite[invitation_code] = scene_suffix(scene.scene_id)
+			if g_simple_party_owner_by_invite != nil do g_simple_party_owner_by_invite[invitation_code] = simple_server_state.user_id
 			if g_simple_steam_lobby_by_invite != nil && simple_server_state.steam_lobby_id != 0 {
 				g_simple_steam_lobby_by_invite[invitation_code] = simple_server_state.steam_lobby_id
 			}
@@ -290,6 +402,57 @@ get_response_from_scene_message :: proc(
 			)
 		}
 		if emit_settings_updated do simple_server_state.scene_ready_args.scene_handle = 0
+
+	case "party.getpartystate2":
+		body := message.body.(Party_GetPartyState2_Body) or_return
+		if !simple_scene_is_party(scene) do break
+		party_handle, party_handle_ok := simple_first_party_scene_handle(simple_server_state)
+		if party_handle_ok && u64(message.scene_handle) == party_handle do break
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+				body = simple_joined_party_state_response(body.rpc_id, simple_server_state, scene),
+			},
+		)
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+				body = Stormancer_Rpc_Completed_Body{
+					rpc_id = stormancer_rpc_completed_id(body.rpc_id, true),
+					message_sent = true,
+				},
+			},
+		)
+
+	case "party.updategamefinderplayerstatus":
+		body := message.body.(Party_UpdateGameFinderPlayerStatus_Body) or_return
+		simple_server_state.party_update_gf_status = body
+		party_handle, party_handle_ok := simple_first_party_scene_handle(simple_server_state)
+		if !party_handle_ok || u64(message.scene_handle) != party_handle {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberStatusUpdated"),
+					body = simple_party_member_status_updated_body(13, 10, simple_server_state.user_id, body.status),
+				},
+			)
+		}
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+				body = Stormancer_Rpc_Completed_Body{
+					rpc_id = stormancer_rpc_completed_id(body.rpc_id, false),
+					message_sent = true,
+				},
+			},
+		)
 
 	case "PartyMerging.GetMergerStatus":
 		body := message.body.(PartyMerging_GetMergerStatus_Body) or_return
@@ -441,6 +604,55 @@ get_response_from_scene_message :: proc(
 				},
 			},
 		)
+	case "GameSession.GetP2PToken":
+		body := message.body.(GameSession_GetP2PToken_Body) or_return
+		simple_server_state.gamesession_get_p2p_token = body
+		owner_user_id := ""
+		if invitation_code := json_string_value(simple_server_state.party_update_settings.custom_data_json, "InvitationCode"); invitation_code != "" && g_simple_party_owner_by_invite != nil {
+			if known_owner, ok := g_simple_party_owner_by_invite[invitation_code]; ok do owner_user_id = known_owner
+		}
+		if owner_user_id == "" && simple_server_state.party_conn_token_from_code.invitation_code != "" && g_simple_party_owner_by_invite != nil {
+			if known_owner, ok := g_simple_party_owner_by_invite[simple_server_state.party_conn_token_from_code.invitation_code]; ok do owner_user_id = known_owner
+		}
+		if simple_server_state.party_conn_token_from_code.invitation_code != "" do break
+		if owner_user_id != "" && owner_user_id != simple_server_state.user_id do break
+		if simple_server_state.party_update_settings.rpc_id == 0 do break
+		if simple_server_state.user_id != "" {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "player.update"),
+					body = Player_Update_Body{user_id = simple_server_state.user_id, state = 1},
+				},
+			)
+		}
+		if other_user_id := simple_other_known_user_id(simple_server_state.user_id); other_user_id != "" {
+			other_state: u64 = 0
+			if g_simple_state_by_user_id != nil {
+				if other_simple_state, ok := g_simple_state_by_user_id[other_user_id]; ok && other_simple_state.game_session_ready {
+					other_state = 1
+				}
+			}
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "player.update"),
+					body = Player_Update_Body{user_id = other_user_id, state = other_state},
+				},
+			)
+		}
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+				body = Stormancer_Rpc_Next_Body{kind = .GameSession_P2PToken_Result, rpc_id = body.rpc_id},
+			},
+		)
+		simple_server_state.game_session_ready = true
+		if g_simple_state_by_user_id != nil && simple_server_state.user_id != "" do g_simple_state_by_user_id[simple_server_state.user_id] = simple_server_state
 	case "Friends.UpdateFriendList":
 		body := message.body.(Friends_UpdateFriendList_Body) or_return
 		simple_server_state.friends_update_friend_list = body

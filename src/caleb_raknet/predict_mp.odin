@@ -72,6 +72,31 @@ mpe_uint :: proc(n: u64, allocator := context.allocator) -> []byte {
 	return out[:]
 }
 
+mpe_int :: proc(n: i64, allocator := context.allocator) -> []byte {
+	if n >= 0 do return mpe_uint(u64(n), allocator)
+	out := make([dynamic]byte, allocator)
+	switch {
+	case n >= -32:
+		append(&out, byte(i8(n)))
+	case n >= -128:
+		append(&out, 0xd0, byte(i8(n)))
+	case n >= -32768:
+		v := u16(i16(n))
+		append(&out, 0xd1, byte(v >> 8), byte(v))
+	case n >= -2147483648:
+		v := u32(i32(n))
+		append(&out, 0xd2, byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v))
+	case:
+		v := u64(n)
+		append(
+			&out, 0xd3,
+			byte(v >> 56), byte(v >> 48), byte(v >> 40), byte(v >> 32),
+			byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v),
+		)
+	}
+	return out[:]
+}
+
 // bin8 / bin16 / bin32 (predict.py mp_bin).
 mpe_bin :: proc(data: []byte, allocator := context.allocator) -> []byte {
 	n := len(data)

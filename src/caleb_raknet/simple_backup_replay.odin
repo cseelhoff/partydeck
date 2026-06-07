@@ -44,6 +44,8 @@ simple_backup_replay :: proc(path: string, out_path := SIMPLE_DEFAULT_PREDICT_FI
 
 	simple_scene_infos_load(scratch) or_return
 	if g_simple_party_scene_by_invite == nil do g_simple_party_scene_by_invite = make(map[string]string, scratch)
+	if g_simple_party_owner_by_invite == nil do g_simple_party_owner_by_invite = make(map[string]string, scratch)
+	if g_simple_state_by_user_id == nil do g_simple_state_by_user_id = make(map[string]^Simple_Server_State, scratch)
 	if g_simple_steam_lobby_by_party_scene == nil do g_simple_steam_lobby_by_party_scene = make(map[string]u64, scratch)
 	if g_simple_steam_lobby_by_invite == nil do g_simple_steam_lobby_by_invite = make(map[string]u64, scratch)
 	g_simple_latest_party_steam_lobby_id = 0
@@ -82,6 +84,7 @@ simple_backup_replay :: proc(path: string, out_path := SIMPLE_DEFAULT_PREDICT_FI
 		pred_bytes := simple_backup_encode_generated(pred_generated[:], scratch)
 		pred_decoded := simple_backup_decode_for_sender(&ps.reg_pred, ps.ep_pred, pred_bytes, scratch)
 		real_decoded := simple_backup_decode_for_sender(&ps.reg_real, ps.ep_real, real_bytes, scratch)
+		real_human := render_decoded_burst(&ps.reg_real, ps.ep_real, real_decoded[:], scratch)
 		pred_human := render_decoded_burst(&ps.reg_pred, ps.ep_pred, pred_decoded[:], scratch)
 		match := decoded_messages_match(real_decoded[:], pred_decoded[:], scratch)
 		if match do match_count += 1
@@ -96,7 +99,7 @@ simple_backup_replay :: proc(path: string, out_path := SIMPLE_DEFAULT_PREDICT_FI
 			real_bytes,
 			pred_bytes,
 			rec.sent_human_readable,
-			rec.real_human_readable,
+			real_human,
 			pred_human,
 		)
 	}

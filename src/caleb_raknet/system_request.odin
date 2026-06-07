@@ -51,7 +51,10 @@ get_system_request_response :: proc(
 //   "real_human_readable": "Scene_Message handle=144 route=14(Steam.CreateLobby) rpc=1 [[1, 4, true, {\"partyDataToken\": b64:\"{\\\"PartyId\\\":\\\"5bbb3677-445a-42d1-a9a9-83094be3639a\\\",\\\"LeaderUserId\\\":\\\"4168ffb24de245f88060d27c9580685e\\\",\\\"LeaderSteamId\\\":76561197977870267}\"}]] | Response_Msg req=27 data=Bool_Result v=true | Response_Complete req=27 has_values=true | Scene_Message handle=144 route=7(party.settingsUpdated) rpc=3 [3, [\"matchmaking\", \"\", 1, false, true, {}, \"\", \"5bbb3677-445a-42d1-a9a9-83094be3639a\"]] | Scene_Message handle=144 route=3(party.memberDataUpdated) rpc=4 [4, [\"4168ffb24de245f88060d27c9580685e\", json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", \"\", 0]], 2], 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] | Scene_Message handle=144 route=7(party.settingsUpdated) rpc=5 [5, [\"matchmaking\", json:{\"InvitationCode\":\"\",\"GameMode\":0,\"GameDifficulty\":0,\"GameModifiers\":[],\"MergerDifficulty\":0}, 3, false, true, {}, \"\", \"5bbb3677-445a-42d1-a9a9-83094be3639a\"]] | Scene_Message handle=144 route=3(party.memberDataUpdated) rpc=6 [6, [\"4168ffb24de245f88060d27c9580685e\", json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":true,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", \"\", 0]], 2], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]",
 		scene, scene_ok := simple_scene_from_handle(simple_server_state, args.scene_handle)
 		party_handle, party_handle_ok := simple_first_party_scene_handle(simple_server_state)
+		joined_party_handle, joined_party_ok := simple_joined_party_scene_handle(simple_server_state)
 		is_matchmaking_ready := scene_ok && scene_suffix(scene.scene_id) == "matchmaking"
+		is_initial_matchmaking_ready := is_matchmaking_ready && party_handle_ok && args.scene_handle == party_handle + 1
+		is_joined_matchmaking_ready := is_matchmaking_ready && joined_party_ok && args.scene_handle > joined_party_handle
 		is_first_party_ready := scene_ok && simple_scene_is_party(scene) && party_handle_ok && args.scene_handle == party_handle
 		is_joined_party_ready := scene_ok && simple_scene_is_party(scene) && (!party_handle_ok || args.scene_handle != party_handle)
 		settings_update := simple_server_state.party_update_settings
@@ -100,7 +103,7 @@ get_system_request_response :: proc(
 				)
 			}
 		}
-		if is_matchmaking_ready && party_handle_ok && has_pending_settings_update {
+		if is_initial_matchmaking_ready && party_handle_ok && has_pending_settings_update {
 			simple_server_state.party_member_connected_after_settings_ack = client_id > 1
 			append(
 				&response_messages,
@@ -130,7 +133,7 @@ get_system_request_response :: proc(
 			simple_server_state.scene_ready_args.sent_game_version_update = true
 		}
 		append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
-		if is_matchmaking_ready && party_handle_ok && has_pending_settings_update {
+		if is_initial_matchmaking_ready && party_handle_ok && has_pending_settings_update {
 			append(
 				&response_messages,
 				Scene_Message{
@@ -155,6 +158,26 @@ get_system_request_response :: proc(
 					body = simple_party_member_data_updated_body(22, 14, simple_server_state, true),
 				},
 			)
+		}
+		if is_joined_matchmaking_ready && joined_party_ok {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = u8(joined_party_handle),
+					route_handle = get_route_num_from_handle(simple_server_state, joined_party_handle, "party.memberDataUpdated"),
+					body = simple_party_member_data_updated_body_with_lobby_state(19, 13, simple_server_state, true, 2, 18),
+				},
+			)
+			if other_id := simple_other_known_user_id(simple_server_state.user_id); other_id != "" {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(joined_party_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, joined_party_handle, "party.memberDataUpdated"),
+						body = simple_party_member_data_updated_body_for_user(21, 14, other_id, true, 2, 23),
+					},
+				)
+			}
 		}
 		if is_joined_party_ready {
 			append(
@@ -444,6 +467,17 @@ get_system_request_response :: proc(
 							"SteamParty.CreatePartyDataBearerToken",
 						},
 					},
+				},
+			)
+			append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
+		} else if looks_uuid(scene_id) || len(scene_id) >= 11 && scene_id[:11] == "gamesession" {
+			simple_server_state.get_scene_infos_args = args
+			infos_raw := scene_infos_for_token(args.token, g_simple_scene_infos)
+			append(
+				&response_messages,
+				Response_Msg{
+					req_id = message.req_id,
+					data = parse_response_data(decode_msgpack_field(infos_raw), context.temp_allocator),
 				},
 			)
 			append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
