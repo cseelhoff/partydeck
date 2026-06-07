@@ -102,6 +102,9 @@ g_simple_scene_infos: Predict_Caleb_Scene_Infos
 g_simple_steam_friends_text: string
 g_simple_user_ids_by_steam: map[string]string
 g_simple_party_scene_by_invite: map[string]string
+g_simple_steam_lobby_by_party_scene: map[string]u64
+g_simple_steam_lobby_by_invite: map[string]u64
+g_simple_latest_party_steam_lobby_id: u64
 
 simple_net :: proc(
 	dgrams: ^UDP_Datagram_Store,
@@ -292,6 +295,8 @@ simple_net_globals_init :: proc() {
 	if client_list == nil do client_list = make(map[net.Endpoint]int)
 	if g_server_state == nil do g_server_state = make([dynamic]Simple_Server_State)
 	if g_simple_party_scene_by_invite == nil do g_simple_party_scene_by_invite = make(map[string]string)
+	if g_simple_steam_lobby_by_party_scene == nil do g_simple_steam_lobby_by_party_scene = make(map[string]u64)
+	if g_simple_steam_lobby_by_invite == nil do g_simple_steam_lobby_by_invite = make(map[string]u64)
 	if len(g_server_state) == 0 do append(&g_server_state, Simple_Server_State{})
 }
 

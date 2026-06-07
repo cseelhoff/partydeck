@@ -52,9 +52,11 @@ get_system_request_response :: proc(
 		scene, scene_ok := simple_scene_from_handle(simple_server_state, args.scene_handle)
 		party_handle, party_handle_ok := simple_first_party_scene_handle(simple_server_state)
 		is_matchmaking_ready := scene_ok && scene_suffix(scene.scene_id) == "matchmaking"
+		is_first_party_ready := scene_ok && simple_scene_is_party(scene) && party_handle_ok && args.scene_handle == party_handle
+		is_joined_party_ready := scene_ok && simple_scene_is_party(scene) && (!party_handle_ok || args.scene_handle != party_handle)
 		settings_update := simple_server_state.party_update_settings
 		has_pending_settings_update := json_string_value(settings_update.custom_data_json, "InvitationCode") != ""
-		if scene_ok && simple_scene_is_party(scene) {
+		if is_first_party_ready {
 			append(
 				&response_messages,
 				Scene_Message{
@@ -69,6 +71,34 @@ get_system_request_response :: proc(
 					},
 				},
 			)
+		}
+		if is_joined_party_ready {
+			lobby_id: u64
+			party_scene := scene_suffix(scene.scene_id)
+			if g_simple_steam_lobby_by_party_scene != nil {
+				if known_lobby_id, ok := g_simple_steam_lobby_by_party_scene[party_scene]; ok do lobby_id = known_lobby_id
+			}
+			invitation_code := simple_server_state.party_conn_token_from_code.invitation_code
+			if lobby_id == 0 && invitation_code != "" && g_simple_party_scene_by_invite != nil && g_simple_steam_lobby_by_party_scene != nil {
+				if invite_scene, ok := g_simple_party_scene_by_invite[invitation_code]; ok {
+					if known_lobby_id, ok := g_simple_steam_lobby_by_party_scene[invite_scene]; ok do lobby_id = known_lobby_id
+				}
+			}
+			if lobby_id == 0 && g_simple_steam_lobby_by_invite != nil && invitation_code != "" {
+				if known_lobby_id, ok := g_simple_steam_lobby_by_invite[invitation_code]; ok do lobby_id = known_lobby_id
+			}
+			if lobby_id == 0 && g_simple_latest_party_steam_lobby_id != 0 do lobby_id = g_simple_latest_party_steam_lobby_id
+			if lobby_id == 0 do lobby_id = simple_server_state.steam_lobby_id
+			if lobby_id != 0 {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(args.scene_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, args.scene_handle, "Steam.JoinLobby"),
+						body = Steam_JoinLobby_Body{rpc_id = 8, lobby_id = lobby_id},
+					},
+				)
+			}
 		}
 		if is_matchmaking_ready && party_handle_ok && has_pending_settings_update {
 			simple_server_state.party_member_connected_after_settings_ack = client_id > 1
@@ -126,7 +156,17 @@ get_system_request_response :: proc(
 				},
 			)
 		}
-		if scene_ok && simple_scene_is_party(scene) {
+		if is_joined_party_ready {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = u8(args.scene_handle),
+					route_handle = get_route_num_from_handle(simple_server_state, args.scene_handle, "party.memberDataUpdated"),
+					body = simple_party_member_data_updated_body(11, 9, simple_server_state, true),
+				},
+			)
+		}
+		if is_first_party_ready {
 			append(
 				&response_messages,
 				Scene_Message{

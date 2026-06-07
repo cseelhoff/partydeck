@@ -419,6 +419,13 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message, ro
 	case Scene_Message:
 		fmt.sbprintf(sb, "Scene_Message handle=%d route=%d", f.scene_handle, f.route_handle)
 		if route_name != "" do fmt.sbprintf(sb, "(%s)", route_name)
+		if route_name == "party.memberDataUpdated" {
+			if body, ok := f.body.(Party_MemberDataUpdated_Body); ok {
+				strings.write_byte(sb, ' ')
+				write_party_member_data_updated_body(sb, body)
+				return
+			}
+		}
 		// Show the raw byte length only when the body did not decode cleanly --
 		// otherwise the decoded value list already accounts for every byte.
 		if f.decoded.values.ok do strings.write_byte(sb, ' ')
@@ -437,6 +444,98 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message, ro
 	case:
 		fmt.sbprintf(sb, "nil")
 	}
+}
+
+write_party_member_data_updated_body :: proc(sb: ^strings.Builder, body: Party_MemberDataUpdated_Body) {
+	fmt.sbprintf(sb, "rpc=%d [%d, ", body.rpc_id, body.version)
+	write_party_member_data(sb, body.member)
+	if len(body.tail_values) > 0 {
+		strings.write_string(sb, ", tail=")
+		write_party_member_data_tail(sb, body.tail_values)
+	}
+	strings.write_byte(sb, ']')
+}
+
+write_party_member_data_tail :: proc(sb: ^strings.Builder, values: []Party_MemberData_Tail_Value) {
+	strings.write_byte(sb, '[')
+	for i := 0; i < len(values); {
+		if i > 0 do strings.write_string(sb, ", ")
+		if tail_ascii_run_len(values, i) >= 2 {
+			strings.write_string(sb, "codes:")
+			write_party_member_data_tail_codes(sb, values, i)
+			i += tail_ascii_run_len(values, i)
+			continue
+		}
+		write_party_member_data_tail_value(sb, values[i])
+		i += 1
+	}
+	strings.write_byte(sb, ']')
+}
+
+tail_ascii_run_len :: proc(values: []Party_MemberData_Tail_Value, start: int) -> int {
+	n := 0
+	for i in start ..< len(values) {
+		if values[i].kind != .Uint || values[i].uint_value < 32 || values[i].uint_value > 126 do break
+		n += 1
+	}
+	return n
+}
+
+write_party_member_data_tail_codes :: proc(sb: ^strings.Builder, values: []Party_MemberData_Tail_Value, start: int) {
+	strings.write_byte(sb, '"')
+	for i in start ..< len(values) {
+		if values[i].kind != .Uint || values[i].uint_value < 32 || values[i].uint_value > 126 do break
+		strings.write_byte(sb, byte(values[i].uint_value))
+	}
+	strings.write_byte(sb, '"')
+}
+
+write_party_member_data_tail_value :: proc(sb: ^strings.Builder, value: Party_MemberData_Tail_Value) {
+	#partial switch value.kind {
+	case .Nil:
+		strings.write_string(sb, "nil")
+	case .Bool:
+		fmt.sbprintf(sb, "%v", value.bool_value)
+	case .Int:
+		fmt.sbprintf(sb, "%d", value.int_value)
+	case .Uint:
+		fmt.sbprintf(sb, "%d", value.uint_value)
+	case .Str:
+		fmt.sbprintf(sb, "%q", value.text)
+	case .Bin:
+		fmt.sbprintf(sb, "bin<%d>", len(value.bytes))
+	case:
+		strings.write_string(sb, "nil")
+	}
+}
+
+write_party_member_data :: proc(sb: ^strings.Builder, member: Scene_Party_Member_Data) {
+	strings.write_byte(sb, '[')
+	fmt.sbprintf(sb, "%q, ", member.user_id)
+	write_scene_string(sb, member.userdata_json)
+	strings.write_string(sb, ", ")
+	write_scene_platforms(sb, member.platforms)
+	fmt.sbprintf(sb, ", %d]", member.state)
+}
+
+write_scene_platforms :: proc(sb: ^strings.Builder, platforms: []Scene_Platform_Identity) {
+	strings.write_byte(sb, '[')
+	for platform, i in platforms {
+		if i > 0 do strings.write_string(sb, ", ")
+		strings.write_byte(sb, '[')
+		fmt.sbprintf(
+			sb,
+			"%q, %q, %q, %q, ",
+			platform.provider,
+			platform.user_id,
+			platform.visibility,
+			platform.platform_id,
+		)
+		if platform.extra_is_nil do strings.write_string(sb, "nil")
+		else do fmt.sbprintf(sb, "%q", platform.extra)
+		fmt.sbprintf(sb, ", %d]", platform.flags)
+	}
+	strings.write_byte(sb, ']')
 }
 
 address_to_string :: proc(a: System_Address) -> string {

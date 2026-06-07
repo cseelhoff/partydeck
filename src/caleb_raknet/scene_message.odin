@@ -49,6 +49,16 @@ get_response_from_scene_message :: proc(
 //   "real_human_readable": "Scene_Message handle=144 route=2(stormancer.rpc.next) rpc=1 [[[\"matchmaking\", \"\", 1, false, true, {}, \"\", \"5bbb3677-445a-42d1-a9a9-83094be3639a\"], \"4168ffb24de245f88060d27c9580685e\", [[\"4168ffb24de245f88060d27c9580685e\", 0, json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, bin<16>, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", nil, 0]], 2]], 3], 97, \"leader\", 1, {}, 1, [21, 21, [[bin<16>, \"dt-live-2\", \"dt-live-2.passtechgames.com:40243\", \"passtech-live\"], [[\"udp1\", \"raknet\", [\"dt-live-2.passtechgames.com:30100\"], 1]], \"dt-live-2.passtechgames.com:40243\", \"dt-live-2.passtechgames.com:40243\", [\"https://dt-live-2.passtechgames.com\"], {}, [\"apps\"], 1], {}, 1], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] | Scene_Message handle=144 route=1(stormancer.rpc.completed) rpc=257 [0]",
 
 		if !simple_scene_is_party(scene) do break
+		lobby_id := scene_route0_lobby_id(message.decoded)
+		if lobby_id == 0 do break
+		simple_server_state.steam_lobby_id = lobby_id
+		g_simple_latest_party_steam_lobby_id = lobby_id
+		if g_simple_steam_lobby_by_party_scene != nil do g_simple_steam_lobby_by_party_scene[scene_suffix(scene.scene_id)] = lobby_id
+		if g_simple_steam_lobby_by_invite != nil {
+			if invitation_code := json_string_value(simple_server_state.party_update_settings.custom_data_json, "InvitationCode"); invitation_code != "" {
+				g_simple_steam_lobby_by_invite[invitation_code] = lobby_id
+			}
+		}
 		append(
 			&response_messages,
 			Scene_Message{
@@ -229,6 +239,12 @@ get_response_from_scene_message :: proc(
 	case "party.updatepartysettings":
 		body := message.body.(Party_UpdatePartySettings_Body) or_return
 		simple_server_state.party_update_settings = body
+		if invitation_code := json_string_value(body.custom_data_json, "InvitationCode"); invitation_code != "" {
+			if g_simple_party_scene_by_invite != nil do g_simple_party_scene_by_invite[invitation_code] = scene_suffix(scene.scene_id)
+			if g_simple_steam_lobby_by_invite != nil && simple_server_state.steam_lobby_id != 0 {
+				g_simple_steam_lobby_by_invite[invitation_code] = simple_server_state.steam_lobby_id
+			}
+		}
 		emit_settings_updated := body.rpc_id == 6 && simple_server_state.scene_ready_args.scene_handle == 145
 		if emit_settings_updated {
 			append(

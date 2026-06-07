@@ -247,6 +247,8 @@ encode_scene_message_body :: proc(
 		if len(b.friends) > 0 do return encode_friends_notification_body(b, allocator)
 	case Steam_CreateLobby_Body:
 		return encode_steam_create_lobby_body(b, allocator)
+	case Steam_JoinLobby_Body:
+		return encode_steam_join_lobby_body(b, allocator)
 	case Party_State_Response_Body:
 		return encode_party_state_response_body(b, allocator)
 	case Party_SettingsUpdated_Body:
@@ -324,8 +326,31 @@ encode_party_member_data_updated_body :: proc(
 	write_u16_le(&out, body.rpc_id)
 	append(&out, ..mpe_uint(body.version, allocator))
 	append(&out, ..encode_party_member_data(body.member, allocator))
-	for _ in 0 ..< body.extra_values do append(&out, ..mpe_uint(0, allocator))
+	for value in body.tail_values do append(&out, ..encode_party_member_data_tail_value(value, allocator))
 	return out[:]
+}
+
+encode_party_member_data_tail_value :: proc(
+	value: Party_MemberData_Tail_Value,
+	allocator := context.allocator,
+) -> []byte {
+	#partial switch value.kind {
+	case .Nil:
+		return mpe_nil(allocator)
+	case .Bool:
+		return mpe_bool(value.bool_value, allocator)
+	case .Int:
+		if value.int_value >= 0 do return mpe_uint(u64(value.int_value), allocator)
+		return mpe_int(value.int_value, allocator)
+	case .Uint:
+		return mpe_uint(value.uint_value, allocator)
+	case .Str:
+		return mpe_str(value.text, allocator)
+	case .Bin:
+		return mpe_bin(value.bytes, allocator)
+	case:
+		return mpe_nil(allocator)
+	}
 }
 
 encode_party_member_data :: proc(member: Scene_Party_Member_Data, allocator := context.allocator) -> []byte {
@@ -475,6 +500,16 @@ encode_steam_create_lobby_body :: proc(
 			allocator,
 		),
 	)
+	return out[:]
+}
+
+encode_steam_join_lobby_body :: proc(
+	body: Steam_JoinLobby_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	append(&out, ..mpe_array({mpe_uint(body.lobby_id, allocator)}, allocator))
 	return out[:]
 }
 

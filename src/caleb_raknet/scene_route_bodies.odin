@@ -162,6 +162,24 @@ Scene_Party_Member_Status :: struct {
 	status:  u64,
 }
 
+Party_MemberData_Tail_Kind :: enum u8 {
+	Nil,
+	Bool,
+	Int,
+	Uint,
+	Str,
+	Bin,
+}
+
+Party_MemberData_Tail_Value :: struct {
+	kind:       Party_MemberData_Tail_Kind,
+	bool_value: bool,
+	int_value:  i64,
+	uint_value: u64,
+	text:       string,
+	bytes:      []byte,
+}
+
 Party_MemberConnected_Body :: struct {
 	rpc_id:   u16,
 	version:  u64,
@@ -170,10 +188,10 @@ Party_MemberConnected_Body :: struct {
 }
 
 Party_MemberDataUpdated_Body :: struct {
-	rpc_id:       u16,
-	version:      u64,
-	member:       Scene_Party_Member_Data,
-	extra_values: int,
+	rpc_id:      u16,
+	version:     u64,
+	member:      Scene_Party_Member_Data,
+	tail_values: []Party_MemberData_Tail_Value,
 }
 
 Party_MemberDisconnected_Body :: struct {
@@ -528,7 +546,7 @@ parse_party_member_data_updated_body :: proc(
 			scene_seq_root(body, 1),
 			allocator,
 		),
-		extra_values = max(len(body.values.roots) - 2, 0),
+		tail_values = scene_member_data_tail_values(body, 2, allocator),
 	}
 }
 
@@ -819,6 +837,39 @@ scene_root_text :: proc(body: Scene_Body, root_index: int) -> string {
 
 scene_root_uint :: proc(body: Scene_Body, root_index: int) -> u64 {
 	return scene_node_uint(body.values.nodes, scene_seq_root(body, root_index))
+}
+
+scene_member_data_tail_values :: proc(
+	body: Scene_Body,
+	start: int,
+	allocator := context.allocator,
+) -> []Party_MemberData_Tail_Value {
+	out := make([dynamic]Party_MemberData_Tail_Value, allocator)
+	for root_index in start ..< len(body.values.roots) {
+		append(&out, scene_member_data_tail_value(body.values.nodes, scene_seq_root(body, root_index)))
+	}
+	return out[:]
+}
+
+scene_member_data_tail_value :: proc(nodes: []Msgpack_Node, idx: int) -> Party_MemberData_Tail_Value {
+	if idx < 0 || idx >= len(nodes) do return Party_MemberData_Tail_Value{kind = .Nil}
+	node := nodes[idx]
+	#partial switch node.kind {
+	case .Nil:
+		return Party_MemberData_Tail_Value{kind = .Nil}
+	case .Bool:
+		return Party_MemberData_Tail_Value{kind = .Bool, bool_value = node.b}
+	case .Int:
+		return Party_MemberData_Tail_Value{kind = .Int, int_value = node.i}
+	case .Uint:
+		return Party_MemberData_Tail_Value{kind = .Uint, uint_value = node.u}
+	case .Str:
+		return Party_MemberData_Tail_Value{kind = .Str, text = node.str}
+	case .Bin:
+		return Party_MemberData_Tail_Value{kind = .Bin, bytes = node.bin}
+	case:
+		return Party_MemberData_Tail_Value{kind = .Nil}
+	}
 }
 
 scene_array_child :: proc(nodes: []Msgpack_Node, array_idx, child_idx: int) -> int {

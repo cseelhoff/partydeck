@@ -44,6 +44,9 @@ simple_backup_replay :: proc(path: string, out_path := SIMPLE_DEFAULT_PREDICT_FI
 
 	simple_scene_infos_load(scratch) or_return
 	if g_simple_party_scene_by_invite == nil do g_simple_party_scene_by_invite = make(map[string]string, scratch)
+	if g_simple_steam_lobby_by_party_scene == nil do g_simple_steam_lobby_by_party_scene = make(map[string]u64, scratch)
+	if g_simple_steam_lobby_by_invite == nil do g_simple_steam_lobby_by_invite = make(map[string]u64, scratch)
+	g_simple_latest_party_steam_lobby_id = 0
 
 	out := strings.builder_make(scratch)
 	peers: [dynamic]^Peer_State
