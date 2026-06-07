@@ -128,6 +128,8 @@ encode_scene_message_body :: proc(
 		return out[:]
 	case Stormancer_Rpc_Next_Body:
 		return encode_stormancer_rpc_next_body(b, allocator)
+	case Party_CreateInvitationCode_Result_Body:
+		return encode_party_create_invitation_code_result_body(b, allocator)
 	case GameVersion_Update_Body:
 		return mpe_str(b.accepted_version, allocator)
 	case Friends_Notification_Body:
@@ -136,10 +138,33 @@ encode_scene_message_body :: proc(
 		return encode_steam_create_lobby_body(b, allocator)
 	case Party_State_Response_Body:
 		return encode_party_state_response_body(b, allocator)
+	case Party_SettingsUpdated_Body:
+		return encode_party_settings_updated_body(b, allocator)
 	case Party_MemberConnected_Body:
 		return encode_party_member_connected_body(b, allocator)
 	}
 	return fallback_raw_body
+}
+
+encode_party_settings_updated_body :: proc(
+	body: Party_SettingsUpdated_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	append(&out, ..mpe_uint(body.version, allocator))
+	append(&out, ..encode_party_settings(body.settings, allocator))
+	return out[:]
+}
+
+encode_party_create_invitation_code_result_body :: proc(
+	body: Party_CreateInvitationCode_Result_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	append(&out, ..mpe_str(body.invitation_code, allocator))
+	return out[:]
 }
 
 encode_party_member_connected_body :: proc(

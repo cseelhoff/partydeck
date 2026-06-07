@@ -60,6 +60,10 @@ stormancer_rpc_completed_id :: proc(rpc_id: u16, sent_next: bool) -> u16 {
 	return (rpc_id << 8) + (sent_next ? u16(1) : u16(0))
 }
 
+simple_invitation_code :: proc(client_id: int, allocator := context.allocator) -> string {
+	return fmt.aprintf("%06d", client_id, allocator = allocator)
+}
+
 simple_party_state_response :: proc(
 	rpc_id: u16,
 	simple_server_state: ^Simple_Server_State,
@@ -84,6 +88,30 @@ simple_party_state_response :: proc(
 		leader_user_id = simple_server_state.user_id,
 		members = members[:],
 		revision = 3,
+	}
+}
+
+simple_party_settings_updated_body :: proc(
+	rpc_id: u16,
+	version: u64,
+	settings_revision: u64,
+	update: Party_UpdatePartySettings_Body,
+	scene: Simple_Scene,
+) -> Party_SettingsUpdated_Body {
+	party_id := scene.scene_id
+	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
+	return Party_SettingsUpdated_Body {
+		rpc_id = rpc_id,
+		version = version,
+		settings = Scene_Party_Settings {
+			game_finder = update.game_finder,
+			custom_data_json = update.custom_data_json,
+			revision = settings_revision,
+			only_leader_invite = false,
+			is_joinable = update.is_joinable,
+			public_data = update.public_data,
+			party_id = party_id,
+		},
 	}
 }
 

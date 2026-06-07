@@ -241,6 +241,34 @@ get_system_request_response :: proc(
 			)
 			append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
 			
+		} else if args.token.scene_id == "matchmaking" {
+			simple_server_state.get_scene_infos_args = args
+//   "sent_human_readable": "System_Request msg_id=Get_Scene_Infos req=29 args=Get_Scene_Infos token=1121B metadata={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
+//   "real_human_readable": "Response_Msg req=29 data=Scene_Infos shard=0 scene=\"matchmaking\" serializer=\"msgpack/array\" meta={stormancer.plugins.gamefinder=\"matchmaking\", stormancer.plugins.gamefinder.protocol=\"202001101\", stormancer.plugins.rpc=\"1.1.0\"} routes=[stormancer.rpc.next#0, stormancer.rpc.cancel#1, stormancer.rpc.error#2, stormancer.rpc.completed#3, gamefinder.cancel#4, GameFinder.GetPublicStatus#5] | Response_Complete req=29 has_values=true",
+			append(
+				&response_messages,
+				Response_Msg{
+					req_id = message.req_id,
+					data = Scene_Infos{
+						shard_id = 0,
+						scene_id = "matchmaking",
+						selected_serializer = "msgpack/array",
+						stormancer_plugins_gamefinder = "matchmaking",
+						stormancer_plugins_gamefinder_protocol = "202001101",
+						stormancer_plugins_rpc = "1.1.0",
+						routes = Routes{
+							"stormancer.rpc.next",
+							"stormancer.rpc.cancel",
+							"stormancer.rpc.error",
+							"stormancer.rpc.completed",
+							"gamefinder.cancel",
+							"GameFinder.GetPublicStatus",
+						},
+					},
+				},
+			)
+			append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
+
 		} else if len(args.token.scene_id) >= 6 && args.token.scene_id[:6] == "party-" {
 			simple_server_state.get_scene_infos_args = args
 // 			  "sent_human_readable": "System_Request msg_id=Get_Scene_Infos req=25 args=Get_Scene_Infos token=949B metadata={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",

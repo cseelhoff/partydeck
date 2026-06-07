@@ -92,6 +92,11 @@ Party_CreateInvitationCode_Body :: struct {
 	rpc_id: u16,
 }
 
+Party_CreateInvitationCode_Result_Body :: struct {
+	rpc_id:          u16,
+	invitation_code: string,
+}
+
 Party_GetPartyState2_Body :: struct {
 	rpc_id: u16,
 }
@@ -284,6 +289,7 @@ Scene_Message_Body :: union {
 	Gamefinder_Update_Body,
 	Locator_GetSceneConnectionToken_Body,
 	Party_CreateInvitationCode_Body,
+	Party_CreateInvitationCode_Result_Body,
 	Party_GetPartyState2_Body,
 	Party_State_Response_Body,
 	Party_MemberConnected_Body,
