@@ -71,6 +71,7 @@ get_system_request_response :: proc(
 			)
 		}
 		if is_matchmaking_ready && party_handle_ok && has_pending_settings_update {
+			simple_server_state.party_member_connected_after_settings_ack = client_id > 1
 			append(
 				&response_messages,
 				Scene_Message{

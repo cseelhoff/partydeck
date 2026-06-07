@@ -31,6 +31,19 @@ get_response_from_scene_message :: proc(
 				},
 			)
 		}
+		if simple_scene_is_party(scene) &&
+		   body.rpc_id == stormancer_rpc_completed_id(7, false) &&
+		   simple_server_state.party_member_connected_after_settings_ack {
+			simple_server_state.party_member_connected_after_settings_ack = false
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberConnected"),
+					body = simple_party_member_connected_body(10, simple_server_state, true),
+				},
+			)
+		}
 	case "stormancer.rpc.next":
 // 	"sent_human_readable": "Scene_Message handle=144 route=0(stormancer.rpc.next) rpc=1 [[true, \"\", \"\", 109775243056466233]]",
 //   "real_human_readable": "Scene_Message handle=144 route=2(stormancer.rpc.next) rpc=1 [[[\"matchmaking\", \"\", 1, false, true, {}, \"\", \"5bbb3677-445a-42d1-a9a9-83094be3639a\"], \"4168ffb24de245f88060d27c9580685e\", [[\"4168ffb24de245f88060d27c9580685e\", 0, json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, bin<16>, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", nil, 0]], 2]], 3], 97, \"leader\", 1, {}, 1, [21, 21, [[bin<16>, \"dt-live-2\", \"dt-live-2.passtechgames.com:40243\", \"passtech-live\"], [[\"udp1\", \"raknet\", [\"dt-live-2.passtechgames.com:30100\"], 1]], \"dt-live-2.passtechgames.com:40243\", \"dt-live-2.passtechgames.com:40243\", [\"https://dt-live-2.passtechgames.com\"], {}, [\"apps\"], 1], {}, 1], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] | Scene_Message handle=144 route=1(stormancer.rpc.completed) rpc=257 [0]",

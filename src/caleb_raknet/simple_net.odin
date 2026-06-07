@@ -81,6 +81,7 @@ Simple_Server_State :: struct {
 	party_member_data_updated:   Party_MemberDataUpdated_Body,
 	party_member_disconnected:   Party_MemberDisconnected_Body,
 	party_member_status_updated: Party_MemberStatusUpdated_Body,
+	party_member_connected_after_settings_ack: bool,
 	party_settings_updated:      Party_SettingsUpdated_Body,
 	party_update_gf_status:      Party_UpdateGameFinderPlayerStatus_Body,
 	party_update_settings:       Party_UpdatePartySettings_Body,
