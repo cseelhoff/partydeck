@@ -17,6 +17,42 @@ get_response_from_scene_message :: proc(
 	if message.route_handle >= u16(len(scene.routes)) do return
 	route := scene.routes[message.route_handle]
 	switch route {
+	case "stormancer.rpc.completed":
+		body := message.body.(Stormancer_Rpc_Completed_Body) or_return
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(1, true) {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberConnected"),
+					body = simple_party_member_connected_body(2, simple_server_state, false),
+				},
+			)
+		}
+	case "stormancer.rpc.next":
+// 	"sent_human_readable": "Scene_Message handle=144 route=0(stormancer.rpc.next) rpc=1 [[true, \"\", \"\", 109775243056466233]]",
+//   "real_human_readable": "Scene_Message handle=144 route=2(stormancer.rpc.next) rpc=1 [[[\"matchmaking\", \"\", 1, false, true, {}, \"\", \"5bbb3677-445a-42d1-a9a9-83094be3639a\"], \"4168ffb24de245f88060d27c9580685e\", [[\"4168ffb24de245f88060d27c9580685e\", 0, json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, bin<16>, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", nil, 0]], 2]], 3], 97, \"leader\", 1, {}, 1, [21, 21, [[bin<16>, \"dt-live-2\", \"dt-live-2.passtechgames.com:40243\", \"passtech-live\"], [[\"udp1\", \"raknet\", [\"dt-live-2.passtechgames.com:30100\"], 1]], \"dt-live-2.passtechgames.com:40243\", \"dt-live-2.passtechgames.com:40243\", [\"https://dt-live-2.passtechgames.com\"], {}, [\"apps\"], 1], {}, 1], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] | Scene_Message handle=144 route=1(stormancer.rpc.completed) rpc=257 [0]",
+
+		if !simple_scene_is_party(scene) do break
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+				body = simple_party_state_response(message.decoded.rpc_id, simple_server_state, scene),
+			},
+		)
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+				body = Stormancer_Rpc_Completed_Body{
+					rpc_id = stormancer_rpc_completed_id(message.decoded.rpc_id, true),
+					message_sent = true,
+				},
+			},
+		)
 	case "Authentication.Login":
 		body := message.body.(Authentication_Login_Body) or_return
 //         "sent_human_readable": "Scene_Message handle=141 route=6(Authentication.Login) rpc=1 [[\"steam\", {\"gameVersion.clientVersion\": \"1.05.00.05\", \"provider\": \"steam\", \"ticket\": \"140000004F316731E9C817C7BB9F0C0101001001C24E236A180000000100000005000000C7D1724E00372436898F5A0AB9000000B20000003200000004000000BB9F0C0101001001F09A1F00A7599BB88101010A00000000BC531B6A3C03376A010059C2100000000000BA6E72D9F085C7D5CD2628D22C0C0D67544C6D4C162CA664248F076E7D4D8A1CED297A86B596A9A28B2CAF53E1FC7E91B8D486F59399B96EC6C110FED6589A3B49E0846268CCC94B17B81FEAF04BB0B0DC23263FFEEA5B70A43A1FA6CC3427AF84EC70F53AFED224AE327149656DEB25CDA05E87CDF2677BA72EE53B8F905BA0\", \"version\": \"v1\", \"appId\": \"2071280\"}]]",

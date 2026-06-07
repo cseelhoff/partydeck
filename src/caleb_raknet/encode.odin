@@ -15,6 +15,7 @@ package caleb_raknet
 // owned byte buffer. Output uses `allocator`; the caller owns the returned slice.
 
 import "core:encoding/base64"
+import "core:encoding/hex"
 import "core:slice"
 
 // Re-encode `message` into its on-the-wire bytes (leading id + body). The result is
@@ -133,8 +134,112 @@ encode_scene_message_body :: proc(
 		if len(b.friends) > 0 do return encode_friends_notification_body(b, allocator)
 	case Steam_CreateLobby_Body:
 		return encode_steam_create_lobby_body(b, allocator)
+	case Party_State_Response_Body:
+		return encode_party_state_response_body(b, allocator)
+	case Party_MemberConnected_Body:
+		return encode_party_member_connected_body(b, allocator)
 	}
 	return fallback_raw_body
+}
+
+encode_party_member_connected_body :: proc(
+	body: Party_MemberConnected_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	append(&out, ..mpe_uint(body.version, allocator))
+	append(&out, ..encode_party_connected_member(body.member, allocator))
+	append(&out, ..body.raw_tail)
+	return out[:]
+}
+
+encode_party_connected_member :: proc(member: Scene_Party_Member_Connected, allocator := context.allocator) -> []byte {
+	platforms := make([dynamic][]byte, allocator)
+	for platform in member.platforms do append(&platforms, encode_scene_platform_identity(platform, allocator))
+	return mpe_array(
+		{
+			mpe_str(member.user_id, allocator),
+			mpe_uint(member.connection_state, allocator),
+			mpe_bin(transmute([]byte)member.userdata_json, allocator),
+			mpe_bin(member.session_token, allocator),
+			mpe_array(platforms[:], allocator),
+			mpe_uint(member.state, allocator),
+		},
+		allocator,
+	)
+}
+
+encode_party_state_response_body :: proc(
+	body: Party_State_Response_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	members := make([dynamic][]byte, allocator)
+	for member in body.members do append(&members, encode_party_state_member(member, allocator))
+	append(
+		&out,
+		..mpe_array(
+			{
+				encode_party_settings(body.settings, allocator),
+				mpe_str(body.leader_user_id, allocator),
+				mpe_array(members[:], allocator),
+				mpe_uint(body.revision, allocator),
+			},
+			allocator,
+		),
+	)
+	return out[:]
+}
+
+encode_party_settings :: proc(settings: Scene_Party_Settings, allocator := context.allocator) -> []byte {
+	return mpe_array(
+		{
+			mpe_str(settings.game_finder, allocator),
+			mpe_str(settings.custom_data_json, allocator),
+			mpe_uint(settings.revision, allocator),
+			mpe_bool(settings.only_leader_invite, allocator),
+			mpe_bool(settings.is_joinable, allocator),
+			mpe_byte(MP_EMPTY_MAP, allocator),
+			mpe_str(settings.public_data, allocator),
+			mpe_str(settings.party_id, allocator),
+		},
+		allocator,
+	)
+}
+
+encode_party_state_member :: proc(member: Party_State_Member, allocator := context.allocator) -> []byte {
+	platforms := make([dynamic][]byte, allocator)
+	for platform in member.platforms do append(&platforms, encode_scene_platform_identity(platform, allocator))
+	session_token, ok := hex.decode(transmute([]byte)member.session_token_hex, allocator)
+	if !ok do session_token = {}
+	return mpe_array(
+		{
+			mpe_str(member.user_id, allocator),
+			mpe_uint(member.connection_state, allocator),
+			mpe_bin(transmute([]byte)member.userdata_json, allocator),
+			mpe_bin(session_token, allocator),
+			mpe_array(platforms[:], allocator),
+			mpe_uint(member.state, allocator),
+		},
+		allocator,
+	)
+}
+
+encode_scene_platform_identity :: proc(platform: Scene_Platform_Identity, allocator := context.allocator) -> []byte {
+	extra := platform.extra_is_nil ? mpe_nil(allocator) : mpe_str(platform.extra, allocator)
+	return mpe_array(
+		{
+			mpe_str(platform.provider, allocator),
+			mpe_str(platform.user_id, allocator),
+			mpe_str(platform.visibility, allocator),
+			mpe_str(platform.platform_id, allocator),
+			extra,
+			mpe_uint(platform.flags, allocator),
+		},
+		allocator,
+	)
 }
 
 encode_steam_create_lobby_body :: proc(

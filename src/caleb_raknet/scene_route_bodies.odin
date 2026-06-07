@@ -96,6 +96,24 @@ Party_GetPartyState2_Body :: struct {
 	rpc_id: u16,
 }
 
+Party_State_Member :: struct {
+	user_id:           string,
+	connection_state:  u64,
+	userdata_json:     string,
+	userdata:          Party_Member_Userdata,
+	session_token_hex: string,
+	platforms:         []Scene_Platform_Identity,
+	state:             u64,
+}
+
+Party_State_Response_Body :: struct {
+	rpc_id:         u16,
+	settings:       Scene_Party_Settings,
+	leader_user_id: string,
+	members:        []Party_State_Member,
+	revision:       u64,
+}
+
 Scene_Platform_Identity :: struct {
 	provider:     string,
 	user_id:      string,
@@ -267,6 +285,7 @@ Scene_Message_Body :: union {
 	Locator_GetSceneConnectionToken_Body,
 	Party_CreateInvitationCode_Body,
 	Party_GetPartyState2_Body,
+	Party_State_Response_Body,
 	Party_MemberConnected_Body,
 	Party_MemberDataUpdated_Body,
 	Party_MemberDisconnected_Body,
