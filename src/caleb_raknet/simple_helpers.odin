@@ -115,6 +115,29 @@ simple_party_settings_updated_body :: proc(
 	}
 }
 
+simple_party_merging_status_result :: proc(
+	rpc_id: u16,
+	allocator := context.allocator,
+) -> PartyMerging_GetMergerStatus_Result_Body {
+	party_counts := make([dynamic]PartyMerging_Difficulty_Count, allocator)
+	append(&party_counts, PartyMerging_Difficulty_Count{difficulty = "2", count = 2})
+	append(&party_counts, PartyMerging_Difficulty_Count{difficulty = "3", count = 1})
+
+	player_counts := make([dynamic]PartyMerging_Difficulty_Count, allocator)
+	append(&player_counts, PartyMerging_Difficulty_Count{difficulty = "2", count = 6})
+	append(&player_counts, PartyMerging_Difficulty_Count{difficulty = "3", count = 1})
+
+	return PartyMerging_GetMergerStatus_Result_Body {
+		rpc_id = rpc_id,
+		status = 1,
+		parties_count = 3,
+		algorithm = "DtPartyMergerAlgorithm",
+		players_count = 7,
+		nb_parties_by_difficulty = party_counts[:],
+		nb_players_by_difficulty = player_counts[:],
+	}
+}
+
 simple_party_member :: proc(
 	simple_server_state: ^Simple_Server_State,
 	platform_committed: bool,

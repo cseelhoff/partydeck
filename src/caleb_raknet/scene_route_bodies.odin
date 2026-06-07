@@ -242,6 +242,21 @@ PartyMerging_GetMergerStatus_Body :: struct {
 	algorithm: string,
 }
 
+PartyMerging_Difficulty_Count :: struct {
+	difficulty: string,
+	count:      u64,
+}
+
+PartyMerging_GetMergerStatus_Result_Body :: struct {
+	rpc_id:                     u16,
+	status:                     u64,
+	parties_count:              u64,
+	algorithm:                  string,
+	players_count:              u64,
+	nb_parties_by_difficulty:   []PartyMerging_Difficulty_Count,
+	nb_players_by_difficulty:   []PartyMerging_Difficulty_Count,
+}
+
 Player_Update_Body :: struct {
 	user_id: string,
 	state:   u64,
@@ -303,6 +318,7 @@ Scene_Message_Body :: union {
 	PartyManagement_CreateConnectionTokenFromInvitationCode_Body,
 	PartyManagement_CreateSession_Body,
 	PartyMerging_GetMergerStatus_Body,
+	PartyMerging_GetMergerStatus_Result_Body,
 	Player_Update_Body,
 	Steam_CreateLobby_Body,
 	Steam_JoinLobby_Body,

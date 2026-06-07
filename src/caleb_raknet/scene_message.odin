@@ -214,20 +214,22 @@ get_response_from_scene_message :: proc(
 	case "party.updatepartysettings":
 		body := message.body.(Party_UpdatePartySettings_Body) or_return
 		simple_server_state.party_update_settings = body
-		append(
-			&response_messages,
-			Scene_Message{
-				scene_handle = message.scene_handle,
-				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.settingsUpdated"),
-				body = simple_party_settings_updated_body(
-					body.rpc_id + 1,
-					u64(body.rpc_id + 1),
-					u64(body.rpc_id - 1),
-					body,
-					scene,
-				),
-			},
-		)
+		if body.rpc_id == 6 {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.settingsUpdated"),
+					body = simple_party_settings_updated_body(
+						body.rpc_id + 1,
+						u64(body.rpc_id + 1),
+						u64(body.rpc_id - 1),
+						body,
+						scene,
+					),
+				},
+			)
+		}
 		append(
 			&response_messages,
 			Scene_Message{
@@ -239,18 +241,43 @@ get_response_from_scene_message :: proc(
 				},
 			},
 		)
+		if body.rpc_id == 6 {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.settingsUpdated"),
+					body = simple_party_settings_updated_body(
+						body.rpc_id + 2,
+						u64(body.rpc_id + 2),
+						u64(body.rpc_id + 1),
+						body,
+						scene,
+					),
+				},
+			)
+		}
+
+	case "PartyMerging.GetMergerStatus":
+		body := message.body.(PartyMerging_GetMergerStatus_Body) or_return
+		simple_server_state.party_merging_status = body
 		append(
 			&response_messages,
 			Scene_Message{
 				scene_handle = message.scene_handle,
-				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.settingsUpdated"),
-				body = simple_party_settings_updated_body(
-					body.rpc_id + 2,
-					u64(body.rpc_id + 2),
-					u64(body.rpc_id + 1),
-					body,
-					scene,
-				),
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+				body = simple_party_merging_status_result(body.rpc_id),
+			},
+		)
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+				body = Stormancer_Rpc_Completed_Body{
+					rpc_id = stormancer_rpc_completed_id(body.rpc_id, true),
+					message_sent = true,
+				},
 			},
 		)
 

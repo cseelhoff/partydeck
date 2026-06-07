@@ -140,10 +140,56 @@ encode_scene_message_body :: proc(
 		return encode_party_state_response_body(b, allocator)
 	case Party_SettingsUpdated_Body:
 		return encode_party_settings_updated_body(b, allocator)
+	case PartyMerging_GetMergerStatus_Result_Body:
+		return encode_party_merging_get_merger_status_result_body(b, allocator)
 	case Party_MemberConnected_Body:
 		return encode_party_member_connected_body(b, allocator)
 	}
 	return fallback_raw_body
+}
+
+encode_party_merging_get_merger_status_result_body :: proc(
+	body: PartyMerging_GetMergerStatus_Result_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	details := mpe_map(
+		{
+			mpe_str("nbPartiesByDifficulty", allocator),
+			encode_party_merging_difficulty_counts(body.nb_parties_by_difficulty, allocator),
+			mpe_str("nbPlayersByDifficulty", allocator),
+			encode_party_merging_difficulty_counts(body.nb_players_by_difficulty, allocator),
+		},
+		allocator,
+	)
+	status := mpe_map(
+		{
+			mpe_str("partiesCount", allocator),
+			mpe_uint(body.parties_count, allocator),
+			mpe_str("algorithm", allocator),
+			mpe_str(body.algorithm, allocator),
+			mpe_str("playersCount", allocator),
+			mpe_uint(body.players_count, allocator),
+			mpe_str("details", allocator),
+			details,
+		},
+		allocator,
+	)
+	append(&out, ..mpe_array({mpe_uint(body.status, allocator), status}, allocator))
+	return out[:]
+}
+
+encode_party_merging_difficulty_counts :: proc(
+	counts: []PartyMerging_Difficulty_Count,
+	allocator := context.allocator,
+) -> []byte {
+	pairs := make([dynamic][]byte, allocator)
+	for count in counts {
+		append(&pairs, mpe_str(count.difficulty, allocator))
+		append(&pairs, mpe_uint(count.count, allocator))
+	}
+	return mpe_map(pairs[:], allocator)
 }
 
 encode_party_settings_updated_body :: proc(
