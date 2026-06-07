@@ -28,18 +28,12 @@ Metadata_Entry :: struct {
 	value: string,
 }
 
-// One entry of the route table a client registers when connecting to a scene.
-Scene_Route :: struct {
-	name:     string,
-	handle:   u16,
-	metadata: []Metadata_Entry,
-}
 
 // Connect_To_Scene (134): join a scene, registering the client's own route table
 // and decoded metadata fields. `token` authenticates/identifies the target scene.
 Connect_To_Scene_Args :: struct {
 	token:                                           string,
-	routes:                                          []Scene_Route,
+	routes:                                          Routes,
 	scene_stormancer_plugins_rpc:                    string,
 	scene_stormancer_plugins_nintendo:               string,
 	scene_stormancer_plugins_xbl_use_modern_gamertag: string,

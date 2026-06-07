@@ -53,17 +53,13 @@ Scene_Infos :: struct {
 SCENE_CONNECTION_RESULT_MAX_SCENES :: 8
 SCENE_CONNECTION_RESULT_MAX_ROUTES :: 18
 
-// Scene: one server->client route table. The containing Scene_Connection_Result
-// index determines scene handle: scenes[0] is handle 141, scenes[1] is 142, etc.
-// The route index determines route handle: routes[0] is handle 1, routes[1] is 2.
-Scene :: struct {
-	routes: [dynamic; SCENE_CONNECTION_RESULT_MAX_ROUTES]string,
-}
+Routes :: [dynamic; SCENE_CONNECTION_RESULT_MAX_ROUTES]string
 
 // Scene_Connection_Result: the reply to Connect_To_Scene. RouteMappings is decoded
 // into the scene slot implied by SceneHandle and routes are stored by handle index.
 Scene_Connection_Result :: struct {
-	scenes: [dynamic; SCENE_CONNECTION_RESULT_MAX_SCENES]Scene,
+	scene_handle: u64,
+	routes: Routes
 }
 
 // Bool_Result: a bare {v: bool} acknowledgement (e.g. a Subscribe / SetStatus ok).

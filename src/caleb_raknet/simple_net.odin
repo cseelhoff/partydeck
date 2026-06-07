@@ -29,6 +29,7 @@ Poll_Slot :: enum int {
 
 Simple_Server_State :: struct {
 	remote:                      net.Endpoint,
+    scenes:                      [dynamic; SCENE_CONNECTION_RESULT_MAX_SCENES]Scene,
 	connected_ping:              Connected_Ping,
 	connected_pong:              Connected_Pong,
 	connection_request:          Connection_Request,
@@ -257,7 +258,7 @@ simple_handle_udp_datagram :: proc(
 	simple_server_state := &g_server_state[client_id]
 	for decoded in decoded_messages {
 		simple_apply_decoded_message(client_id, label, decoded, verbose, simple_server_state)
-		partial_response_messages := simple_dispatch_decoded_message(
+		partial_response_messages := get_response_from_request(
 			client_id,
 			label,
 			decoded,
@@ -362,176 +363,19 @@ simple_write_prediction_record :: proc(
 	free_all(allocator)
 }
 
-simple_scene_message :: proc(
-	scene_handle: u8,
-	route_handle: u16,
-	body: []byte,
-	allocator := context.allocator,
-) -> Decoded_Message {
-	msg := make([dynamic]byte, allocator)
-	append(&msg, scene_handle)
-	write_u16_le(&msg, route_handle)
-	append(&msg, ..body)
-	return decode_message(msg[:], allocator)
-}
-
-simple_response_msg :: proc(req_id: u16, raw: []byte, allocator := context.allocator) -> Decoded_Message {
-	msg := make([dynamic]byte, allocator)
-	append(&msg, u8(Message_Id.Response_Msg))
-	write_u16_le(&msg, req_id)
-	append(&msg, ..raw)
-	return decode_message(msg[:], allocator)
-}
-
-simple_response_complete :: proc(
-	req_id: u16,
-	has_values: bool,
-	allocator := context.allocator,
-) -> Decoded_Message {
-	msg := make([dynamic]byte, allocator)
-	append(&msg, u8(Message_Id.Response_Complete))
-	write_u16_le(&msg, req_id)
-	append(&msg, has_values ? 1 : 0)
-	return decode_message(msg[:], allocator)
-}
-
-simple_bool_response_msg :: proc(
-	req_id: u16,
-	value: bool,
-	allocator := context.allocator,
-) -> Decoded_Message {
-	raw := mpe_map({mpe_str("v", allocator), mpe_bool(value, allocator)}, allocator)
-	return simple_response_msg(req_id, raw, allocator)
-}
-
-simple_session_token_response_msg :: proc(req_id: u16, allocator := context.allocator) -> Decoded_Message {
-	jwt := "eyJhbGciOiJub25lIiwidHlwIjoiSldUIiwiY2x1c3RlcklkIjoicGFzc3RlY2gtbGl2ZSJ9.eyJTdG9ybWFuY2VyL3Nlc3Npb25JZCI6ImJYMkZOMVdhS1Vxb3VCY2JVNTlWbVEiLCJuYmYiOjE3ODA1MzcyMTIsImV4cCI6MTc4MDYyMzYxMiwiaWF0IjoxNzgwNTM3MjEyLCJpc3MiOiJwYXNzdGVjaC1saXZlIn0."
-	sid := "bX2FN1WaKUqouBcbU59VmQ"
-	raw := mpe_concat(mpe_str(jwt, allocator), mpe_str(sid, allocator), allocator = allocator)
-	return simple_response_msg(req_id, raw, allocator)
-}
-
-simple_ping_response_msg :: proc(
-	req_id: u16,
-	echo_clock: u64,
-	allocator := context.allocator,
-) -> Decoded_Message {
-	raw := make([dynamic]byte, allocator)
-	write_u64_le(&raw, server_time_ms())
-	write_u64_le(&raw, echo_clock)
-	return simple_response_msg(req_id, raw[:], allocator)
-}
-
-simple_rpc_next_message :: proc(
-	scene_handle: u8,
-	route_handle: u16,
-	rpc_id: u16,
-	result: []byte,
-	allocator := context.allocator,
-) -> Decoded_Message {
-	body := make([dynamic]byte, allocator)
-	write_u16_le(&body, rpc_id)
-	append(&body, ..result)
-	return simple_scene_message(scene_handle, route_handle, body[:], allocator)
-}
-
-simple_rpc_completed_message :: proc(
-	scene_handle: u8,
-	route_handle: u16,
-	rpc_id: u16,
-	message_sent: bool,
-	allocator := context.allocator,
-) -> Decoded_Message {
-	body := make([dynamic]byte, allocator)
-	append(&body, message_sent ? 1 : 0)
-	write_u16_le(&body, rpc_id)
-	return simple_scene_message(scene_handle, route_handle, body[:], allocator)
-}
-
-simple_append_rpc_response :: proc(
-	messages: ^[dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
-	scene_handle: u8,
-	rpc_next_route: u16,
-	rpc_completed_route: u16,
-	rpc_id: u16,
-	result: []byte,
-	allocator := context.allocator,
-) {
-	if rpc_next_route != 0 {
-		append(
-			messages,
-			simple_rpc_next_message(scene_handle, rpc_next_route, rpc_id, result, allocator),
-		)
-	}
-	if rpc_completed_route != 0 {
-		append(
-			messages,
-			simple_rpc_completed_message(scene_handle, rpc_completed_route, rpc_id, true, allocator),
-		)
-	}
-}
-
-simple_append_rpc_complete :: proc(
-	messages: ^[dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
-	scene_handle: u8,
-	rpc_completed_route: u16,
-	rpc_id: u16,
-	message_sent: bool,
-	allocator := context.allocator,
-) {
-	if rpc_completed_route == 0 do return
-	append(
-		messages,
-		simple_rpc_completed_message(scene_handle, rpc_completed_route, rpc_id, message_sent, allocator),
-	)
-}
-
-simple_scene_token_response_for_suffix :: proc(scene_suffix: string, allocator := context.allocator) -> []byte {
-	raknet_endpoint := env_string("RAKNET_ENDPOINT", SIMPLE_DEFAULT_RAKNET_ENDPOINT, allocator)
-	return mpe_str(scene_token_json_endpoint(scene_suffix, raknet_endpoint, allocator), allocator)
-}
-
-simple_party_scene_for_invite :: proc(invitation_code, fallback_label: string) -> string {
-	if invitation_code == invite_code_for_peer("C1") do return party_scene_for_peer("C1")
-	if invitation_code == invite_code_for_peer("C2") do return party_scene_for_peer("C2")
-	return party_scene_for_peer(fallback_label)
-}
-
-simple_identity_label :: proc(simple_server_state: ^Simple_Server_State, fallback_label: string) -> string {
-	if simple_server_state.identity_label != "" do return simple_server_state.identity_label
-	return fallback_label
-}
-
-simple_party_userdata_json :: proc(
-	simple_server_state: ^Simple_Server_State,
-	identity: string,
-	initialized: bool,
-	lobby_state: int,
-) -> string {
-	if simple_server_state.party_update_user_data2.userdata_json != "" {
-		return simple_server_state.party_update_user_data2.userdata_json
-	}
-	if simple_server_state.party_create_session.userdata_json != "" {
-		return simple_server_state.party_create_session.userdata_json
-	}
-	return party_userdata_json(identity, initialized, lobby_state, 3)
-}
-
 get_route_from_handle :: proc(
 	simple_server_state: ^Simple_Server_State,
 	scene_handle: u64,
     route_name_query: string,
 ) -> u16 {
-	if scene_handle < u64(SCENE_HANDLE_MIN) do return 0
-	scene_index := int(scene_handle - u64(SCENE_HANDLE_MIN))
-	if scene_index < 0 || scene_index >= len(simple_server_state.scene_connection_result.scenes) {
-		return 0
-	}
+    assert(scene_handle >= u64(SCENE_HANDLE_MIN))
+	scene_index := scene_handle - u64(SCENE_HANDLE_MIN)
 
-	scene := simple_server_state.scene_connection_result.scenes[scene_index]
+	scene := simple_server_state.scenes[scene_index]
 	for route_name, route_index in scene.routes {
-		if route_name == route_name_query do return u16(route_index + 1)
+		if route_name == route_name_query do return (route_index + 1)
 	}
+    assert(false, "route not found: " + route_name_query)
 	return 0
 }
 
@@ -595,57 +439,57 @@ simple_apply_decoded_message :: proc(
 	}
 }
 
-simple_apply_system_request :: proc(
-	client_id: int,
-	label: string,
-	message: System_Request,
-	verbose: bool,
-	simple_server_state: ^Simple_Server_State,
-) -> (
-	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
-){
-	switch args in message.args {
-	case Connect_To_Scene_Args:
-//   "sent_human_readable": "System_Request msg_id=Connect_To_Scene req=7 args=Connect token=449B routes=[stormancer.rpc.completed#0, stormancer.rpc.next#0, gameVersion.update#0, stormancer.rpc.cancel#0, sendRequest#0, stormancer.rpc.error#0, serverVersion.update#0, users.renewCredentials#0] scene_meta={stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.nintendo=\"enabled\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\", stormancer.plugins.steam=\"4.2.1.42\", appId=\"live-1-05-00\", accountId=\"darktales\", stormancer.gameVersion=\"default\", stormancer.plugins.psn=\"202006171\"} conn_meta={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
-//   "real_human_readable": "Response_Msg req=7 data=Scene_Connection_Result handle=141 routes=[stormancer.rpc.completed#1, stormancer.rpc.next#2, gameVersion.update#3, stormancer.rpc.cancel#4, sendRequest#5, stormancer.rpc.error#6, serverVersion.update#7, users.renewCredentials#8] | Response_Complete req=7 has_values=true",
+// simple_apply_system_request :: proc(
+// 	client_id: int,
+// 	label: string,
+// 	message: System_Request,
+// 	verbose: bool,
+// 	simple_server_state: ^Simple_Server_State,
+// ) -> (
+// 	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
+// ){
+// 	switch args in message.args {
+// 	case Connect_To_Scene_Args:
+// //   "sent_human_readable": "System_Request msg_id=Connect_To_Scene req=7 args=Connect token=449B routes=[stormancer.rpc.completed#0, stormancer.rpc.next#0, gameVersion.update#0, stormancer.rpc.cancel#0, sendRequest#0, stormancer.rpc.error#0, serverVersion.update#0, users.renewCredentials#0] scene_meta={stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.nintendo=\"enabled\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\", stormancer.plugins.steam=\"4.2.1.42\", appId=\"live-1-05-00\", accountId=\"darktales\", stormancer.gameVersion=\"default\", stormancer.plugins.psn=\"202006171\"} conn_meta={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
+// //   "real_human_readable": "Response_Msg req=7 data=Scene_Connection_Result handle=141 routes=[stormancer.rpc.completed#1, stormancer.rpc.next#2, gameVersion.update#3, stormancer.rpc.cancel#4, sendRequest#5, stormancer.rpc.error#6, serverVersion.update#7, users.renewCredentials#8] | Response_Complete req=7 has_values=true",
  
-		simple_server_state.connect_to_scene_args = args
-        simple_server_state
-		append(&response_messages, Response_Msg {
-            req_id = message.req_id,
-            data = Scene_Connection_Result {
-                handle = 141,
-                routes = args.routes,
-            },
-        })
-	case Get_Scene_Infos_Args:
-		simple_server_state.get_scene_infos_args = args
-		simple_net_stub(label, "System_Request.Get_Scene_Infos", verbose)
-	case Set_Metadata_Args:
-		simple_server_state.set_metadata_args = args
-		simple_net_stub(label, "System_Request.Set_Metadata", verbose)
-	case Scene_Ready_Args:
-		was_sent := simple_server_state.scene_ready_args.sent_game_version_update
-		simple_server_state.scene_ready_args = args
-		simple_server_state.scene_ready_args.sent_game_version_update = was_sent
-		simple_server_state.scene_message.scene_handle = u8(args.scene_handle)
-		simple_net_stub(label, "System_Request.Scene_Ready", verbose)
-	case Disconnect_From_Scene_Args:
-		simple_server_state.disconnect_from_scene_args = args
-		simple_net_stub(label, "System_Request.Disconnect_From_Scene", verbose)
-	case Ping_Args:
-		simple_server_state.ping_args = args
-		simple_net_stub(label, "System_Request.Ping", verbose)
-	case No_Args:
-		simple_server_state.no_args = args
-		simple_net_stub(label, "System_Request.No_Args", verbose)
-	case Unparsed_Args:
-		simple_server_state.unparsed_args = args
-		simple_net_stub(label, "System_Request.Unparsed_Args", verbose)
-	}
-}
+// 		simple_server_state.connect_to_scene_args = args
+//         simple_server_state
+// 		append(&response_messages, Response_Msg {
+//             req_id = message.req_id,
+//             data = Scene_Connection_Result {
+//                 handle = 141,
+//                 routes = args.routes,
+//             },
+//         })
+// 	case Get_Scene_Infos_Args:
+// 		simple_server_state.get_scene_infos_args = args
+// 		simple_net_stub(label, "System_Request.Get_Scene_Infos", verbose)
+// 	case Set_Metadata_Args:
+// 		simple_server_state.set_metadata_args = args
+// 		simple_net_stub(label, "System_Request.Set_Metadata", verbose)
+// 	case Scene_Ready_Args:
+// 		was_sent := simple_server_state.scene_ready_args.sent_game_version_update
+// 		simple_server_state.scene_ready_args = args
+// 		simple_server_state.scene_ready_args.sent_game_version_update = was_sent
+// 		simple_server_state.scene_message.scene_handle = u8(args.scene_handle)
+// 		simple_net_stub(label, "System_Request.Scene_Ready", verbose)
+// 	case Disconnect_From_Scene_Args:
+// 		simple_server_state.disconnect_from_scene_args = args
+// 		simple_net_stub(label, "System_Request.Disconnect_From_Scene", verbose)
+// 	case Ping_Args:
+// 		simple_server_state.ping_args = args
+// 		simple_net_stub(label, "System_Request.Ping", verbose)
+// 	case No_Args:
+// 		simple_server_state.no_args = args
+// 		simple_net_stub(label, "System_Request.No_Args", verbose)
+// 	case Unparsed_Args:
+// 		simple_server_state.unparsed_args = args
+// 		simple_net_stub(label, "System_Request.Unparsed_Args", verbose)
+// 	}
+// }
 
-simple_dispatch_decoded_message :: proc(
+get_response_from_request :: proc(
 	client_id: int,
 	label: string,
 	message: Decoded_Message,
@@ -654,7 +498,7 @@ simple_dispatch_decoded_message :: proc(
 ) -> (
 	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
 ) {
-	switch m in message {
+	switch request_message in message {
 	case Connected_Ping:
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Connected_Ping", verbose)
@@ -663,17 +507,17 @@ simple_dispatch_decoded_message :: proc(
 		simple_net_stub(label, "Connected_Pong", verbose)
 	case Connection_Request:
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:47.962577337Z line=  "sent_human_readable": "Connection_Request guid=0dd000327154492d time=216649998 sec=false",
-		response := Connection_Request_Accepted {
+        simple_server_state.connection_request = request_message
+		append(&response_messages, Connection_Request_Accepted {
 			remote = system_address_from_endpoint(simple_server_state.remote),
 			system_index = simple_server_state.connection_request_accepted.system_index + 1,
 			internal = [MAX_INTERNAL_IDS]System_Address {
 				0 = System_Address{version = 4, ip = {127, 0, 0, 1}, port = SERVER_PORT},
 			},
 			internal_count = 1,
-			echo_time = m.time,
+			echo_time = request_message.time,
 			server_time = server_time_ms(),
-		}
-		append(&response_messages, Decoded_Message(response))
+		})
 	case Connection_Request_Accepted:
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Connection_Request_Accepted", verbose)
@@ -685,7 +529,7 @@ simple_dispatch_decoded_message :: proc(
 		simple_net_stub(label, "Disconnection_Notification", verbose)
 	case System_Request:
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:49.582001573Z line=  "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
-		return get_system_request_response(client_id, label, m, verbose, simple_server_state)
+		return get_system_request_response(client_id, label, request_message, verbose, simple_server_state)
 	case Response_Msg:
 		simple_net_stub(label, "Response_Msg", verbose)
 		// predict_caleb sent_human_readable: not found in sent_human_readable
@@ -700,7 +544,7 @@ simple_dispatch_decoded_message :: proc(
 		simple_net_stub(label, "Connection_Result", verbose)
 	case Scene_Message:
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:54.547386728Z line=  "sent_human_readable": "Scene_Message handle=141 route=6(Authentication.Login) rpc=1 [[\"steam\", {\"gameVersion.clientVersion\": \"1.05.00.05\", \"provider\": \"steam\", \"ticket\": \"140000004F316731E9C817C7BB9F0C0101001001C24E236A180000000100000005000000C7D1724E00372436898F5A0AB9000000B20000003200000004000000BB9F0C0101001001F09A1F00A7599BB88101010A00000000BC531B6A3C03376A010059C2100000000000BA6E72D9F085C7D5CD2628D22C0C0D67544C6D4C162CA664248F076E7D4D8A1CED297A86B596A9A28B2CAF53E1FC7E91B8D486F59399B96EC6C110FED6589A3B49E0846268CCC94B17B81FEAF04BB0B0DC23263FFEEA5B70A43A1FA6CC3427AF84EC70F53AFED224AE327149656DEB25CDA05E87CDF2677BA72EE53B8F905BA0\", \"version\": \"v1\", \"appId\": \"2071280\"}]]",
-		return simple_dispatch_scene_message(client_id, label, m, verbose, simple_server_state)
+		return get_response_from_scene_message(client_id, label, request_message, verbose, simple_server_state)
 	case Malformed_Message:
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Malformed_Message", verbose)
@@ -722,13 +566,15 @@ get_system_request_response :: proc(
 ) {
 	switch args in message.msg_id {
 	case Set_Metadata:
-		// predict_caleb sent_human_readable t=2026-06-06T01:03:52.313899701Z line=  "sent_human_readable": "System_Request msg_id=Connect_To_Scene req=7 args=Connect token=449B routes=[stormancer.rpc.completed#0, stormancer.rpc.next#0, gameVersion.update#0, stormancer.rpc.cancel#0, sendRequest#0, stormancer.rpc.error#0, serverVersion.update#0, users.renewCredentials#0] scene_meta={stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.nintendo=\"enabled\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\", stormancer.plugins.steam=\"4.2.1.42\", appId=\"live-1-05-00\", accountId=\"darktales\", stormancer.gameVersion=\"default\", stormancer.plugins.psn=\"202006171\"} conn_meta={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
-		scene_handle := u64(SCENE_HANDLE_MIN + len(simple_server_state.scene_connection_result.scenes))
-		raw := build_scene_connection_result_raw(scene_handle, args.routes, context.allocator)
+//  "sent": ["860005008fb073746f726d616e6365722e7061727479ac323032322d30362d30392e31a776657273696f6ea0ab7365727665722e6e616d65a964742d6c6976652d31a774696d656f7574a435303030ae7365727665722e76657273696f6ea7392e332e302e32b773746f726d616e6365722e70617274792e706c7567696eac323032302d30382d32312e31ba73746f726d616e6365722e70617274796d616e6167656d656e74ac323032302d30352d32302e31d92673746f726d616e6365722e706c7567696e732e67616d6566696e6465722e70726f746f636f6ca9323032303036303931a7706c7567696e73d9d452504328312e302e30293b20557365727328312e302e30293b20506172747928323032302d30382d32312e31293b2050617274794d657267696e6728312e302e30293b2047616d6546696e64657228323032303036303931293b2047616d6553657373696f6e28312e302e30293b2047616d6556657273696f6e28312e302e30293b20467269656e647328322e302e30293b20506c617965725265706f72747328312e302e30293b204461726b54616c65732e47616d6553657373696f6e7328312e302e30293b20537465616d28312e302e3029ab73657269616c697a657273ad6d73677061636b2f6172726179a97472616e73706f7274a672616b6e6574a8706c6174666f726da557696e3634a870726f746f636f6ca134a474797065a6736572766572aa73657269616c697a6572ad6d73677061636b2f6172726179"],
+//   "sent_human_readable": "System_Request msg_id=Set_Metadata req=5 args=Set_Metadata {stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
+ 		simple_server_state.set_metadata_args = args
 		append(
 			&response_messages,
-			simple_response_msg(message.req_id, raw),
-			simple_response_complete(message.req_id, true),
+			Response_Complete{
+                req_id = message.req_id,
+                has_values = false,
+            },
 		)
 	case Scene_Ready:
 
@@ -736,91 +582,10 @@ get_system_request_response :: proc(
 		append(&response_messages, simple_response_complete(message.req_id, false))
 	case Scene_Ready_Args:
 		//  "real_human_readable": "Response_Msg req=9 data=Bool_Result v=true | Scene_Message handle=141 route=3(gameVersion.update) [\"bot,1.05.*\"] | Response_Complete req=9 has_values=true | Response_Complete req=12 has_values=true",
-		steam_create_lobby_route := get_route_from_handle(
-			simple_server_state,
-			args.scene_handle,
-			"Steam.CreateLobby",
-		)
-		identity := simple_identity_label(simple_server_state, label)
-		if steam_create_lobby_route != 0 {
-			append(
-				&response_messages,
-				simple_scene_message(
-					u8(args.scene_handle),
-					steam_create_lobby_route,
-					steam_create_lobby_body(identity, 1, party_scene_for_peer(identity)),
-				),
-			)
-		}
-		append(&response_messages, simple_bool_response_msg(message.req_id, true))
-		if simple_server_state.scene_ready_args.sent_game_version_update == false {
-			append(
-				&response_messages,
-				simple_scene_message(
-					u8(args.scene_handle),
-					get_route_from_handle(simple_server_state, args.scene_handle, "gameVersion.update"),
-					mpe_str("bot,1.05.*"),
-				),
-			)
-			simple_server_state.scene_ready_args.sent_game_version_update = true
-		}
-		append(&response_messages, simple_response_complete(message.req_id, true))
-		if steam_create_lobby_route != 0 {
-			settings_route := get_route_from_handle(
-				simple_server_state,
-				args.scene_handle,
-				"party.settingsUpdated",
-			)
-			member_data_route := get_route_from_handle(
-				simple_server_state,
-				args.scene_handle,
-				"party.memberDataUpdated",
-			)
-			if settings_route != 0 {
-				append(
-					&response_messages,
-					simple_scene_message(
-						u8(args.scene_handle),
-						settings_route,
-						party_settings_body(identity, 3, 1, ""),
-					),
-				)
-			}
-			if member_data_route != 0 {
-				append(
-					&response_messages,
-					simple_scene_message(
-						u8(args.scene_handle),
-						member_data_route,
-						party_memberdata_body(identity, 4, 4, false, 3),
-					),
-				)
-			}
-			if settings_route != 0 {
-				append(
-					&response_messages,
-					simple_scene_message(
-						u8(args.scene_handle),
-						settings_route,
-						party_settings_body(identity, 5, 3, ""),
-					),
-				)
-			}
-			if member_data_route != 0 {
-				append(
-					&response_messages,
-					simple_scene_message(
-						u8(args.scene_handle),
-						member_data_route,
-						party_memberdata_body(identity, 6, 6, true, 3),
-					),
-				)
-			}
-		}
+
 	case Get_Session_Token:
 // "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
 // "real_human_readable": "Response_Msg req=1 data=Session_Token sid=\"mK3b_FfCGU6pNfjn4w8Pxg\" jwt=JWT{header={\"alg\":\"none\",\"typ\":\"JWT\",\"clusterId\":\"passtech-live\"} payload={\"Stormancer/sessionId\":\"mK3b_FfCGU6pNfjn4w8Pxg\",\"nbf\":1780707829,\"exp\":1780794229,\"iat\":1780707829,\"iss\":\"passtech-live\"} sig=0B} | Response_Complete req=1 has_values=true",
- 
 		append(
 			&response_messages,
 			Response_Msg{
@@ -830,22 +595,49 @@ get_system_request_response :: proc(
                     sid = "mK3b_FfCGU6pNfjn4w8Pxg",
                 },
             },
-            simple_response_complete(message.req_id, true),
+            Response_Complete{
+                req_id = message.req_id,
+                has_values = true,
+            },
 		)
-		simple_net_stub(label, "System_Request.No_Args", verbose)
 
 	case Scene_Ready2:
-		// predict_caleb sent_human_readable: not found in sent_human_readable
-		append(
-			&response_messages,
-			simple_ping_response_msg(message.req_id, args.clock),
-			simple_response_complete(message.req_id, true),
-		)
-		simple_net_stub(label, "System_Request.Ping", verbose)
+//   "sent_human_readable": "System_Request msg_id=Scene_Ready2 req=9 args=Scene_Ready handle=141",
+//   "real_human_readable": "Response_Msg req=9 data=Bool_Result v=true | Scene_Message handle=141 route=3(gameVersion.update) [\"bot,1.05.*\"] | Response_Complete req=9 has_values=true | Response_Complete req=12 has_values=true",
+		simple_server_state.scene_ready_args = args
+		append(&response_messages, simple_bool_response_msg(message.req_id, true))
+		if simple_server_state.scene_ready_args.sent_game_version_update == false {
+			append(
+				&response_messages,
+				Response_Message {
+                    req_id = message.req_id,
+					data = Scene_Message {
+						handle = u8(args.scene_handle),
+						route = get_route_from_handle(simple_server_state, args.scene_handle, "gameVersion.update"),
+						body = GameVersion_Update_Body{accepted_version="bot,1.05.*"},
+					},
+				},
+			)
+			simple_server_state.scene_ready_args.sent_game_version_update = true
+		}
+		append(&response_messages, simple_response_complete(message.req_id, true))
 	case Connect_To_Scene:
-		// predict_caleb sent_human_readable t=2026-06-06T01:03:49.582001573Z line=  "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
+//  "sent_human_readable": "System_Request msg_id=Connect_To_Scene req=7 args=Connect token=449B routes=[stormancer.rpc.completed#0, stormancer.rpc.next#0, gameVersion.update#0, stormancer.rpc.cancel#0, sendRequest#0, stormancer.rpc.error#0, serverVersion.update#0, users.renewCredentials#0] scene_meta={stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.nintendo=\"enabled\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\", stormancer.plugins.steam=\"4.2.1.42\", appId=\"live-1-05-00\", accountId=\"darktales\", stormancer.gameVersion=\"default\", stormancer.plugins.psn=\"202006171\"} conn_meta={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
+//   "real_human_readable": "Response_Msg req=7 data=Scene_Connection_Result handle=141 routes=[stormancer.rpc.completed#1, stormancer.rpc.next#2, gameVersion.update#3, stormancer.rpc.cancel#4, sendRequest#5, stormancer.rpc.error#6, serverVersion.update#7, users.renewCredentials#8] | Response_Complete req=7 has_values=true",
+        simple_server_state.connect_to_scene_args = args
 
-		return
+        append(&response_messages, Response_Message {
+            req_id = message.req_id,
+            data = Scene_Connection_Result {
+                handle = len(simple_server_state.scenes) + SCENE_HANDLE_MIN,
+                routes = args.routes,
+            },
+        })
+        append(&simple_server_state.scenes, Response_Complete{
+            req_id = message.req_id,
+            has_values = true,
+        })
+
 	case Disconnect_From_Scene:
         // predict_caleb sent_human_readable t=2026-06-06T01:04:26.261603647Z line=  "sent_human_readable": "System_Request msg_id=Disconnect_From_Scene req=36 args=Disconnect handle=144",
 		append(
@@ -939,7 +731,7 @@ simple_dispatch_response_msg :: proc(
 	}
 }
 
-simple_dispatch_scene_message :: proc(
+get_response_from_scene_message :: proc(
 	client_id: int,
 	label: string,
 	message: Scene_Message,
@@ -947,7 +739,9 @@ simple_dispatch_scene_message :: proc(
 	simple_server_state: ^Simple_Server_State,
 ) -> (
 	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message) {
-	switch body in message.body {
+    route:=simple_server_state.scene[message.scene_handle - SCENE_HANDLE_MIN].routes[message.route]
+
+	switch route {
 	case Scene_Raw_Body:
 		simple_server_state.scene_raw_body = body
 		// predict_caleb sent_human_readable: not found in sent_human_readable
@@ -1007,37 +801,61 @@ simple_dispatch_scene_message :: proc(
 		simple_server_state.stormancer_rpc_error = body
 		// predict_caleb sent_human_readable: not found in sent_human_readable
 		simple_net_stub(label, "Scene_Message.Stormancer_Rpc_Error", verbose)
-	case Authentication_Login_Body:
-		simple_server_state.authentication_login = body
-		peer := login_canonical_label_from_ticket(transmute([]byte)body.ticket)
-		if len(peer) == 0 do peer = label
-		steam_id := steam_id_from_login_ticket(body.ticket)
-		if len(steam_id) == 0 do steam_id = party_member_steam_id_for_peer(peer)
-		simple_server_state.identity_label = peer
-		simple_server_state.steam_id = steam_id
-		user_id := ""
-		if id, ok := g_simple_user_ids_by_steam[steam_id]; ok do user_id = id
-		if len(user_id) == 0 do user_id = user_id_for_peer(peer)
-		steam_identity := fmt.aprintf("steam:%s", steam_id)
-		login_result := mpe_array(
-			{
-				mpe_nil(),
-				mpe_bool(true),
-				mpe_str(user_id),
-				mpe_str(""),
-				mpe_map({mpe_str("steam"), mpe_str(steam_identity)}),
-				mpe_byte(MP_EMPTY_MAP),
-			},
-		)
-		// "Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=1 [[nil, true, \"4168ffb24de245f88060d27c9580685e\", \"\", {\"steam\": \"steam:76561197977870267\"}, {}]]"
-		simple_append_rpc_response(
-			&response_messages,
-			message.scene_handle,
-			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
-			get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
-			body.rpc_id,
-			login_result,
-		)
+	case "Authentication.Login":
+//         "sent_human_readable": "Scene_Message handle=141 route=6(Authentication.Login) rpc=1 [[\"steam\", {\"gameVersion.clientVersion\": \"1.05.00.05\", \"provider\": \"steam\", \"ticket\": \"140000004F316731E9C817C7BB9F0C0101001001C24E236A180000000100000005000000C7D1724E00372436898F5A0AB9000000B20000003200000004000000BB9F0C0101001001F09A1F00A7599BB88101010A00000000BC531B6A3C03376A010059C2100000000000BA6E72D9F085C7D5CD2628D22C0C0D67544C6D4C162CA664248F076E7D4D8A1CED297A86B596A9A28B2CAF53E1FC7E91B8D486F59399B96EC6C110FED6589A3B49E0846268CCC94B17B81FEAF04BB0B0DC23263FFEEA5B70A43A1FA6CC3427AF84EC70F53AFED224AE327149656DEB25CDA05E87CDF2677BA72EE53B8F905BA0\", \"version\": \"v1\", \"appId\": \"2071280\"}]]",
+//   "real_human_readable": "Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=1 [[nil, true, \"4168ffb24de245f88060d27c9580685e\", \"\", {\"steam\": \"steam:76561197977870267\"}, {}]] | Scene_Message handle=141 route=1(stormancer.rpc.completed) rpc=257 [0]",
+  
+        nodes := message.body.values.nodes
+        root := scene_seq_root(message.body, 0)
+        meta := scene_array_child(nodes, root, 1)
+        authentication_login_body = Authentication_Login_Body {
+            rpc_id = message.body.rpc_id,
+            provider = scene_node_text(nodes, scene_array_child(nodes, root, 0)),
+            client_version = scene_map_string(nodes, meta, "gameVersion.clientVersion"),
+            ticket = scene_map_string(nodes, meta, "ticket"),
+            version = scene_map_string(nodes, meta, "version"),
+            app_id = scene_map_string(nodes, meta, "appId"),
+        }
+
+		simple_server_state.authentication_login = authentication_login_body
+
+		simple_server_state.steam_id := steam_id_from_login_ticket(authentication_login_body.ticket)
+		simple_server_state.user_id := user_id_by_steam_id[simple_server_state.steam_id]
+
+		if id, ok :=g_simple_user_ids_by_steam[simple_server_state.steam_id]; ok do simple_server_state.user_id = id
+        if len(simple_server_state.user_id) == 0 {
+            simple_server_state.user_id = fmt.aprintf("%032s", simple_server_state.steam_id)
+        }
+		steam_identity := fmt.aprintf("steam:%s", simple_server_state.steam_id)
+		append(
+            &response_messages,
+            Scene_Message{
+                scene_handle = message.scene_handle,
+                route = get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+                body = Stormancer_Rpc_Next_Body { 
+                    rpc_id = authentication_login_body.rpc_id, // or maybe hardcode 1 since we know that's what the client expects?
+                    result_is_nil = true,
+                    success = true,
+                    user_id = simple_server_state.user_id,
+                    error_message = "",
+                    identity_count = 1,
+                    steam_identity = steam_identity,
+                    steam_id = simple_server_state.steam_id,
+                    metadata_count = 0,
+                },
+            },
+        )
+        append(
+            &response_messages,Scene_Message{
+                scene_handle = message.scene_handle,
+                route = get_route_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+                body = Stormancer_Rpc_Completed_Body {
+                    rpc_id = 257, // the client seems to expect this specific rpc_id for the completed message after login
+                    message_sent = true,
+                    raw = 0
+                }
+            }
+        )
 	case Friends_Subscribe_Body:
 		simple_server_state.friends_subscribe = body
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:58.633021004Z line=  "sent_human_readable": "Scene_Message handle=142 route=5(Friends.Subscribe) rpc=1 []",
