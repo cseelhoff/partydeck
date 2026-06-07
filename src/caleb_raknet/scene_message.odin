@@ -289,6 +289,12 @@ get_response_from_scene_message :: proc(
 		body := message.body.(Party_CreateInvitationCode_Body) or_return
 		simple_server_state.party_create_invitation = body
 		invitation_code := simple_invitation_code(client_id)
+		if g_simple_party_scene_by_invite != nil {
+			if party_handle, ok := simple_first_party_scene_handle(simple_server_state); ok {
+				party, _ := simple_scene_from_handle(simple_server_state, party_handle)
+				g_simple_party_scene_by_invite[invitation_code] = scene_suffix(party.scene_id)
+			}
+		}
 		append(
 			&response_messages,
 			Scene_Message{
@@ -373,9 +379,14 @@ get_response_from_scene_message :: proc(
 		body := message.body.(PartyManagement_CreateConnectionTokenFromInvitationCode_Body) or_return
 		simple_server_state.party_conn_token_from_code = body
 		party_scene := ""
-		if party_handle, ok := simple_first_party_scene_handle(simple_server_state); ok {
+		if g_simple_party_scene_by_invite != nil {
+			if known_scene, ok := g_simple_party_scene_by_invite[body.invitation_code]; ok do party_scene = known_scene
+		}
+		if len(party_scene) == 0 {
+			if party_handle, ok := simple_first_party_scene_handle(simple_server_state); ok {
 			party, _ := simple_scene_from_handle(simple_server_state, party_handle)
 			party_scene = scene_suffix(party.scene_id)
+			}
 		}
 		append(
 			&response_messages,

@@ -43,6 +43,7 @@ simple_backup_replay :: proc(path: string, out_path := SIMPLE_DEFAULT_PREDICT_FI
 	defer free_all(scratch)
 
 	simple_scene_infos_load(scratch) or_return
+	if g_simple_party_scene_by_invite == nil do g_simple_party_scene_by_invite = make(map[string]string, scratch)
 
 	out := strings.builder_make(scratch)
 	peers: [dynamic]^Peer_State
