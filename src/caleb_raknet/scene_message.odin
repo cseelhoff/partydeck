@@ -12,7 +12,10 @@ get_response_from_scene_message :: proc(
 	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
 	ok: bool,
 ) {
-	route := simple_server_state.scenes[message.scene_handle - SCENE_HANDLE_MIN][message.route_handle]
+	scene, scene_ok := simple_scene_from_handle(simple_server_state, u64(message.scene_handle))
+	if !scene_ok do return
+	if message.route_handle >= u16(len(scene.routes)) do return
+	route := scene.routes[message.route_handle]
 	switch route {
 	case "Authentication.Login":
 		body := message.body.(Authentication_Login_Body) or_return
@@ -51,7 +54,7 @@ get_response_from_scene_message :: proc(
                 scene_handle = message.scene_handle,
 				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
                 body = Stormancer_Rpc_Completed_Body {
-                    rpc_id = 257, // the client seems to expect this specific rpc_id for the completed message after login
+					rpc_id = stormancer_rpc_completed_id(body.rpc_id, true),
                     message_sent = true,
                 }
             }
@@ -81,7 +84,7 @@ get_response_from_scene_message :: proc(
                 scene_handle = message.scene_handle,
                 route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
                 body = Stormancer_Rpc_Completed_Body {
-                    rpc_id = 513, 
+					rpc_id = stormancer_rpc_completed_id(body.rpc_id, true),
                     message_sent = true,
                 },
             }
@@ -110,7 +113,7 @@ get_response_from_scene_message :: proc(
 				scene_handle = message.scene_handle,
 				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
 				body = Stormancer_Rpc_Completed_Body {
-					rpc_id = 769,
+					rpc_id = stormancer_rpc_completed_id(body.rpc_id, true),
 					message_sent = true,
 				},
 			},
@@ -126,7 +129,7 @@ get_response_from_scene_message :: proc(
             scene_handle = message.scene_handle,
 			route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
             body = Stormancer_Rpc_Completed_Body {
-                rpc_id = 1024, // the client seems to expect this specific rpc_id for the completed message after updating user options
+				rpc_id = stormancer_rpc_completed_id(body.rpc_id, false),
                 message_sent = true,
             }
         })
@@ -153,7 +156,7 @@ get_response_from_scene_message :: proc(
 			scene_handle = message.scene_handle,
 			route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
 			body = Stormancer_Rpc_Completed_Body {
-				rpc_id = 256, // the client seems to expect this specific rpc_id for the completed message after friends subscribe
+				rpc_id = stormancer_rpc_completed_id(body.rpc_id, false),
 				message_sent = true,
 			}
 		})
@@ -183,7 +186,7 @@ get_response_from_scene_message :: proc(
 				scene_handle = message.scene_handle,
 				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
 				body = Stormancer_Rpc_Completed_Body {
-					rpc_id = 257,
+					rpc_id = stormancer_rpc_completed_id(body.rpc_id, true),
 					message_sent = true,
 				},
 			},

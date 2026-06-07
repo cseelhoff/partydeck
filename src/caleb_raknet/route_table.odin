@@ -116,9 +116,8 @@ route_registry_observe :: proc(
 	case System_Request:
 		reg.roles[from] = .Client
 		if c, ok := f.args.(Connect_To_Scene_Args); ok {
-			tok := parse_connection_token(c.token, scratch)
-			if tok.ok {
-				reg.req_scene[f.req_id] = strings.clone(scene_suffix(tok.scene_id), reg.allocator)
+			if c.token.ok {
+				reg.req_scene[f.req_id] = strings.clone(scene_suffix(c.token.scene_id), reg.allocator)
 			}
 		}
 	case Response_Msg:

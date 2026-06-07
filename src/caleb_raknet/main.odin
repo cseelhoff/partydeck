@@ -2150,7 +2150,7 @@ predict_caleb_step :: proc(
 				#partial switch args in decoded.args {
 				case Connect_To_Scene_Args:
 					handle := next_connect_scene_handle(live.txns[:], ps)
-					tok := parse_connection_token(args.token, scratch)
+					tok := args.token
 					if tok.ok do predict_caleb_set_scene_handle(live, txn.label, scene_suffix(tok.scene_id), u8(handle))
 					raw := build_scene_connection_result_raw(handle, args.routes, scratch)
 					append_response_msg(&txn.preds, decoded.req_id, raw, scratch)
@@ -5598,7 +5598,7 @@ predict_caleb :: proc(
 					#partial switch args in decoded.args {
 					case Connect_To_Scene_Args:
 						handle := next_connect_scene_handle(txns[:], ps)
-						tok := parse_connection_token(args.token, scratch)
+						tok := args.token
 						if tok.ok {
 							scene := scene_suffix(tok.scene_id)
 							predict_caleb_set_scene_handle_entry(

@@ -47,8 +47,27 @@ get_system_request_response :: proc(
 //   "real_human_readable": "Response_Msg req=9 data=Bool_Result v=true | Scene_Message handle=141 route=3(gameVersion.update) [\"bot,1.05.*\"] | Response_Complete req=9 has_values=true | Response_Complete req=12 has_values=true",
 		args := message.args.(Scene_Ready_Args) or_return
 		simple_server_state.scene_ready_args = args
+// 		  "sent_human_readable": "System_Request msg_id=Scene_Ready2 req=27 args=Scene_Ready handle=144",
+//   "real_human_readable": "Scene_Message handle=144 route=14(Steam.CreateLobby) rpc=1 [[1, 4, true, {\"partyDataToken\": b64:\"{\\\"PartyId\\\":\\\"5bbb3677-445a-42d1-a9a9-83094be3639a\\\",\\\"LeaderUserId\\\":\\\"4168ffb24de245f88060d27c9580685e\\\",\\\"LeaderSteamId\\\":76561197977870267}\"}]] | Response_Msg req=27 data=Bool_Result v=true | Response_Complete req=27 has_values=true | Scene_Message handle=144 route=7(party.settingsUpdated) rpc=3 [3, [\"matchmaking\", \"\", 1, false, true, {}, \"\", \"5bbb3677-445a-42d1-a9a9-83094be3639a\"]] | Scene_Message handle=144 route=3(party.memberDataUpdated) rpc=4 [4, [\"4168ffb24de245f88060d27c9580685e\", json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", \"\", 0]], 2], 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] | Scene_Message handle=144 route=7(party.settingsUpdated) rpc=5 [5, [\"matchmaking\", json:{\"InvitationCode\":\"\",\"GameMode\":0,\"GameDifficulty\":0,\"GameModifiers\":[],\"MergerDifficulty\":0}, 3, false, true, {}, \"\", \"5bbb3677-445a-42d1-a9a9-83094be3639a\"]] | Scene_Message handle=144 route=3(party.memberDataUpdated) rpc=6 [6, [\"4168ffb24de245f88060d27c9580685e\", json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":true,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", \"\", 0]], 2], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]",
+		scene, scene_ok := simple_scene_from_handle(simple_server_state, args.scene_handle)
+		if scene_ok && simple_scene_is_party(scene) {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = u8(args.scene_handle),
+					route_handle = get_route_num_from_handle(simple_server_state, args.scene_handle, "Steam.CreateLobby"),
+					body = Steam_CreateLobby_Body{
+						rpc_id = 1,
+						lobby_type = 1,
+						max_members = 4,
+						joinable = true,
+						party_data_token_json = simple_party_data_token_json(simple_server_state, scene),
+					},
+				},
+			)
+		}
 		append(&response_messages, Response_Msg{req_id = message.req_id, data = Bool_Result{value = true}})
-		if simple_server_state.scene_ready_args.sent_game_version_update == false {
+		if scene_ok && simple_scene_has_route(scene, "gameVersion.update") && simple_server_state.scene_ready_args.sent_game_version_update == false {
 			append(
 				&response_messages,
 				Scene_Message {
@@ -69,15 +88,14 @@ get_system_request_response :: proc(
         append(&response_messages, Response_Msg {
             req_id = message.req_id,
             data = Scene_Connection_Result {
-				scene_handle = len(simple_server_state.scenes) + SCENE_HANDLE_MIN,
+				scene_handle = u64(len(simple_server_state.scenes) + SCENE_HANDLE_MIN),
                 routes = args.routes,
             },
         }, Response_Complete {
 			req_id = message.req_id,
 			has_values = true,
 		})
-		append(&simple_server_state.scenes, args.routes)
-
+		append(&simple_server_state.scenes, Simple_Scene{scene_id = args.token.scene_id, routes = args.routes})
 	case System_Request_Id.Get_Scene_Infos:
 // "sent_human_readable": "System_Request msg_id=Get_Scene_Infos req=2 args=Get_Scene_Infos token=449B metadata={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\"}",
 //   "real_human_readable": "Response_Msg req=2 data=Scene_Infos shard=0 scene=\"authenticator\" serializer=\"msgpack/array\" meta={stormancer.plugins.nintendo=\"enabled\", stormancer.plugins.steam=\"4.2.1.42\", stormancer.gameVersion=\"default\", stormancer.plugins.rpc=\"1.1.0\", stormancer.plugins.psn=\"202006171\", accountId=\"darktales\", appId=\"live-1-05-00\", Stormancer.plugins.XBLServices.useModernGamerTag=\"false\"} routes=[stormancer.rpc.next#0, stormancer.rpc.cancel#1, stormancer.rpc.error#2, stormancer.rpc.completed#3, Authentication.GetMetadata#4, Authentication.Register#5, Authentication.Login#6, Authentication.GetStatus#7, Authentication.Unlink#8, sendRequest#9, sceneauthorization.gettoken#10, UserSession.GetAuthenticatedUsersCountPublic#11, UserSession.CreateUserBearerToken#12, UserSession.GetUserIdFromBearerToken#13, UserSession.GetUserOptions#14, UserSession.UpdateUserOptions#15, NX.GetAdvertisedParties#16, Steam.QueryUserIds#17, Steam.DecodePartyDataBearerTokens#18, Locator.GetSceneConnectionToken#19] | Response_Complete req=2 has_values=true",
@@ -194,7 +212,78 @@ get_system_request_response :: proc(
                 }
             )
             append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
-        }
+        } else if args.token.scene_id == "party-manager" {
+			simple_server_state.get_scene_infos_args = args
+// 			 "sent_human_readable": "System_Request msg_id=Get_Scene_Infos req=23 args=Get_Scene_Infos token=1053B metadata={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
+//   "real_human_readable": "Response_Msg req=23 data=Scene_Infos shard=0 scene=\"party-manager\" serializer=\"msgpack/array\" meta={stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.rpc=\"1.1.0\"} routes=[stormancer.rpc.next#0, stormancer.rpc.cancel#1, stormancer.rpc.error#2, stormancer.rpc.completed#3, partymanagement.createsession#4, PartyManagement.CreateConnectionTokenFromInvitationCode#5, PartyManagement.CreateConnectionTokenFromPartyId#6, PartyManagement.SearchParties#7] | Response_Complete req=23 has_values=true",
+			append(
+				&response_messages,
+				Response_Msg{
+					req_id = message.req_id,
+					data = Scene_Infos {
+						shard_id = 0,
+						scene_id = "party-manager",
+						selected_serializer = "msgpack/array",
+						stormancer_partymanagement = "2020-05-20.1",
+						stormancer_plugins_rpc = "1.1.0",
+						routes = Routes {
+							"stormancer.rpc.next",
+							"stormancer.rpc.cancel",
+							"stormancer.rpc.error",
+							"stormancer.rpc.completed",
+							"partymanagement.createsession",
+							"PartyManagement.CreateConnectionTokenFromInvitationCode",
+							"PartyManagement.CreateConnectionTokenFromPartyId",
+							"PartyManagement.SearchParties",
+						},
+					},
+				},
+			)
+			append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
+			
+		} else if len(args.token.scene_id) >= 6 && args.token.scene_id[:6] == "party-" {
+			simple_server_state.get_scene_infos_args = args
+// 			  "sent_human_readable": "System_Request msg_id=Get_Scene_Infos req=25 args=Get_Scene_Infos token=949B metadata={stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
+//   "real_human_readable": "Response_Msg req=25 data=Scene_Infos shard=0 scene=\"party-5bbb3677-445a-42d1-a9a9-83094be3639a\" serializer=\"msgpack/array\" meta={stormancer.party=\"2022-06-09.1\", stormancer.party.revision=\"2020-08-21.1\", stormancer.plugins.rpc=\"1.1.0\", stormancer.partyMerging=\"0.1.2.79\"} routes=[stormancer.rpc.next#0, stormancer.rpc.cancel#1, stormancer.rpc.error#2, stormancer.rpc.completed#3, party.updatepartysettings#4, party.updatepartyuserdata#5, Party.UpdatePartyUserData2#6, party.promoteleader#7, party.kickplayer#8, party.updategamefinderplayerstatus#9, party.getpartystate#10, party.getpartystate2#11, party.sendinvitation#12, Party.CreateInvitationCode#13, Party.CancelInvitationCode#14, JoinGameParty.RequestReservationInCurrentGamesession#15, PartyMerging.GetMergerStatus#16, PartyMerging.Start#17, PartyMerging.Stop#18, SteamParty.CreatePartyDataBearerToken#19] | Response_Complete req=25 has_values=true",
+			append(
+				&response_messages,
+				Response_Msg{
+					req_id = message.req_id,
+					data = Scene_Infos {
+						shard_id = 0,
+						scene_id = args.token.scene_id,
+						selected_serializer = "msgpack/array",
+						stormancer_party = "2022-06-09.1",
+						stormancer_party_revision = "2020-08-21.1",
+						stormancer_plugins_rpc = "1.1.0",
+						stormancer_party_merging = "0.1.2.79",
+						routes = Routes {
+							"stormancer.rpc.next",
+							"stormancer.rpc.cancel",
+							"stormancer.rpc.error",
+							"stormancer.rpc.completed",
+							"party.updatepartysettings",
+							"party.updatepartyuserdata",
+							"Party.UpdatePartyUserData2",
+							"party.promoteleader",
+							"party.kickplayer",
+							"party.updategamefinderplayerstatus",
+							"party.getpartystate",
+							"party.getpartystate2",
+							"party.sendinvitation",
+							"Party.CreateInvitationCode",
+							"Party.CancelInvitationCode",
+							"JoinGameParty.RequestReservationInCurrentGamesession",
+							"PartyMerging.GetMergerStatus",
+							"PartyMerging.Start",
+							"PartyMerging.Stop",
+							"SteamParty.CreatePartyDataBearerToken",
+						},
+					},
+				},
+			)
+			append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
+		}
 }
 	ok = true
 	return

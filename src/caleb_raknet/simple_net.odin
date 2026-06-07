@@ -30,7 +30,7 @@ Poll_Slot :: enum int {
 
 Simple_Server_State :: struct {
 	remote:                      net.Endpoint,
-    scenes:                      [dynamic; SCENE_CONNECTION_RESULT_MAX_SCENES]Routes,
+	scenes:                      [dynamic; SCENE_CONNECTION_RESULT_MAX_SCENES]Simple_Scene,
 	connected_ping:              Connected_Ping,
 	connected_pong:              Connected_Pong,
 	connection_request:          Connection_Request,

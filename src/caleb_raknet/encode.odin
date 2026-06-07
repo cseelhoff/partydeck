@@ -14,6 +14,7 @@ package caleb_raknet
 // No OOP, no methods -- a switch over the same tagged union, writing into a caller-
 // owned byte buffer. Output uses `allocator`; the caller owns the returned slice.
 
+import "core:encoding/base64"
 import "core:slice"
 
 // Re-encode `message` into its on-the-wire bytes (leading id + body). The result is
@@ -126,10 +127,40 @@ encode_scene_message_body :: proc(
 		return out[:]
 	case Stormancer_Rpc_Next_Body:
 		return encode_stormancer_rpc_next_body(b, allocator)
+	case GameVersion_Update_Body:
+		return mpe_str(b.accepted_version, allocator)
 	case Friends_Notification_Body:
 		if len(b.friends) > 0 do return encode_friends_notification_body(b, allocator)
+	case Steam_CreateLobby_Body:
+		return encode_steam_create_lobby_body(b, allocator)
 	}
 	return fallback_raw_body
+}
+
+encode_steam_create_lobby_body :: proc(
+	body: Steam_CreateLobby_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	token := body.party_data_token
+	if len(token) == 0 && len(body.party_data_token_json) > 0 {
+		encoded, err := base64.encode(transmute([]byte)body.party_data_token_json, base64.ENC_TABLE, allocator)
+		if err == nil do token = string(encoded)
+	}
+	append(
+		&out,
+		..mpe_array(
+			{
+				mpe_uint(body.lobby_type, allocator),
+				mpe_uint(body.max_members, allocator),
+				mpe_bool(body.joinable, allocator),
+				mpe_map({mpe_str("partyDataToken", allocator), mpe_str(token, allocator)}, allocator),
+			},
+			allocator,
+		),
+	)
+	return out[:]
 }
 
 encode_stormancer_rpc_next_body :: proc(

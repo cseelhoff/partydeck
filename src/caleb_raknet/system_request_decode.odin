@@ -9,7 +9,7 @@ Metadata_Entry :: struct {
 }
 
 Connect_To_Scene_Args :: struct {
-	token:                                             string,
+	token:                                             Connection_Token,
 	routes:                                            Routes,
 	scene_stormancer_plugins_rpc:                      string,
 	scene_stormancer_plugins_nintendo:                 string,
@@ -115,7 +115,7 @@ parse_system_request_args :: proc(
 		scene_metadata := collect_metadata(n, msgpack_map_get(n, 0, "SceneMetadata"), allocator)
 		connection_metadata := collect_metadata(n, msgpack_map_get(n, 0, "ConnectionMetadata"), allocator)
 		return Connect_To_Scene_Args {
-			token = node_str(n, msgpack_map_get(n, 0, "Token")),
+			token = parse_connection_token(node_str(n, msgpack_map_get(n, 0, "Token")), allocator),
 			routes = collect_routes(n, msgpack_map_get(n, 0, "Routes"), allocator),
 			scene_stormancer_plugins_rpc = metadata_value(scene_metadata, "stormancer.plugins.rpc"),
 			scene_stormancer_plugins_nintendo = metadata_value(scene_metadata, "stormancer.plugins.nintendo"),
@@ -252,7 +252,9 @@ collect_routes :: proc(nodes: []Msgpack_Node, arr_idx: int, allocator := context
 write_system_request_args :: proc(sb: ^strings.Builder, args: System_Request_Args) {
 	switch a in args {
 	case Connect_To_Scene_Args:
-		fmt.sbprintf(sb, "Connect token=%dB routes=", len(a.token))
+		strings.write_string(sb, "Connect token=")
+		write_connection_token(sb, a.token)
+		strings.write_string(sb, " routes=")
 		write_routes(sb, a.routes)
 	case Get_Scene_Infos_Args:
 		strings.write_string(sb, "Get_Scene_Infos token=")

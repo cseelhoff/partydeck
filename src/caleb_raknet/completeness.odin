@@ -101,7 +101,7 @@ scan_system_request_args :: proc(
 ) {
 	switch a in args {
 	case Connect_To_Scene_Args:
-		scan_token(a.token, "Connect_To_Scene.Token", sink, allocator)
+		scan_connection_token(a.token, "Connect_To_Scene.Token", sink)
 		scan_routes(a.routes, "Connect_To_Scene.Routes", sink)
 		scan_connect_to_scene_args(a, sink)
 	case Get_Scene_Infos_Args:
