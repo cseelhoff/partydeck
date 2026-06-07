@@ -52,9 +52,11 @@ get_system_request_response :: proc(
 		scene, scene_ok := simple_scene_from_handle(simple_server_state, args.scene_handle)
 		party_handle, party_handle_ok := simple_first_party_scene_handle(simple_server_state)
 		joined_party_handle, joined_party_ok := simple_joined_party_scene_handle(simple_server_state)
+		gamesession_handle, gamesession_ok := simple_gamesession_scene_handle(simple_server_state)
 		is_matchmaking_ready := scene_ok && scene_suffix(scene.scene_id) == "matchmaking"
 		is_initial_matchmaking_ready := is_matchmaking_ready && party_handle_ok && args.scene_handle == party_handle + 1
 		is_joined_matchmaking_ready := is_matchmaking_ready && joined_party_ok && args.scene_handle > joined_party_handle
+		is_gamesession_ready := scene_ok && gamesession_ok && args.scene_handle == gamesession_handle
 		is_first_party_ready := scene_ok && simple_scene_is_party(scene) && party_handle_ok && args.scene_handle == party_handle
 		is_joined_party_ready := scene_ok && simple_scene_is_party(scene) && (!party_handle_ok || args.scene_handle != party_handle)
 		settings_update := simple_server_state.party_update_settings
@@ -133,6 +135,105 @@ get_system_request_response :: proc(
 			simple_server_state.scene_ready_args.sent_game_version_update = true
 		}
 		append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
+		if is_gamesession_ready {
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = u8(args.scene_handle),
+					route_handle = get_route_num_from_handle(simple_server_state, args.scene_handle, "stormancer.rpc.completed"),
+					body = Stormancer_Rpc_Completed_Body{
+						rpc_id = stormancer_rpc_completed_id(1, true),
+						message_sent = true,
+					},
+				},
+			)
+			if joined_party_ok && args.scene_handle > joined_party_handle {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(joined_party_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, joined_party_handle, "party.memberDataUpdated"),
+						body = simple_party_member_data_updated_body_with_lobby_state(28, 17, simple_server_state, true, 11, 6),
+					},
+				)
+				if other_id := simple_other_known_user_id(simple_server_state.user_id); other_id != "" {
+					append(
+						&response_messages,
+						Scene_Message{
+							scene_handle = u8(joined_party_handle),
+							route_handle = get_route_num_from_handle(simple_server_state, joined_party_handle, "party.memberDataUpdated"),
+							body = simple_party_member_data_updated_body_for_user(30, 18, other_id, true, 9, 9),
+						},
+					)
+				}
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(joined_party_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, joined_party_handle, "party.memberDataUpdated"),
+						body = simple_party_member_data_updated_body_with_lobby_state(34, 20, simple_server_state, true, 9, 17),
+					},
+				)
+			} else if party_handle_ok {
+				party_scene := simple_server_state.scenes[party_handle - u64(SCENE_HANDLE_MIN)]
+				custom_data_json := simple_server_state.party_update_settings.custom_data_json
+				if custom_data_json == "" && simple_server_state.party_conn_token_from_code.invitation_code != "" {
+					custom_data_json = simple_party_settings_custom_json(simple_server_state.party_conn_token_from_code.invitation_code)
+				}
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(party_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, party_handle, "party.settingsUpdated"),
+						body = simple_party_settings_updated_snapshot(25, 15, 7, custom_data_json, party_scene),
+					},
+				)
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(party_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, party_handle, "party.settingsUpdated"),
+						body = simple_party_settings_updated_gamesession_body(27, 16, 8, simple_server_state, party_scene),
+					},
+				)
+				if other_id := simple_other_known_user_id(simple_server_state.user_id); other_id != "" {
+					append(
+						&response_messages,
+						Scene_Message{
+							scene_handle = u8(party_handle),
+							route_handle = get_route_num_from_handle(simple_server_state, party_handle, "party.memberDataUpdated"),
+							body = simple_party_member_data_updated_body_for_user(29, 17, other_id, true, 11, 6),
+						},
+					)
+				}
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(party_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, party_handle, "party.memberDataUpdated"),
+						body = simple_party_member_data_updated_body_with_lobby_state(31, 18, simple_server_state, true, 9, 9),
+					},
+				)
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(party_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, party_handle, "party.settingsUpdated"),
+						body = simple_party_settings_updated_gamesession_body(33, 19, 10, simple_server_state, party_scene),
+					},
+				)
+				if other_id := simple_other_known_user_id(simple_server_state.user_id); other_id != "" {
+					append(
+						&response_messages,
+						Scene_Message{
+							scene_handle = u8(party_handle),
+							route_handle = get_route_num_from_handle(simple_server_state, party_handle, "party.memberDataUpdated"),
+							body = simple_party_member_data_updated_body_for_user(35, 20, other_id, true, 9, 17),
+						},
+					)
+				}
+			}
+		}
 		if is_initial_matchmaking_ready && party_handle_ok && has_pending_settings_update {
 			append(
 				&response_messages,

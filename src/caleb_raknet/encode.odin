@@ -255,12 +255,16 @@ encode_scene_message_body :: proc(
 		return encode_steam_create_lobby_body(b, allocator)
 	case Steam_JoinLobby_Body:
 		return encode_steam_join_lobby_body(b, allocator)
+	case Steam_UpdateLobbyJoinable_Body:
+		return encode_steam_update_lobby_joinable_body(b, allocator)
 	case Party_State_Response_Body:
 		return encode_party_state_response_body(b, allocator)
 	case Party_SettingsUpdated_Body:
 		return encode_party_settings_updated_body(b, allocator)
 	case Party_MemberDataUpdated_Body:
 		return encode_party_member_data_updated_body(b, allocator)
+	case Party_MemberDisconnected_Body:
+		return encode_party_member_disconnected_body(b, allocator)
 	case Party_MemberStatusUpdated_Body:
 		return encode_party_member_status_updated_body(b, allocator)
 	case PartyMerging_GetMergerStatus_Result_Body:
@@ -385,6 +389,17 @@ encode_party_member_data_updated_body :: proc(
 	return out[:]
 }
 
+encode_party_member_disconnected_body :: proc(
+	body: Party_MemberDisconnected_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	append(&out, ..mpe_uint(body.version, allocator))
+	append(&out, ..mpe_array({mpe_str(body.user_id, allocator), mpe_uint(body.reason, allocator)}, allocator))
+	return out[:]
+}
+
 encode_party_member_data_tail_value :: proc(
 	value: Party_MemberData_Tail_Value,
 	allocator := context.allocator,
@@ -483,6 +498,18 @@ encode_party_state_response_body :: proc(
 }
 
 encode_party_settings :: proc(settings: Scene_Party_Settings, allocator := context.allocator) -> []byte {
+	server_data := mpe_byte(MP_EMPTY_MAP, allocator)
+	if settings.server_status != "" || settings.server_status_details != "" {
+		server_data = mpe_map(
+			{
+				mpe_str("stormancer.partyStatus", allocator),
+				mpe_str(settings.server_status, allocator),
+				mpe_str("stormancer.partyStatus.details", allocator),
+				mpe_str(settings.server_status_details, allocator),
+			},
+			allocator,
+		)
+	}
 	return mpe_array(
 		{
 			mpe_str(settings.game_finder, allocator),
@@ -490,7 +517,7 @@ encode_party_settings :: proc(settings: Scene_Party_Settings, allocator := conte
 			mpe_uint(settings.revision, allocator),
 			mpe_bool(settings.only_leader_invite, allocator),
 			mpe_bool(settings.is_joinable, allocator),
-			mpe_byte(MP_EMPTY_MAP, allocator),
+			server_data,
 			mpe_str(settings.public_data, allocator),
 			mpe_str(settings.party_id, allocator),
 		},
@@ -564,6 +591,16 @@ encode_steam_join_lobby_body :: proc(
 	out := make([dynamic]byte, allocator)
 	write_u16_le(&out, body.rpc_id)
 	append(&out, ..mpe_array({mpe_uint(body.lobby_id, allocator)}, allocator))
+	return out[:]
+}
+
+encode_steam_update_lobby_joinable_body :: proc(
+	body: Steam_UpdateLobbyJoinable_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	append(&out, ..mpe_array({mpe_uint(body.lobby_id, allocator), mpe_bool(body.joinable, allocator)}, allocator))
 	return out[:]
 }
 

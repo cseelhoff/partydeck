@@ -259,6 +259,58 @@ simple_party_state_response :: proc(
 	}
 }
 
+simple_party_state_known_members_response :: proc(
+	rpc_id: u16,
+	simple_server_state: ^Simple_Server_State,
+	scene: Simple_Scene,
+	allocator := context.allocator,
+) -> Party_State_Response_Body {
+	party_id := scene_suffix(scene.scene_id)
+	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
+	custom_data_json := simple_server_state.party_update_settings.custom_data_json
+	if custom_data_json == "" && simple_server_state.party_conn_token_from_code.invitation_code != "" {
+		custom_data_json = simple_party_settings_custom_json(simple_server_state.party_conn_token_from_code.invitation_code, allocator)
+	}
+	members := make([dynamic]Party_State_Member, allocator)
+	if g_simple_state_by_user_id != nil {
+		others := make([dynamic]string, allocator)
+		for user_id, _ in g_simple_state_by_user_id {
+			if user_id != "" && user_id != simple_server_state.user_id do append(&others, user_id)
+		}
+		simple_sort_strings(others[:])
+		for user_id in others {
+			if member, ok := simple_known_party_member(user_id, true, allocator); ok do append(&members, member)
+		}
+	}
+	if len(members) == 0 && g_simple_user_ids_by_steam != nil {
+		fallback := make([dynamic]string, allocator)
+		for _, user_id in g_simple_user_ids_by_steam {
+			if user_id != "" && user_id != simple_server_state.user_id do append(&fallback, user_id)
+		}
+		simple_sort_strings(fallback[:])
+		for user_id in fallback {
+			if member, ok := simple_known_party_member(user_id, true, allocator); ok do append(&members, member)
+		}
+	}
+	if simple_server_state.user_id != "" do append(&members, simple_party_member(simple_server_state, false, allocator))
+	if len(members) == 0 do append(&members, simple_party_member(simple_server_state, false, allocator))
+	return Party_State_Response_Body{
+		rpc_id = rpc_id,
+		settings = Scene_Party_Settings{
+			game_finder = "matchmaking",
+			custom_data_json = custom_data_json,
+			revision = 5,
+			only_leader_invite = false,
+			is_joinable = true,
+			public_data = "",
+			party_id = party_id,
+		},
+		leader_user_id = simple_server_state.user_id,
+		members = members[:],
+		revision = 11,
+	}
+}
+
 simple_joined_party_state_response :: proc(
 	rpc_id: u16,
 	simple_server_state: ^Simple_Server_State,
@@ -457,6 +509,54 @@ simple_party_settings_updated_snapshot :: proc(
 			revision = settings_revision,
 			only_leader_invite = false,
 			is_joinable = true,
+			public_data = "",
+			party_id = party_id,
+		},
+	}
+}
+
+simple_party_settings_updated_gamesession_body :: proc(
+	rpc_id: u16,
+	version: u64,
+	settings_revision: u64,
+	simple_server_state: ^Simple_Server_State,
+	scene: Simple_Scene,
+) -> Party_SettingsUpdated_Body {
+	party_id := scene_suffix(scene.scene_id)
+	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
+	invitation_code := ""
+	if g_simple_party_scene_by_invite != nil {
+		candidates := make([dynamic]string, context.temp_allocator)
+		for code, party_scene in g_simple_party_scene_by_invite {
+			known_party_id := scene_suffix(party_scene)
+			if len(known_party_id) >= 6 && known_party_id[:6] == "party-" do known_party_id = known_party_id[6:]
+			if known_party_id == party_id do append(&candidates, code)
+		}
+		simple_sort_strings(candidates[:])
+		if len(candidates) > 0 do invitation_code = candidates[0]
+	}
+	if invitation_code == "" do invitation_code = json_string_value(simple_server_state.party_update_settings.custom_data_json, "InvitationCode")
+	if invitation_code == "" do invitation_code = simple_server_state.party_conn_token_from_code.invitation_code
+	custom_data_json := ""
+	if invitation_code != "" do custom_data_json = simple_party_settings_custom_json(invitation_code)
+	if custom_data_json == "" do custom_data_json = simple_server_state.party_update_settings.custom_data_json
+	game_session_id := ""
+	if gamesession_handle, ok := simple_gamesession_scene_handle(simple_server_state); ok {
+		if gamesession_scene, scene_ok := simple_scene_from_handle(simple_server_state, gamesession_handle); scene_ok {
+			game_session_id = scene_suffix(gamesession_scene.scene_id)
+		}
+	}
+	return Party_SettingsUpdated_Body{
+		rpc_id = rpc_id,
+		version = version,
+		settings = Scene_Party_Settings{
+			game_finder = "matchmaking",
+			custom_data_json = custom_data_json,
+			revision = settings_revision,
+			only_leader_invite = false,
+			is_joinable = false,
+			server_status = "gamesession",
+			server_status_details = game_session_id,
 			public_data = "",
 			party_id = party_id,
 		},

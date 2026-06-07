@@ -153,6 +153,113 @@ get_response_from_scene_message :: proc(
 				)
 			}
 		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(21, false) {
+			if joined_party_handle, ok := simple_joined_party_scene_handle(simple_server_state); ok && joined_party_handle == u64(message.scene_handle) {
+				if gamesession_handle, game_ok := simple_gamesession_scene_handle(simple_server_state); game_ok {
+					if other_user_id := simple_other_known_user_id(simple_server_state.user_id); other_user_id != "" {
+						append(
+							&response_messages,
+							Scene_Message{
+								scene_handle = u8(gamesession_handle),
+								route_handle = get_route_num_from_handle(simple_server_state, gamesession_handle, "player.update"),
+								body = Player_Update_Body{user_id = other_user_id, state = 1},
+							},
+						)
+					}
+				}
+				custom_data_json := simple_server_state.party_update_settings.custom_data_json
+				if custom_data_json == "" && simple_server_state.party_conn_token_from_code.invitation_code != "" {
+					custom_data_json = simple_party_settings_custom_json(simple_server_state.party_conn_token_from_code.invitation_code)
+				}
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = message.scene_handle,
+						route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.settingsUpdated"),
+						body = simple_party_settings_updated_snapshot(24, 15, 7, custom_data_json, scene),
+					},
+				)
+			}
+		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(22, false) {
+			if gamesession_handle, ok := simple_gamesession_scene_handle(simple_server_state); ok {
+				if simple_server_state.user_id != "" {
+					append(
+						&response_messages,
+						Scene_Message{
+							scene_handle = u8(gamesession_handle),
+							route_handle = get_route_num_from_handle(simple_server_state, gamesession_handle, "player.update"),
+							body = Player_Update_Body{user_id = simple_server_state.user_id, state = 1},
+						},
+					)
+				}
+				if other_user_id := simple_other_known_user_id(simple_server_state.user_id); other_user_id != "" {
+					append(
+						&response_messages,
+						Scene_Message{
+							scene_handle = u8(gamesession_handle),
+							route_handle = get_route_num_from_handle(simple_server_state, gamesession_handle, "player.update"),
+							body = Player_Update_Body{user_id = other_user_id, state = 1},
+						},
+					)
+				}
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(gamesession_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, gamesession_handle, "stormancer.rpc.next"),
+						body = Stormancer_Rpc_Next_Body{kind = .GameSession_P2PToken_Result, rpc_id = 1},
+					},
+				)
+			}
+			lobby_id := simple_server_state.steam_lobby_id
+			if lobby_id == 0 && g_simple_latest_party_steam_lobby_id != 0 do lobby_id = g_simple_latest_party_steam_lobby_id
+			if lobby_id != 0 {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = message.scene_handle,
+						route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "Steam.UpdateLobbyJoinable"),
+						body = Steam_UpdateLobbyJoinable_Body{rpc_id = 23, lobby_id = lobby_id, joinable = false},
+					},
+				)
+			}
+		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(24, false) {
+			if joined_party_handle, ok := simple_joined_party_scene_handle(simple_server_state); ok && joined_party_handle == u64(message.scene_handle) {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = message.scene_handle,
+						route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.settingsUpdated"),
+						body = simple_party_settings_updated_gamesession_body(26, 16, 8, simple_server_state, scene),
+					},
+				)
+			}
+		}
+		if simple_scene_is_party(scene) && body.rpc_id == stormancer_rpc_completed_id(35, false) {
+			disconnected_user_id := simple_other_known_user_id(simple_server_state.user_id)
+			if disconnected_user_id != "" {
+				if gamesession_handle, ok := simple_gamesession_scene_handle(simple_server_state); ok {
+					append(
+						&response_messages,
+						Scene_Message{
+							scene_handle = u8(gamesession_handle),
+							route_handle = get_route_num_from_handle(simple_server_state, gamesession_handle, "player.update"),
+							body = Player_Update_Body{user_id = disconnected_user_id, state = 4},
+						},
+					)
+				}
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = message.scene_handle,
+						route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberDisconnected"),
+						body = Party_MemberDisconnected_Body{rpc_id = 36, version = 21, user_id = disconnected_user_id, reason = 0},
+					},
+				)
+			}
+		}
 	case "stormancer.rpc.next":
 // 	"sent_human_readable": "Scene_Message handle=144 route=0(stormancer.rpc.next) rpc=1 [[true, \"\", \"\", 109775243056466233]]",
 //   "real_human_readable": "Scene_Message handle=144 route=2(stormancer.rpc.next) rpc=1 [[[\"matchmaking\", \"\", 1, false, true, {}, \"\", \"5bbb3677-445a-42d1-a9a9-83094be3639a\"], \"4168ffb24de245f88060d27c9580685e\", [[\"4168ffb24de245f88060d27c9580685e\", 0, json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, bin<16>, [[\"steam\", \"4168ffb24de245f88060d27c9580685e\", \"anonymous\", \"76561197977870267\", nil, 0]], 2]], 3], 97, \"leader\", 1, {}, 1, [21, 21, [[bin<16>, \"dt-live-2\", \"dt-live-2.passtechgames.com:40243\", \"passtech-live\"], [[\"udp1\", \"raknet\", [\"dt-live-2.passtechgames.com:30100\"], 1]], \"dt-live-2.passtechgames.com:40243\", \"dt-live-2.passtechgames.com:40243\", [\"https://dt-live-2.passtechgames.com\"], {}, [\"apps\"], 1], {}, 1], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] | Scene_Message handle=144 route=1(stormancer.rpc.completed) rpc=257 [0]",
@@ -335,6 +442,18 @@ get_response_from_scene_message :: proc(
 		body := message.body.(Party_UpdatePartyUserData2_Body) or_return
 		simple_server_state.party_update_user_data2 = body
 		if body.rpc_id == 8 && simple_server_state.party_update_gf_status.rpc_id == 7 do break
+		if body.rpc_id == 7 {
+			if joined_party_handle, ok := simple_joined_party_scene_handle(simple_server_state); ok && u64(message.scene_handle) == joined_party_handle {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = message.scene_handle,
+						route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.settingsUpdated"),
+						body = simple_party_settings_updated_gamesession_body(32, 19, 10, simple_server_state, scene),
+					},
+				)
+			}
+		}
 		append(
 			&response_messages,
 			Scene_Message{
@@ -352,7 +471,9 @@ get_response_from_scene_message :: proc(
 		simple_server_state.party_update_settings = body
 		if invitation_code := json_string_value(body.custom_data_json, "InvitationCode"); invitation_code != "" {
 			if g_simple_party_scene_by_invite != nil do g_simple_party_scene_by_invite[invitation_code] = scene_suffix(scene.scene_id)
-			if g_simple_party_owner_by_invite != nil do g_simple_party_owner_by_invite[invitation_code] = simple_server_state.user_id
+			if g_simple_party_owner_by_invite != nil {
+				if _, owner_known := g_simple_party_owner_by_invite[invitation_code]; !owner_known do g_simple_party_owner_by_invite[invitation_code] = simple_server_state.user_id
+			}
 			if g_simple_steam_lobby_by_invite != nil && simple_server_state.steam_lobby_id != 0 {
 				g_simple_steam_lobby_by_invite[invitation_code] = simple_server_state.steam_lobby_id
 			}
@@ -407,13 +528,59 @@ get_response_from_scene_message :: proc(
 		body := message.body.(Party_GetPartyState2_Body) or_return
 		if !simple_scene_is_party(scene) do break
 		party_handle, party_handle_ok := simple_first_party_scene_handle(simple_server_state)
-		if party_handle_ok && u64(message.scene_handle) == party_handle do break
+		if party_handle_ok && u64(message.scene_handle) == party_handle {
+			if body.rpc_id != 9 do break
+			party_state := simple_party_state_known_members_response(body.rpc_id, simple_server_state, scene)
+			simple_server_state.party_get_party_state2 = body
+			simple_server_state.party_leader_user_id = party_state.leader_user_id
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+					body = party_state,
+				},
+			)
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+					body = Stormancer_Rpc_Completed_Body{
+						rpc_id = stormancer_rpc_completed_id(body.rpc_id, true),
+						message_sent = true,
+					},
+				},
+			)
+			if matchmaking_handle, ok := simple_initial_matchmaking_scene_handle(simple_server_state); ok {
+				append(
+					&response_messages,
+					Scene_Message{
+						scene_handle = u8(matchmaking_handle),
+						route_handle = get_route_num_from_handle(simple_server_state, matchmaking_handle, "gamefinder.update"),
+						body = Gamefinder_Update_Body{status = 3},
+					},
+				)
+			}
+			append(
+				&response_messages,
+				Scene_Message{
+					scene_handle = message.scene_handle,
+					route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberStatusUpdated"),
+					body = simple_party_member_status_known_members_body(18, 12, simple_server_state, 0),
+				},
+			)
+			break
+		}
+		party_state := simple_joined_party_state_response(body.rpc_id, simple_server_state, scene)
+		simple_server_state.party_get_party_state2 = body
+		simple_server_state.party_leader_user_id = party_state.leader_user_id
 		append(
 			&response_messages,
 			Scene_Message{
 				scene_handle = message.scene_handle,
 				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
-				body = simple_joined_party_state_response(body.rpc_id, simple_server_state, scene),
+				body = party_state,
 			},
 		)
 		append(
@@ -607,16 +774,8 @@ get_response_from_scene_message :: proc(
 	case "GameSession.GetP2PToken":
 		body := message.body.(GameSession_GetP2PToken_Body) or_return
 		simple_server_state.gamesession_get_p2p_token = body
-		owner_user_id := ""
-		if invitation_code := json_string_value(simple_server_state.party_update_settings.custom_data_json, "InvitationCode"); invitation_code != "" && g_simple_party_owner_by_invite != nil {
-			if known_owner, ok := g_simple_party_owner_by_invite[invitation_code]; ok do owner_user_id = known_owner
-		}
-		if owner_user_id == "" && simple_server_state.party_conn_token_from_code.invitation_code != "" && g_simple_party_owner_by_invite != nil {
-			if known_owner, ok := g_simple_party_owner_by_invite[simple_server_state.party_conn_token_from_code.invitation_code]; ok do owner_user_id = known_owner
-		}
-		if simple_server_state.party_conn_token_from_code.invitation_code != "" do break
-		if owner_user_id != "" && owner_user_id != simple_server_state.user_id do break
-		if simple_server_state.party_update_settings.rpc_id == 0 do break
+		joined_party_handle, joined_party_ok := simple_joined_party_scene_handle(simple_server_state)
+		if !joined_party_ok || u64(message.scene_handle) <= joined_party_handle do break
 		if simple_server_state.user_id != "" {
 			append(
 				&response_messages,

@@ -154,6 +154,8 @@ Scene_Party_Settings :: struct {
 	revision:           u64,
 	only_leader_invite: bool,
 	is_joinable:        bool,
+	server_status:      string,
+	server_status_details: string,
 	public_data:        string,
 	party_id:           string,
 }
@@ -762,6 +764,8 @@ scene_parse_party_settings :: proc(nodes: []Msgpack_Node, idx: int) -> Scene_Par
 		revision = scene_node_uint(nodes, scene_array_child(nodes, idx, 2)),
 		only_leader_invite = scene_node_bool(nodes, scene_array_child(nodes, idx, 3)),
 		is_joinable = scene_node_bool(nodes, scene_array_child(nodes, idx, 4)),
+		server_status = scene_map_string(nodes, scene_array_child(nodes, idx, 5), "stormancer.partyStatus"),
+		server_status_details = scene_map_string(nodes, scene_array_child(nodes, idx, 5), "stormancer.partyStatus.details"),
 		public_data = scene_node_text(nodes, scene_array_child(nodes, idx, 6)),
 		party_id = scene_node_text(nodes, scene_array_child(nodes, idx, 7)),
 	}

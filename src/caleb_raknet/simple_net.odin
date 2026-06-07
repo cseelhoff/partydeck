@@ -78,6 +78,7 @@ Simple_Server_State :: struct {
 	locator_get_scene_token:     Locator_GetSceneConnectionToken_Body,
 	party_create_invitation:     Party_CreateInvitationCode_Body,
 	party_get_party_state2:      Party_GetPartyState2_Body,
+	party_leader_user_id:        string,
 	party_member_connected:      Party_MemberConnected_Body,
 	party_member_data_updated:   Party_MemberDataUpdated_Body,
 	party_member_disconnected:   Party_MemberDisconnected_Body,
