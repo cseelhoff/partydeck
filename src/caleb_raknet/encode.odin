@@ -78,7 +78,13 @@ encode_message :: proc(message: Decoded_Message, allocator := context.allocator)
 		append(&b, u8(Message_Id.Response_Msg))
 		write_u16_le(&b, f.req_id)
 		// `data` is a typed view; `raw` is the undecoded payload after req_id.
-		append(&b, ..f.raw)
+		// Decoded capture messages keep `raw` for byte-exact round-trip, while
+		// simple_net responses are built as typed values and need fresh encoding.
+		if len(f.raw) > 0 {
+			append(&b, ..f.raw)
+		} else {
+			append(&b, ..encode_response_data(f.data, allocator))
+		}
 
 	case Response_Complete:
 		append(&b, u8(Message_Id.Response_Complete))
@@ -113,6 +119,111 @@ encode_message :: proc(message: Decoded_Message, allocator := context.allocator)
 	return b[:]
 }
 
+encode_response_data :: proc(data: Response_Data, allocator := context.allocator) -> []byte {
+	#partial switch d in data {
+	case Scene_Infos:
+		return encode_scene_infos_response(d, allocator)
+	case Scene_Connection_Result:
+		return encode_scene_connection_result_response(d, allocator)
+	case Bool_Result:
+		return mpe_map({mpe_str("v", allocator), mpe_bool(d.value, allocator)}, allocator)
+	case Session_Token:
+		return mpe_concat(mpe_str(d.jwt, allocator), mpe_str(d.session_id, allocator), allocator = allocator)
+	case Ping_Response:
+		out := make([dynamic]byte, allocator)
+		write_u64_le(&out, d.server_clock)
+		write_u64_le(&out, d.echo_clock)
+		return out[:]
+	case Other_Response:
+		return d.data.raw
+	}
+	return {}
+}
+
+encode_scene_infos_response :: proc(info: Scene_Infos, allocator := context.allocator) -> []byte {
+	metadata := make([dynamic][]byte, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "accountId", info.account_id, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "appId", info.app_id, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "darktales.gamesession", info.darktales_gamesession, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.friends", info.stormancer_friends, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.gamesession", info.stormancer_gamesession, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.gameVersion", info.stormancer_game_version, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.party", info.stormancer_party, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.partymanagement", info.stormancer_partymanagement, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.partyMerging", info.stormancer_party_merging, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.party.revision", info.stormancer_party_revision, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.plugins.gamefinder", info.stormancer_plugins_gamefinder, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.plugins.gamefinder.protocol", info.stormancer_plugins_gamefinder_protocol, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.plugins.nintendo", info.stormancer_plugins_nintendo, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.plugins.psn", info.stormancer_plugins_psn, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.plugins.rpc", info.stormancer_plugins_rpc, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "stormancer.plugins.steam", info.stormancer_plugins_steam, allocator)
+	encode_scene_infos_metadata_pair(&metadata, "Stormancer.plugins.XBLServices.useModernGamerTag", info.stormancer_plugins_xbl_use_modern_gamertag, allocator)
+
+	routes := make([dynamic][]byte, allocator)
+	for route_name, route_index in info.routes {
+		append(&routes, mpe_map(
+			{
+				mpe_str("Name", allocator),
+				mpe_str(route_name, allocator),
+				mpe_str("Handle", allocator),
+				mpe_uint(u64(route_index), allocator),
+				mpe_str("Metadata", allocator),
+				mpe_byte(MP_EMPTY_MAP, allocator),
+			},
+			allocator,
+		))
+	}
+
+	return mpe_map(
+		{
+			mpe_str("ShardId", allocator),
+			mpe_uint(info.shard_id, allocator),
+			mpe_str("SceneId", allocator),
+			mpe_str(info.scene_id, allocator),
+			mpe_str("Metadata", allocator),
+			mpe_map(metadata[:], allocator),
+			mpe_str("Routes", allocator),
+			mpe_array(routes[:], allocator),
+			mpe_str("SelectedSerializer", allocator),
+			mpe_str(info.selected_serializer, allocator),
+		},
+		allocator,
+	)
+}
+
+encode_scene_infos_metadata_pair :: proc(
+	pairs: ^[dynamic][]byte,
+	key: string,
+	value: string,
+	allocator := context.allocator,
+) {
+	if len(value) == 0 do return
+	append(pairs, mpe_str(key, allocator))
+	append(pairs, mpe_str(value, allocator))
+}
+
+encode_scene_connection_result_response :: proc(
+	result: Scene_Connection_Result,
+	allocator := context.allocator,
+) -> []byte {
+	route_pairs := make([dynamic][]byte, allocator)
+	for route_name, route_index in result.routes {
+		if len(route_name) == 0 do continue
+		append(&route_pairs, mpe_str(route_name, allocator))
+		append(&route_pairs, mpe_uint(u64(route_index + 1), allocator))
+	}
+	return mpe_map(
+		{
+			mpe_str("SceneHandle", allocator),
+			mpe_uint(result.scene_handle, allocator),
+			mpe_str("RouteMappings", allocator),
+			mpe_map(route_pairs[:], allocator),
+		},
+		allocator,
+	)
+}
+
 encode_scene_message_body :: proc(
 	body: Scene_Message_Body,
 	fallback_raw_body: []byte,
@@ -123,8 +234,8 @@ encode_scene_message_body :: proc(
 		return b.raw
 	case Stormancer_Rpc_Completed_Body:
 		out := make([dynamic]byte, allocator)
-		append(&out, b.message_sent ? 1 : 0)
 		write_u16_le(&out, b.rpc_id)
+		append(&out, 0)
 		return out[:]
 	case Stormancer_Rpc_Next_Body:
 		return encode_stormancer_rpc_next_body(b, allocator)
@@ -140,6 +251,8 @@ encode_scene_message_body :: proc(
 		return encode_party_state_response_body(b, allocator)
 	case Party_SettingsUpdated_Body:
 		return encode_party_settings_updated_body(b, allocator)
+	case Party_MemberDataUpdated_Body:
+		return encode_party_member_data_updated_body(b, allocator)
 	case PartyMerging_GetMergerStatus_Result_Body:
 		return encode_party_merging_get_merger_status_result_body(b, allocator)
 	case Party_MemberConnected_Body:
@@ -201,6 +314,32 @@ encode_party_settings_updated_body :: proc(
 	append(&out, ..mpe_uint(body.version, allocator))
 	append(&out, ..encode_party_settings(body.settings, allocator))
 	return out[:]
+}
+
+encode_party_member_data_updated_body :: proc(
+	body: Party_MemberDataUpdated_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	append(&out, ..mpe_uint(body.version, allocator))
+	append(&out, ..encode_party_member_data(body.member, allocator))
+	for _ in 0 ..< body.extra_values do append(&out, ..mpe_uint(0, allocator))
+	return out[:]
+}
+
+encode_party_member_data :: proc(member: Scene_Party_Member_Data, allocator := context.allocator) -> []byte {
+	platforms := make([dynamic][]byte, allocator)
+	for platform in member.platforms do append(&platforms, encode_scene_platform_identity(platform, allocator))
+	return mpe_array(
+		{
+			mpe_str(member.user_id, allocator),
+			mpe_bin(transmute([]byte)member.userdata_json, allocator),
+			mpe_array(platforms[:], allocator),
+			mpe_uint(member.state, allocator),
+		},
+		allocator,
+	)
 }
 
 encode_party_create_invitation_code_result_body :: proc(

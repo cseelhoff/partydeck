@@ -100,6 +100,10 @@ main :: proc() {
 		err = sync_replay(args[2])
 	} else if len(args) > 2 && args[1] == "predict-caleb" {
 		err = predict_caleb(datagrams, msgs, reasm, args[2])
+	} else if len(args) > 2 && args[1] == "simple-backup" {
+		out_path := SIMPLE_DEFAULT_PREDICT_FILE
+		if len(args) > 3 do out_path = args[3]
+		err = simple_backup_replay(args[2], out_path)
 	} else if len(args) > 1 && args[1] == "simple" {
 		err = simple_net(datagrams, msgs, reasm)
 	} else if len(args) > 1 {

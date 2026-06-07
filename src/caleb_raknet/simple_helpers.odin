@@ -3,6 +3,7 @@ package caleb_raknet
 import "core:encoding/hex"
 import "core:fmt"
 import "core:slice"
+import "core:strings"
 
 Simple_Scene :: struct {
 	scene_id: string,
@@ -27,7 +28,114 @@ simple_scene_has_route :: proc(scene: Simple_Scene, route_name: string) -> bool 
 }
 
 simple_scene_is_party :: proc(scene: Simple_Scene) -> bool {
-	return len(scene.scene_id) >= 6 && scene.scene_id[:6] == "party-"
+	scene_id := scene_suffix(scene.scene_id)
+	return scene_id != "party-manager" && len(scene_id) >= 6 && scene_id[:6] == "party-"
+}
+
+simple_first_party_scene_handle :: proc(simple_server_state: ^Simple_Server_State) -> (u64, bool) {
+	for scene, scene_index in simple_server_state.scenes {
+		if simple_scene_is_party(scene) do return u64(scene_index + SCENE_HANDLE_MIN), true
+	}
+	return 0, false
+}
+
+simple_scene_client_route_name :: proc(scene: Simple_Scene, route_handle: u16) -> string {
+	routes := simple_scene_client_routes(scene_suffix(scene.scene_id))
+	if route_handle >= u16(len(routes)) do return ""
+	return routes[route_handle]
+}
+
+simple_scene_client_routes :: proc(scene_id: string) -> Routes {
+	if scene_id == "authenticator" {
+		return Routes{
+			"stormancer.rpc.next",
+			"stormancer.rpc.cancel",
+			"stormancer.rpc.error",
+			"stormancer.rpc.completed",
+			"Authentication.GetMetadata",
+			"Authentication.Register",
+			"Authentication.Login",
+			"Authentication.GetStatus",
+			"Authentication.Unlink",
+			"sendRequest",
+			"sceneauthorization.gettoken",
+			"UserSession.GetAuthenticatedUsersCountPublic",
+			"UserSession.CreateUserBearerToken",
+			"UserSession.GetUserIdFromBearerToken",
+			"UserSession.GetUserOptions",
+			"UserSession.UpdateUserOptions",
+			"NX.GetAdvertisedParties",
+			"Steam.QueryUserIds",
+			"Steam.DecodePartyDataBearerTokens",
+			"Locator.GetSceneConnectionToken",
+		}
+	}
+	if scene_id == "friends" {
+		return Routes{
+			"stormancer.rpc.next",
+			"stormancer.rpc.cancel",
+			"stormancer.rpc.error",
+			"stormancer.rpc.completed",
+			"Friends.UpdateFriendList",
+			"Friends.Subscribe",
+			"Friends.RefreshSubscription",
+			"friends.invitefriend",
+			"friends.acceptfriendinvitation",
+			"friends.removefriend",
+			"friends.setstatus",
+			"Friends.Block",
+			"Friends.Unblock",
+			"Friends.GetBlockedList",
+			"Friends.Get",
+		}
+	}
+	if scene_id == "party-manager" || scene_id == "party" {
+		return Routes{
+			"stormancer.rpc.next",
+			"stormancer.rpc.cancel",
+			"stormancer.rpc.error",
+			"stormancer.rpc.completed",
+			"partymanagement.createsession",
+			"PartyManagement.CreateConnectionTokenFromInvitationCode",
+			"PartyManagement.CreateConnectionTokenFromPartyId",
+			"PartyManagement.SearchParties",
+		}
+	}
+	if scene_id == "matchmaking" {
+		return Routes{
+			"stormancer.rpc.next",
+			"stormancer.rpc.cancel",
+			"stormancer.rpc.error",
+			"stormancer.rpc.completed",
+			"gamefinder.cancel",
+			"GameFinder.GetPublicStatus",
+		}
+	}
+	if len(scene_id) >= 6 && scene_id[:6] == "party-" {
+		return Routes{
+			"stormancer.rpc.next",
+			"stormancer.rpc.cancel",
+			"stormancer.rpc.error",
+			"stormancer.rpc.completed",
+			"party.updatepartysettings",
+			"party.updatepartyuserdata",
+			"Party.UpdatePartyUserData2",
+			"party.promoteleader",
+			"party.kickplayer",
+			"party.updategamefinderplayerstatus",
+			"party.getpartystate",
+			"party.getpartystate2",
+			"party.sendinvitation",
+			"Party.CreateInvitationCode",
+			"Party.CancelInvitationCode",
+			"JoinGameParty.RequestReservationInCurrentGamesession",
+			"PartyMerging.GetMergerStatus",
+			"PartyMerging.Start",
+			"PartyMerging.Stop",
+			"SteamParty.CreatePartyDataBearerToken",
+		}
+	}
+	return {}
 }
 
 get_route_num_from_handle :: proc(
@@ -40,19 +148,25 @@ get_route_num_from_handle :: proc(
 	for route, route_index in scene.routes {
 		if route == route_name_query do return u16(route_index + 1)
 	}
+	fmt.eprintfln("route not found scene=%s handle=%d route=%s", scene.scene_id, scene_handle, route_name_query)
 	assert(false, "route not found")
 	return 0
 }
 
 simple_party_data_token_json :: proc(simple_server_state: ^Simple_Server_State, scene: Simple_Scene, allocator := context.allocator) -> string {
-	party_id := scene.scene_id
+	party_id := scene_suffix(scene.scene_id)
 	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
-	return fmt.aprintf(
-		`{"PartyId":"%s","LeaderUserId":"%s","LeaderSteamId":%s}`,
-		party_id,
-		simple_server_state.user_id,
-		simple_server_state.steam_id,
-		allocator = allocator,
+	return strings.concatenate(
+		{
+			`{"PartyId":"`,
+			party_id,
+			`","LeaderUserId":"`,
+			simple_server_state.user_id,
+			`","LeaderSteamId":`,
+			simple_server_state.steam_id,
+			`}`,
+		},
+		allocator,
 	)
 }
 
@@ -70,7 +184,7 @@ simple_party_state_response :: proc(
 	scene: Simple_Scene,
 	allocator := context.allocator,
 ) -> Party_State_Response_Body {
-	party_id := scene.scene_id
+	party_id := scene_suffix(scene.scene_id)
 	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
 	members := make([dynamic]Party_State_Member, allocator)
 	append(&members, simple_party_member(simple_server_state, false, allocator))
@@ -91,6 +205,66 @@ simple_party_state_response :: proc(
 	}
 }
 
+simple_party_settings_updated_snapshot :: proc(
+	rpc_id: u16,
+	version: u64,
+	settings_revision: u64,
+	custom_data_json: string,
+	scene: Simple_Scene,
+) -> Party_SettingsUpdated_Body {
+	party_id := scene_suffix(scene.scene_id)
+	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
+	return Party_SettingsUpdated_Body {
+		rpc_id = rpc_id,
+		version = version,
+		settings = Scene_Party_Settings {
+			game_finder = "matchmaking",
+			custom_data_json = custom_data_json,
+			revision = settings_revision,
+			only_leader_invite = false,
+			is_joinable = true,
+			public_data = "",
+			party_id = party_id,
+		},
+	}
+}
+
+simple_party_settings_custom_json :: proc(invitation_code: string, allocator := context.allocator) -> string {
+	return strings.concatenate(
+		{
+			`{"InvitationCode":"`,
+			invitation_code,
+			`","GameMode":0,"GameDifficulty":0,"GameModifiers":[],"MergerDifficulty":0}`,
+		},
+		allocator,
+	)
+}
+
+simple_party_member_data_updated_body :: proc(
+	rpc_id: u16,
+	version: u64,
+	simple_server_state: ^Simple_Server_State,
+	initialized: bool,
+	allocator := context.allocator,
+) -> Party_MemberDataUpdated_Body {
+	state_member := simple_party_member(simple_server_state, true, allocator)
+	if initialized {
+		state_member.userdata_json = simple_party_userdata_json(simple_server_state, true, allocator)
+		state_member.userdata = parse_party_member_userdata(state_member.userdata_json)
+	}
+	return Party_MemberDataUpdated_Body {
+		rpc_id = rpc_id,
+		version = version,
+		member = Scene_Party_Member_Data {
+			user_id = state_member.user_id,
+			userdata_json = state_member.userdata_json,
+			userdata = state_member.userdata,
+			platforms = state_member.platforms,
+			state = state_member.state,
+		},
+	}
+}
+
 simple_party_settings_updated_body :: proc(
 	rpc_id: u16,
 	version: u64,
@@ -98,7 +272,7 @@ simple_party_settings_updated_body :: proc(
 	update: Party_UpdatePartySettings_Body,
 	scene: Simple_Scene,
 ) -> Party_SettingsUpdated_Body {
-	party_id := scene.scene_id
+	party_id := scene_suffix(scene.scene_id)
 	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
 	return Party_SettingsUpdated_Body {
 		rpc_id = rpc_id,
@@ -215,15 +389,25 @@ simple_party_userdata_json :: proc(
 	if unlocked_hero_flag == 0 do unlocked_hero_flag = simple_unlocked_hero_flag(simple_server_state.steam_id)
 	eos_user_id := userdata.eos_user_id
 	if len(eos_user_id) == 0 do eos_user_id = simple_eos_user_id(simple_server_state.steam_id)
-	return fmt.aprintf(
-		`{"RequestedHero":%d,"RequestedSkin":0,"InLobby":true,"PlayerName":"%s","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":%s,"UnlockedHeroFlag":%d,"m_sEosUserId":"%s","m_sSteamUserId":%s,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`,
-		hero,
-		player_name,
-		initialized ? "true" : "false",
-		unlocked_hero_flag,
-		eos_user_id,
-		simple_server_state.steam_id,
-		allocator = allocator,
+	hero_text := fmt.aprintf("%d", hero, allocator = allocator)
+	flag_text := fmt.aprintf("%d", unlocked_hero_flag, allocator = allocator)
+	return strings.concatenate(
+		{
+			`{"RequestedHero":`,
+			hero_text,
+			`,"RequestedSkin":0,"InLobby":true,"PlayerName":"`,
+			player_name,
+			`","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":`,
+			initialized ? "true" : "false",
+			`,"UnlockedHeroFlag":`,
+			flag_text,
+			`,"m_sEosUserId":"`,
+			eos_user_id,
+			`","m_sSteamUserId":`,
+			simple_server_state.steam_id,
+			`,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`,
+		},
+		allocator,
 	)
 }
 

@@ -1,7 +1,7 @@
 package caleb_raknet
 
-import "core:fmt"
 import "core:mem"
+import "core:strings"
 
 Simple_Friend :: struct {
 	steam_id:             string,
@@ -117,12 +117,18 @@ simple_friend_notification_value :: proc(
 
 simple_friend_details_json :: proc(friend: Simple_Friend, allocator := context.allocator) -> string {
 	crossplay := friend.crossplay_enabled ? "true" : "false"
-	return fmt.aprintf(
-		"{\n  \"userId\": \"%s\",\n  \"lastPlatform\": \"steam\",\n  \"platforms\": {\n    \"steam\": {\n      \"steamid\": %s\n    }\n  },\n  \"crossplay\": {\n    \"Enabled\": %s\n  },\n  \"pseudo\": \"%s\"\n}",
-		friend.stormancer_id,
-		friend.steam_id,
-		crossplay,
-		friend.pseudo,
-		allocator = allocator,
+	return strings.concatenate(
+		{
+			"{\n  \"userId\": \"",
+			friend.stormancer_id,
+			"\",\n  \"lastPlatform\": \"steam\",\n  \"platforms\": {\n    \"steam\": {\n      \"steamid\": ",
+			friend.steam_id,
+			"\n    }\n  },\n  \"crossplay\": {\n    \"Enabled\": ",
+			crossplay,
+			"\n  },\n  \"pseudo\": \"",
+			friend.pseudo,
+			"\"\n}",
+		},
+		allocator,
 	)
 }

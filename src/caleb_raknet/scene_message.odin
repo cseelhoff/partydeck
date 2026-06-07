@@ -5,17 +5,19 @@ import "core:fmt"
 get_response_from_scene_message :: proc(
 	client_id: int,
 	label: string,
-	message: Scene_Message,
+	raw_message: Scene_Message,
 	verbose: bool,
 	simple_server_state: ^Simple_Server_State,
 ) -> (
 	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
 	ok: bool,
 ) {
-	scene, scene_ok := simple_scene_from_handle(simple_server_state, u64(message.scene_handle))
+	scene, scene_ok := simple_scene_from_handle(simple_server_state, u64(raw_message.scene_handle))
 	if !scene_ok do return
-	if message.route_handle >= u16(len(scene.routes)) do return
-	route := scene.routes[message.route_handle]
+	route := simple_scene_client_route_name(scene, raw_message.route_handle)
+	if route == "" do return
+	typed_message := scene_message_with_route_body(raw_message, route)
+	message := typed_message.(Scene_Message) or_return
 	switch route {
 	case "stormancer.rpc.completed":
 		body := message.body.(Stormancer_Rpc_Completed_Body) or_return
@@ -98,7 +100,7 @@ get_response_from_scene_message :: proc(
 
 	case "Locator.GetSceneConnectionToken":
 		body := message.body.(Locator_GetSceneConnectionToken_Body) or_return
-		if body.scene_id == "stormancer.friends" {
+		if body.scene_type == "stormancer.friends" {
            // "sent_human_readable": "Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=2 [\"stormancer.friends\", \"\"] 
             //   "real_human_readable": "Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=2 [json:{\"token\":\"i6lBY2NvdW50SWSpZGFya3RhbGVzq0FwcGxpY2F0aW9urGxpdmUtMS0wNS0wMKZJc3N1ZWTX/\\u002BoV\\u002BgBqI3H7qkV4cGlyYXRpb27X/\\u002BoV\\u002B5BqI3MnqFVzZXJEYXRhxQHhAAAB3ZmSpXN0ZWFtsTc2NTYxMTk3OTc3ODcwMjY3mNkgNDE2OGZmYjI0ZGUyNDVmODgwNjBkMjdjOTU4MDY4NWWBpXN0ZWFtgadzdGVhbWlksTc2NTYxMTk3OTc3ODcwMjY3g6Zwc2V1ZG\\u002BqTWFqb3IgSG9mZqdvcHRpb25zgaljcm9zc3BsYXmBp2VuYWJsZWTDp3N0ZWFtaWSxNzY1NjExOTc5Nzc4NzAyNjfX/zgATcBqG1ZR1/84AE3AahtWUYClc3RlYW3AxBCYrdv8V8IZTqk1\\u002BOfjDw/GgaVzdGVhbbdzdGVhbTo3NjU2MTE5Nzk3Nzg3MDI2N4Krc3RlYW0uYXBwSWTEBPCaHwC5Z2FtZVZlcnNpb24uY2xpZW50VmVyc2lvbsQPAAAAC6oxLjA1LjAwLjA11//qW1yAaiNx\\u002Btmbc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvL2Rhcmt0YWxlcy9saXZlLTEtMDUtMDAvMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmLzE/L2F1dGhlbnRpY2F0b3IjYXV0aGVudGljYXRvci8wKCspWzJlMDk1NmUxLTk0M2YtNGE0ZS1hMGIzLTFiODZkOTA2MDA5Yl3AAKtDb250ZW50VHlwZbZzdG9ybWFuY2VyL3VzZXJTZXNzaW9uqUVuZHBvaW50c8CnU2NlbmVJZNkzc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvZGFya3RhbGVzL2xpdmUtMS0wNS0wMC9mcmllbmRzp1JvdXRpbmfArERlcGxveW1lbnRJZNkkMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmp1ZlcnNpb24C-X2GmCSkYfcmmsa79XgI9bfwZsbd9ipEovC1JNbF66co=\",\"endpoints\":{\"raknet\":[\"dt-live.passtechgames.com:30100\",\"dt-live-2.passtechgames.com:30100\"]},\"encryption\":{\"algorithm\":\"aes256\",\"mode\":\"GCM\",\"key\":\"B\\u002B9QpyQucI/bPhfQ65KwHUod9twmSBi6ZQGJgL6v2tg=\",\"token\":\"xBDnDQaJoyQZS435Ce47IdMpXHVJte40NO/G6cbGtYh4rDnqMYnuuQQqx419XKPtyW1hxFKALet6kgVn4kWmqnz4ebeLKIDqyt0=\"}}, 114, 109, 97, 110, 99, 101, 114, 46, 114, 112, 99, 46, 99, 111, 109, 112, 108, 101, 116, 101, 100, \"Handle\", 0, \"Metadata\", {}, {\"Name\": \"stormancer.rpc.next\", \"Handle\": 0, \"Metadata\": {}}, {\"Name\": \"stormancer.rpc.cancel\", \"Handle\": 0, \"Metadata\": {}}, {\"Name\": \"stormancer.rpc.error\", \"Handle\": 0, \"Metadata\": {}}, {\"Name\": \"gamefinder.update\", \"Handle\": 0, \"Metadata\": {}}, \"stormancer/userSession\", nil, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 
             //  Scene_Message handle=141 route=1(stormancer.rpc.completed) rpc=513 [0]  
@@ -125,7 +127,7 @@ get_response_from_scene_message :: proc(
                 },
             }
 		)
-		} else if body.scene_id == "stormancer.plugins.partyManagement" {
+		} else if body.scene_type == "stormancer.plugins.partyManagement" {
         //  Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=3 [\"stormancer.plugins.partyManagement\", \"\"] 
         //  Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=3 [json:{\"token\":\"i6lBY2NvdW50SWSpZGFya3RhbGVzq0FwcGxpY2F0aW9urGxpdmUtMS0wNS0wMKZJc3N1ZWTX/\\u002BtaRlBqI3H7qkV4cGlyYXRpb27X/\\u002BtaRlBqI3MnqFVzZXJEYXRhxQHhAAAB3ZmSpXN0ZWFtsTc2NTYxMTk3OTc3ODcwMjY3mNkgNDE2OGZmYjI0ZGUyNDVmODgwNjBkMjdjOTU4MDY4NWWBpXN0ZWFtgadzdGVhbWlksTc2NTYxMTk3OTc3ODcwMjY3g6Zwc2V1ZG\\u002BqTWFqb3IgSG9mZqdvcHRpb25zgaljcm9zc3BsYXmBp2VuYWJsZWTDp3N0ZWFtaWSxNzY1NjExOTc5Nzc4NzAyNjfX/zgATcBqG1ZR1/84AE3AahtWUYClc3RlYW3AxBCYrdv8V8IZTqk1\\u002BOfjDw/GgaVzdGVhbbdzdGVhbTo3NjU2MTE5Nzk3Nzg3MDI2N4Krc3RlYW0uYXBwSWTEBPCaHwC5Z2FtZVZlcnNpb24uY2xpZW50VmVyc2lvbsQPAAAAC6oxLjA1LjAwLjA11//qW1yAaiNx\\u002Btmbc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvL2Rhcmt0YWxlcy9saXZlLTEtMDUtMDAvMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmLzE/L2F1dGhlbnRpY2F0b3IjYXV0aGVudGljYXRvci8wKCspWzJlMDk1NmUxLTk0M2YtNGE0ZS1hMGIzLTFiODZkOTA2MDA5Yl3AAKtDb250ZW50VHlwZbZzdG9ybWFuY2VyL3VzZXJTZXNzaW9uqUVuZHBvaW50c8CnU2NlbmVJZNk5c2NlbmU6L3Bhc3N0ZWNoLWxpdmUvZGFya3RhbGVzL2xpdmUtMS0wNS0wMC9wYXJ0eS1tYW5hZ2Vyp1JvdXRpbmfArERlcGxveW1lbnRJZNkkMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmp1ZlcnNpb24C-t\\u002BICAXrw3wUTPFnl6D39Jqe7\\u002BROYezleBqYMTcG5R3k=\",\"endpoints\":{\"raknet\":[\"dt-live.passtechgames.com:30100\",\"dt-live-2.passtechgames.com:30100\"]},\"encryption\":{\"algorithm\":\"aes256\",\"mode\":\"GCM\",\"key\":\"qNPJiED5pjKs764P0X2PKl4HcMlo\\u002BojmkQW4bxRgCZ0=\",\"token\":\"xBDnDQaJoyQZS435Ce47IdMpcML4NNNFWD75rdisPIIITL6zv2BzlxBifHyGHrExpp\\u002BWQfSVr\\u002B8\\u002BK8lD4QqhF8\\u002BZbm9QwY2go1w=\"}}, 121, 80, 120, 87, 65, 107, 122, 99, 52, 47, 57, 82, 84, 100, 101, 110, 119, 97, 114, 83, 67, 55, 119, 110, 107, 90, 78, 66, 122, 101, 66, 71, 111, 83, 113, 104, 48, 72, 79, 102, 71, 92, 117, 48, 48, 50, 66, 81, 102, 92, 117, 48, 48, 50, 66, 110, 90, 77, 110, 72, 83, 73, 107, 61, 34, 125, 125, 0, 0, 0, 25, 0, 1, 0, 0, 0, 0, 0, 7, 14, 103, 0, 0, 0, 56, 0, 0, 0, 2, 0, 1, 2, 3, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 
         //  Scene_Message handle=141 route=1(stormancer.rpc.completed) rpc=769 [0] 
@@ -214,7 +216,8 @@ get_response_from_scene_message :: proc(
 	case "party.updatepartysettings":
 		body := message.body.(Party_UpdatePartySettings_Body) or_return
 		simple_server_state.party_update_settings = body
-		if body.rpc_id == 6 {
+		emit_settings_updated := body.rpc_id == 6 && simple_server_state.scene_ready_args.scene_handle == 145
+		if emit_settings_updated {
 			append(
 				&response_messages,
 				Scene_Message{
@@ -241,7 +244,7 @@ get_response_from_scene_message :: proc(
 				},
 			},
 		)
-		if body.rpc_id == 6 {
+		if emit_settings_updated {
 			append(
 				&response_messages,
 				Scene_Message{
@@ -257,6 +260,7 @@ get_response_from_scene_message :: proc(
 				},
 			)
 		}
+		if emit_settings_updated do simple_server_state.scene_ready_args.scene_handle = 0
 
 	case "PartyMerging.GetMergerStatus":
 		body := message.body.(PartyMerging_GetMergerStatus_Body) or_return
@@ -351,6 +355,38 @@ get_response_from_scene_message :: proc(
 					kind = .Scene_Connection_Token,
 					token_scene = "party-manager",
 					token_json = scene_token_json("party-manager"),
+				},
+			},
+		)
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+				body = Stormancer_Rpc_Completed_Body {
+					rpc_id = stormancer_rpc_completed_id(body.rpc_id, true),
+					message_sent = true,
+				},
+			},
+		)
+	case "PartyManagement.CreateConnectionTokenFromInvitationCode":
+		body := message.body.(PartyManagement_CreateConnectionTokenFromInvitationCode_Body) or_return
+		simple_server_state.party_conn_token_from_code = body
+		party_scene := ""
+		if party_handle, ok := simple_first_party_scene_handle(simple_server_state); ok {
+			party, _ := simple_scene_from_handle(simple_server_state, party_handle)
+			party_scene = scene_suffix(party.scene_id)
+		}
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+				body = Stormancer_Rpc_Next_Body {
+					rpc_id = body.rpc_id,
+					kind = .Scene_Connection_Token,
+					token_scene = party_scene,
+					token_json = scene_token_json(party_scene),
 				},
 			},
 		)

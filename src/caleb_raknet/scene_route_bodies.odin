@@ -409,9 +409,9 @@ scene_message_with_route_body :: proc(
 
 parse_stormancer_rpc_completed_body :: proc(raw: []byte) -> Stormancer_Rpc_Completed_Body {
 	out := Stormancer_Rpc_Completed_Body{}
-	if len(raw) >= 3 {
-		out.message_sent = raw[0] != 0
-		out.rpc_id = read_u16_le(raw, 1)
+	if len(raw) >= 2 {
+		out.rpc_id = read_u16_le(raw, 0)
+		out.message_sent = (out.rpc_id & 1) != 0
 	}
 	return out
 }
