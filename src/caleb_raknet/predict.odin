@@ -9,6 +9,23 @@ package caleb_raknet
 
 // --- §L offline handshake ----------------------------------------------------
 
+on_unconnected_ping :: proc(w: ^World, conn: ^Conn, data: []byte) {
+	out := make([dynamic]byte, context.allocator)
+	append(&out, ID_UNCONNECTED_PONG)
+	if len(data) >= 9 {
+		append(&out, ..data[1:9])
+	} else {
+		for _ in 0 ..< 8 do append(&out, 0)
+	}
+	write_u64_be(&out, w.server_guid)
+	m := MAGIC
+	append(&out, ..m[:])
+	server_name := "partydeck;darktales;1.05.00.05"
+	write_u16_be(&out, u16(len(server_name)))
+	append(&out, ..transmute([]byte)server_name)
+	out_dg(w, conn.addr, out[:])
+}
+
 on_ocr1 :: proc(w: ^World, conn: ^Conn, data: []byte) {
 	mtu := min(len(data) + 28, 1492)
 	out := make([dynamic]byte, context.allocator)
@@ -192,12 +209,12 @@ predict :: proc(world: ^World, caddr: Peer_Addr, datagram: []byte) -> []Out_Dg {
 	m := MAGIC
 	is_off := len(datagram) >= 17 && bytes_equal(datagram[1:17], m[:])
 	switch {
+	case (mid == ID_UNCONNECTED_PING || mid == ID_UNCONNECTED_PING_OPEN_CONN) && is_off:
+		on_unconnected_ping(world, conn, datagram)
 	case mid == ID_OPEN_CONNECTION_REQUEST_1 && is_off:
 		on_ocr1(world, conn, datagram)
 	case mid == ID_OPEN_CONNECTION_REQUEST_2 && is_off:
 		on_ocr2(world, conn, datagram)
-	case (mid == ID_UNCONNECTED_PING || mid == ID_UNCONNECTED_PING_OPEN_CONN) && is_off:
-	// unconnected pings carry no content; the real server's reply is not modelled
 	case:
 		on_connected(world, conn, datagram)
 	}

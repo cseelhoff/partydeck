@@ -59,7 +59,6 @@ Simple_Server_State :: struct {
 	session_token:               Session_Token,
 	ping_response:               Ping_Response,
 	other_response:              Other_Response,
-	identity_label:              string,
 	user_id:                     string,
 	steam_id:                    string,
 	steam_lobby_id:              u64,
@@ -98,17 +97,26 @@ Simple_Server_State :: struct {
 	user_session_update_options: UserSession_UpdateUserOptions_Body,
 }
 
+Simple_Cross_Message :: struct {
+	remote: net.Endpoint,
+	msg:    Decoded_Message,
+}
+
 client_list: map[net.Endpoint]int
 g_server_state: [dynamic]Simple_Server_State
 g_simple_scene_infos: Predict_Caleb_Scene_Infos
+g_simple_raknet_samples_text: string
 g_simple_steam_friends_text: string
 g_simple_user_ids_by_steam: map[string]string
 g_simple_party_scene_by_invite: map[string]string
 g_simple_party_owner_by_invite: map[string]string
-g_simple_state_by_user_id: map[string]^Simple_Server_State
+g_simple_client_id_by_user_id: map[string]int
 g_simple_steam_lobby_by_party_scene: map[string]u64
 g_simple_steam_lobby_by_invite: map[string]u64
 g_simple_latest_party_steam_lobby_id: u64
+g_simple_cross_messages: [dynamic]Simple_Cross_Message
+g_simple_party_join_announced: map[string]bool
+	g_simple_party_join_ready_announced: map[string]bool
 
 simple_net :: proc(
 	dgrams: ^UDP_Datagram_Store,
@@ -244,11 +252,25 @@ simple_handle_udp_datagram :: proc(
 	net.send_udp(sock, make_ack(read_u24_le(data, 1), scratch), remote)
 
 	peer_state := find_peer(peers, label, nidx)
-	encoded_messages := filter_health_messages(reassemble_side(peer_state, .C2S, {data}, scratch), scratch)
-	if len(encoded_messages) == 0 do return
+	all_encoded_messages := reassemble_side(peer_state, .C2S, {data}, scratch)
+	if len(all_encoded_messages) == 0 do return
+	encoded_messages := filter_health_messages(all_encoded_messages, scratch)
 
 	decoded_messages: [dynamic]Decoded_Message
 	response_messages: [dynamic]Decoded_Message
+	simple_server_state := &g_server_state[client_id]
+	for encoded_message in all_encoded_messages {
+		if !message_is_health_channel(encoded_message) do continue
+		decoded := decode_message(encoded_message, scratch)
+		partial_response_messages := get_response_from_request(
+			client_id,
+			label,
+			decoded,
+			verbose,
+			simple_server_state,
+		) or_continue
+		for response_message in partial_response_messages do append(&response_messages, response_message)
+	}
 	for encoded_message in encoded_messages {
 		decoded := decode_message(encoded_message, scratch)
 		route_registry_observe(&peer_state.reg_real, peer_state.ep_client, decoded)
@@ -266,7 +288,6 @@ simple_handle_udp_datagram :: proc(
 	defer delete(decoded_messages)
 	defer delete(response_messages)
 
-	simple_server_state := &g_server_state[client_id]
 	for decoded in decoded_messages {
 		partial_response_messages := get_response_from_request(
 			client_id,
@@ -281,11 +302,26 @@ simple_handle_udp_datagram :: proc(
 	for response_message in response_messages {
 		route_registry_observe(&peer_state.reg_real, peer_state.ep_real, response_message, scratch)
 	}
+	if len(decoded_messages) > 0 || len(response_messages) > 0 {
+		simple_net_write_live_record(
+			simple_predict_log,
+			simple_predict_path,
+			&peer_state.reg_real,
+			peer_state.ep_client,
+			peer_state.ep_real,
+			label,
+			encoded_messages,
+			decoded_messages[:],
+			response_messages[:],
+			scratch,
+		)
+	}
 	if len(response_messages) > 0 {
 		live_send_decoded_messages(sock, wire, remote, response_messages[:], scratch)
 	}
+	simple_net_flush_cross_messages(sock, wire, scratch)
 
-	if verbose {
+	if verbose && env_truthy("SIMPLE_NET_TRACE_COUNTS") {
 		fmt.printfln(
 			"simple %s c2s_msgs=%d pred_msgs=%d",
 			label,
@@ -295,14 +331,80 @@ simple_handle_udp_datagram :: proc(
 	}
 }
 
+simple_queue_cross_message :: proc(remote: net.Endpoint, msg: Decoded_Message) {
+	if g_simple_cross_messages == nil do g_simple_cross_messages = make([dynamic]Simple_Cross_Message)
+	append(&g_simple_cross_messages, Simple_Cross_Message{remote = remote, msg = msg})
+}
+
+simple_net_flush_cross_messages :: proc(
+	sock: net.UDP_Socket,
+	wire: ^World,
+	scratch: mem.Allocator,
+) {
+	if g_simple_cross_messages == nil || len(g_simple_cross_messages) == 0 do return
+	kept: [dynamic]Simple_Cross_Message
+	flushed := make([]bool, len(g_simple_cross_messages), scratch)
+	for i in 0 ..< len(g_simple_cross_messages) {
+		if flushed[i] do continue
+		remote := g_simple_cross_messages[i].remote
+		if remote.port == 0 {
+			append(&kept, g_simple_cross_messages[i])
+			flushed[i] = true
+			continue
+		}
+		msgs := make([dynamic]Decoded_Message, scratch)
+		for j in i ..< len(g_simple_cross_messages) {
+			if flushed[j] || g_simple_cross_messages[j].remote != remote do continue
+			append(&msgs, g_simple_cross_messages[j].msg)
+			flushed[j] = true
+		}
+		if env_truthy("SIMPLE_NET_VERBOSE") do fmt.printfln("simple cross flush -> %v msgs=%d", remote, len(msgs))
+		live_send_decoded_messages(sock, wire, remote, msgs[:], scratch)
+	}
+	clear(&g_simple_cross_messages)
+	for cross in kept do append(&g_simple_cross_messages, cross)
+}
+
+simple_net_write_live_record :: proc(
+	out: ^strings.Builder,
+	out_path: string,
+	reg: ^Route_Registry,
+	ep_client, ep_server: net.Endpoint,
+	label: string,
+	sent_bytes: [][]byte,
+	sent_decoded: []Decoded_Message,
+	pred_decoded: []Decoded_Message,
+	allocator := context.allocator,
+) {
+	pred_bytes := simple_backup_encode_generated(pred_decoded, allocator)
+	sent_human := render_decoded_burst(reg, ep_client, sent_decoded, allocator)
+	pred_human := render_decoded_burst(reg, ep_server, pred_decoded, allocator)
+	stamp, _ := time.time_to_rfc3339(time.now(), allocator = allocator)
+	sync_write_record(
+		out,
+		stamp,
+		label,
+		false,
+		sent_bytes,
+		{},
+		pred_bytes,
+		sent_human,
+		"",
+		pred_human,
+	)
+	sync_write_out(out_path, strings.to_string(out^))
+}
+
 simple_net_globals_init :: proc() {
 	if client_list == nil do client_list = make(map[net.Endpoint]int)
 	if g_server_state == nil do g_server_state = make([dynamic]Simple_Server_State)
 	if g_simple_party_scene_by_invite == nil do g_simple_party_scene_by_invite = make(map[string]string)
 	if g_simple_party_owner_by_invite == nil do g_simple_party_owner_by_invite = make(map[string]string)
-	if g_simple_state_by_user_id == nil do g_simple_state_by_user_id = make(map[string]^Simple_Server_State)
+	if g_simple_client_id_by_user_id == nil do g_simple_client_id_by_user_id = make(map[string]int)
 	if g_simple_steam_lobby_by_party_scene == nil do g_simple_steam_lobby_by_party_scene = make(map[string]u64)
 	if g_simple_steam_lobby_by_invite == nil do g_simple_steam_lobby_by_invite = make(map[string]u64)
+	if g_simple_party_join_announced == nil do g_simple_party_join_announced = make(map[string]bool)
+	if g_simple_party_join_ready_announced == nil do g_simple_party_join_ready_announced = make(map[string]bool)
 	if len(g_server_state) == 0 do append(&g_server_state, Simple_Server_State{})
 }
 
@@ -328,6 +430,8 @@ simple_scene_infos_load :: proc(allocator: mem.Allocator) -> Error {
 	}
 	steam_friends_bytes := os.read_entire_file_from_path("src/steam_friends.json", allocator) or_return
 	g_simple_steam_friends_text = string(steam_friends_bytes)
+	raknet_samples_bytes := os.read_entire_file_from_path("src/raknet_samples.json", allocator) or_return
+	g_simple_raknet_samples_text = string(raknet_samples_bytes)
 	steam_user_id_bytes := os.read_entire_file_from_path("src/steam_user_ids.json", allocator) or_return
 	g_simple_user_ids_by_steam = make(map[string]string, allocator)
 	if json.unmarshal_string(string(steam_user_id_bytes), &g_simple_user_ids_by_steam, allocator = allocator) != nil {

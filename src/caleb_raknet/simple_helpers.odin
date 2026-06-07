@@ -232,31 +232,175 @@ simple_invitation_code :: proc(client_id: int, allocator := context.allocator) -
 	return fmt.aprintf("%06d", client_id, allocator = allocator)
 }
 
+simple_invitation_client_id :: proc(invitation_code: string) -> (int, bool) {
+	client_id := 0
+	if invitation_code == "" do return 0, false
+	for ch in transmute([]byte)invitation_code {
+		if ch < '0' || ch > '9' do return 0, false
+		client_id = client_id * 10 + int(ch - '0')
+	}
+	if client_id <= 0 || client_id >= len(g_server_state) do return 0, false
+	return client_id, true
+}
+
+simple_state_for_user_id :: proc(user_id: string) -> (^Simple_Server_State, bool) {
+	if user_id == "" || g_simple_client_id_by_user_id == nil do return nil, false
+	client_id, ok := g_simple_client_id_by_user_id[user_id]
+	if !ok || client_id <= 0 || client_id >= len(g_server_state) do return nil, false
+	return &g_server_state[client_id], true
+}
+
+simple_state_for_party_scene :: proc(party_scene: string) -> (^Simple_Server_State, bool) {
+	if party_scene == "" do return nil, false
+	for client_id in 1 ..< len(g_server_state) {
+		state := &g_server_state[client_id]
+		if party_handle, ok := simple_first_party_scene_handle(state); ok {
+			party, _ := simple_scene_from_handle(state, party_handle)
+			if scene_suffix(party.scene_id) == party_scene do return state, true
+		}
+	}
+	return nil, false
+}
+
+simple_party_scene_for_client :: proc(
+	client_id: int,
+	simple_server_state: ^Simple_Server_State,
+	allocator := context.allocator,
+) -> string {
+	if simple_server_state.user_id != "" && len(simple_server_state.user_id) >= 32 {
+		user_id := simple_server_state.user_id
+		return strings.concatenate(
+			{
+				"party-",
+				user_id[0:8], "-",
+				user_id[8:12], "-",
+				user_id[12:16], "-",
+				user_id[16:20], "-",
+				user_id[20:32],
+			},
+			allocator,
+		)
+	}
+	return fmt.aprintf("party-%08d-0000-4000-8000-%012d", client_id, client_id, allocator = allocator)
+}
+
+simple_party_owner_for_invitation_code :: proc(
+	invitation_code: string,
+	requester: ^Simple_Server_State,
+) -> string {
+	if invitation_code != "" && g_simple_party_owner_by_invite != nil {
+		if owner_id, ok := g_simple_party_owner_by_invite[invitation_code]; ok && owner_id != "" do return owner_id
+	}
+	if owner_client_id, ok := simple_invitation_client_id(invitation_code); ok {
+		owner_state := &g_server_state[owner_client_id]
+		if owner_state.user_id != "" do return owner_state.user_id
+	}
+	if g_simple_client_id_by_user_id != nil {
+		owners := make([dynamic]string, context.temp_allocator)
+		for user_id, _ in g_simple_client_id_by_user_id {
+			if user_id != "" && user_id != requester.user_id do append(&owners, user_id)
+		}
+		simple_sort_strings(owners[:])
+		if len(owners) > 0 do return owners[0]
+	}
+	return ""
+}
+
+simple_party_scene_for_invitation_code :: proc(
+	invitation_code: string,
+	requester: ^Simple_Server_State,
+	allocator := context.allocator,
+) -> string {
+	if invitation_code != "" && g_simple_party_scene_by_invite != nil {
+		if party_scene, ok := g_simple_party_scene_by_invite[invitation_code]; ok && party_scene != "" do return party_scene
+	}
+	owner_id := simple_party_owner_for_invitation_code(invitation_code, requester)
+	if owner_id != "" {
+		if owner_state, ok := simple_state_for_user_id(owner_id); ok {
+			if party_handle, party_ok := simple_first_party_scene_handle(owner_state); party_ok {
+				party, _ := simple_scene_from_handle(owner_state, party_handle)
+				return scene_suffix(party.scene_id)
+			}
+		}
+	}
+	if owner_client_id, ok := simple_invitation_client_id(invitation_code); ok {
+		return simple_party_scene_for_client(owner_client_id, &g_server_state[owner_client_id], allocator)
+	}
+	return ""
+}
+
 simple_party_state_response :: proc(
 	rpc_id: u16,
 	simple_server_state: ^Simple_Server_State,
 	scene: Simple_Scene,
 	allocator := context.allocator,
 ) -> Party_State_Response_Body {
+	if len(simple_server_state.user_id) > 0 {
+		members := simple_announced_party_members(simple_server_state, allocator)
+		if len(members) > 1 {
+			return simple_party_state_response_from_members(rpc_id, simple_server_state, scene, members, 8, 5, allocator)
+		}
+	}
 	party_id := scene_suffix(scene.scene_id)
 	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
 	members := make([dynamic]Party_State_Member, allocator)
 	append(&members, simple_party_member(simple_server_state, false, allocator))
+	return simple_party_state_response_from_members(rpc_id, simple_server_state, scene, members[:], 3, 1, allocator)
+}
+
+simple_party_state_response_from_members :: proc(
+	rpc_id: u16,
+	simple_server_state: ^Simple_Server_State,
+	scene: Simple_Scene,
+	members: []Party_State_Member,
+	party_revision: u64,
+	settings_revision: u64,
+	allocator := context.allocator,
+) -> Party_State_Response_Body {
+	party_id := scene_suffix(scene.scene_id)
+	if len(party_id) >= 6 && party_id[:6] == "party-" do party_id = party_id[6:]
+	custom_data_json := simple_server_state.party_update_settings.custom_data_json
 	return Party_State_Response_Body {
 		rpc_id = rpc_id,
 		settings = Scene_Party_Settings {
 			game_finder = "matchmaking",
-			custom_data_json = "",
-			revision = 1,
+			custom_data_json = custom_data_json,
+			revision = settings_revision,
 			only_leader_invite = false,
 			is_joinable = true,
 			public_data = "",
 			party_id = party_id,
 		},
 		leader_user_id = simple_server_state.user_id,
-		members = members[:],
-		revision = 3,
+		members = members,
+		revision = party_revision,
 	}
+}
+
+simple_announced_party_members :: proc(
+	simple_server_state: ^Simple_Server_State,
+	allocator := context.allocator,
+) -> []Party_State_Member {
+	members := make([dynamic]Party_State_Member, allocator)
+	if simple_server_state.user_id != "" do append(&members, simple_party_member(simple_server_state, false, allocator))
+	if g_simple_party_join_announced != nil && simple_server_state.user_id != "" {
+		joiners := make([dynamic]string, allocator)
+		prefix := strings.concatenate({simple_server_state.user_id, "|"}, allocator)
+		for key, announced in g_simple_party_join_announced {
+			if !announced || !strings.has_prefix(key, prefix) do continue
+			joiner_id := key[len(prefix):]
+			if joiner_id != "" do append(&joiners, joiner_id)
+		}
+		simple_sort_strings(joiners[:])
+		for joiner_id in joiners {
+			if joiner_state, ok := simple_state_for_user_id(joiner_id); ok {
+				append(&members, simple_party_member(joiner_state, false, allocator))
+			} else if member, known := simple_known_party_member(joiner_id, true, allocator); known {
+				append(&members, member)
+			}
+		}
+	}
+	return members[:]
 }
 
 simple_party_state_known_members_response :: proc(
@@ -272,9 +416,9 @@ simple_party_state_known_members_response :: proc(
 		custom_data_json = simple_party_settings_custom_json(simple_server_state.party_conn_token_from_code.invitation_code, allocator)
 	}
 	members := make([dynamic]Party_State_Member, allocator)
-	if g_simple_state_by_user_id != nil {
+	if g_simple_client_id_by_user_id != nil {
 		others := make([dynamic]string, allocator)
-		for user_id, _ in g_simple_state_by_user_id {
+		for user_id, _ in g_simple_client_id_by_user_id {
 			if user_id != "" && user_id != simple_server_state.user_id do append(&others, user_id)
 		}
 		simple_sort_strings(others[:])
@@ -325,8 +469,8 @@ simple_joined_party_state_response :: proc(
 	if invitation_code != "" && g_simple_party_owner_by_invite != nil {
 		if known_owner, ok := g_simple_party_owner_by_invite[invitation_code]; ok do owner_id = known_owner
 	}
-	if owner_id == "" && g_simple_state_by_user_id != nil {
-		for known_user_id, _ in g_simple_state_by_user_id {
+	if owner_id == "" && g_simple_client_id_by_user_id != nil {
+		for known_user_id, _ in g_simple_client_id_by_user_id {
 			if known_user_id != simple_server_state.user_id {
 				owner_id = known_user_id
 				break
@@ -338,8 +482,8 @@ simple_joined_party_state_response :: proc(
 
 	members := make([dynamic]Party_State_Member, allocator)
 	owner_appended := false
-	if owner_id != "" && g_simple_state_by_user_id != nil {
-		if owner_state, ok := g_simple_state_by_user_id[owner_id]; ok {
+	if owner_id != "" {
+		if owner_state, ok := simple_state_for_user_id(owner_id); ok {
 			append(&members, simple_party_member(owner_state, false, allocator))
 			owner_appended = true
 		}
@@ -373,9 +517,9 @@ simple_joined_party_state_response :: proc(
 }
 
 simple_other_known_user_id :: proc(user_id: string) -> string {
-	if g_simple_state_by_user_id != nil {
+	if g_simple_client_id_by_user_id != nil {
 		known := make([dynamic]string, context.temp_allocator)
-		for known_user_id, _ in g_simple_state_by_user_id {
+		for known_user_id, _ in g_simple_client_id_by_user_id {
 			if known_user_id != "" && known_user_id != user_id do append(&known, known_user_id)
 		}
 		simple_sort_strings(known[:])
@@ -737,6 +881,16 @@ simple_party_member_connected_body :: proc(
 	initialized: bool,
 	allocator := context.allocator,
 ) -> Party_MemberConnected_Body {
+	return simple_party_member_connected_body_version(rpc_id, 2, simple_server_state, initialized, allocator)
+}
+
+simple_party_member_connected_body_version :: proc(
+	rpc_id: u16,
+	version: u64,
+	simple_server_state: ^Simple_Server_State,
+	initialized: bool,
+	allocator := context.allocator,
+) -> Party_MemberConnected_Body {
 	state_member := simple_party_member(simple_server_state, false, allocator)
 	if initialized {
 		state_member.userdata_json = simple_party_userdata_json(simple_server_state, true, allocator)
@@ -744,7 +898,7 @@ simple_party_member_connected_body :: proc(
 	}
 	return Party_MemberConnected_Body {
 		rpc_id = rpc_id,
-		version = 2,
+		version = version,
 		member = Scene_Party_Member_Connected {
 			user_id = state_member.user_id,
 			connection_state = state_member.connection_state,
@@ -755,6 +909,171 @@ simple_party_member_connected_body :: proc(
 			state = state_member.state,
 		},
 	}
+}
+
+simple_party_member_connected_sample_body :: proc(
+	rpc_id: u16,
+	simple_server_state: ^Simple_Server_State,
+	allocator := context.allocator,
+) -> ([]byte, bool) {
+	if g_simple_raknet_samples_text == "" || simple_server_state.steam_id == "" do return nil, false
+	body, ok := simple_captured_push_sample_for_steam(
+		g_simple_raknet_samples_text,
+		"party/party.memberConnected",
+		simple_server_state.steam_id,
+		allocator,
+	)
+	if !ok || len(body) < 2 do return nil, false
+	body[0] = u8(rpc_id)
+	body[1] = u8(rpc_id >> 8)
+	return body, true
+}
+
+simple_party_join_announce_key :: proc(
+	owner_id, joiner_id: string,
+	allocator := context.allocator,
+) -> string {
+	return strings.concatenate({owner_id, "|", joiner_id}, allocator)
+}
+
+simple_queue_owner_party_join_messages :: proc(
+	owner_state: ^Simple_Server_State,
+	joiner_state: ^Simple_Server_State,
+	owner_party_handle: u64,
+	include_snapshot := true,
+) {
+	if owner_state == nil || joiner_state == nil || owner_state.remote.port == 0 do return
+	owner_party_scene, _ := simple_scene_from_handle(owner_state, owner_party_handle)
+	member_connected_body := simple_party_member_connected_body_version(10, 8, joiner_state, true)
+	member_connected_raw, member_connected_raw_ok := simple_party_member_connected_sample_body(10, joiner_state)
+	simple_queue_cross_message(
+		owner_state.remote,
+		Scene_Message{
+			scene_handle = u8(owner_party_handle),
+			route_handle = get_route_num_from_handle(owner_state, owner_party_handle, "party.memberDataUpdated"),
+			body = simple_party_member_data_updated_body_with_lobby_state(12, 9, joiner_state, true, 1, 0),
+		},
+	)
+	simple_queue_cross_message(
+		owner_state.remote,
+		Scene_Message{
+			scene_handle = u8(owner_party_handle),
+			route_handle = get_route_num_from_handle(owner_state, owner_party_handle, "party.memberDataUpdated"),
+			body = simple_party_member_data_updated_body_with_lobby_state(20, 13, joiner_state, true, 2, 18),
+		},
+	)
+	simple_queue_cross_message(
+		owner_state.remote,
+		Scene_Message{
+			scene_handle = u8(owner_party_handle),
+			route_handle = get_route_num_from_handle(owner_state, owner_party_handle, "party.memberDataUpdated"),
+			body = simple_party_member_data_updated_body_with_lobby_state(22, 14, owner_state, true, 2, 22),
+		},
+	)
+	if member_connected_raw_ok {
+		member_connected_decoded := decode_scene_body(member_connected_raw)
+		simple_queue_cross_message(
+			owner_state.remote,
+			Scene_Message{
+				scene_handle = u8(owner_party_handle),
+				route_handle = get_route_num_from_handle(owner_state, owner_party_handle, "party.memberConnected"),
+				body = Scene_Raw_Body{raw = member_connected_raw, decoded = member_connected_decoded},
+				raw_body = member_connected_raw,
+				decoded = member_connected_decoded,
+			},
+		)
+	} else {
+		simple_queue_cross_message(
+			owner_state.remote,
+			Scene_Message{
+				scene_handle = u8(owner_party_handle),
+				route_handle = get_route_num_from_handle(owner_state, owner_party_handle, "party.memberConnected"),
+				body = member_connected_body,
+			},
+		)
+	}
+	if g_simple_party_join_announced != nil && owner_state.user_id != "" && joiner_state.user_id != "" {
+		g_simple_party_join_announced[simple_party_join_announce_key(owner_state.user_id, joiner_state.user_id)] = true
+	}
+	if include_snapshot {
+		simple_queue_cross_message(
+			owner_state.remote,
+			Scene_Message{
+				scene_handle = u8(owner_party_handle),
+				route_handle = get_route_num_from_handle(owner_state, owner_party_handle, "party.getPartyStateResponse"),
+				body = simple_party_state_response(23, owner_state, owner_party_scene),
+			},
+		)
+	}
+}
+
+simple_queue_owner_party_join_ready_messages :: proc(joiner_state: ^Simple_Server_State) -> bool {
+	if joiner_state == nil || joiner_state.user_id == "" do return false
+	invitation_code := joiner_state.party_conn_token_from_code.invitation_code
+	if invitation_code == "" do return false
+	owner_id := simple_party_owner_for_invitation_code(invitation_code, joiner_state)
+	if owner_id == "" || owner_id == joiner_state.user_id do return false
+	ready_key := simple_party_join_announce_key(owner_id, joiner_state.user_id)
+	if g_simple_party_join_ready_announced != nil {
+		if announced, ok := g_simple_party_join_ready_announced[ready_key]; ok && announced do return false
+	}
+	party_scene := simple_party_scene_for_invitation_code(invitation_code, joiner_state)
+	owner_state, owner_ok := simple_state_for_user_id(owner_id)
+	if !owner_ok || owner_state.remote.port == 0 {
+		owner_state, owner_ok = simple_state_for_party_scene(party_scene)
+	}
+	if !owner_ok || owner_state.remote.port == 0 do return false
+	owner_party_handle, owner_party_ok := simple_first_party_scene_handle(owner_state)
+	if !owner_party_ok do return false
+	simple_queue_owner_party_join_messages(owner_state, joiner_state, owner_party_handle, true)
+	if g_simple_party_join_ready_announced != nil do g_simple_party_join_ready_announced[ready_key] = true
+	return true
+}
+
+simple_captured_push_sample_for_steam :: proc(
+	text, key, steam_id: string,
+	allocator := context.allocator,
+) -> ([]byte, bool) {
+	key_needle := fmt.aprintf("\"%s\"", key, allocator = allocator)
+	start := strings.index(text, key_needle)
+	if start < 0 do return nil, false
+	section := text[start:]
+	section = section[:next_push_key_offset(section)]
+	samples_pos := strings.index(section, "\"samples\"")
+	if samples_pos < 0 do return nil, false
+	section = section[samples_pos:]
+
+	best_hex := ""
+	steam_needle := fmt.aprintf("\"steamId\": \"%s\"", steam_id, allocator = allocator)
+	for {
+		hex_key := strings.index(section, "\"hex\"")
+		if hex_key < 0 do break
+		section = section[hex_key:]
+		hex_quote := strings.index(section, "\"")
+		if hex_quote < 0 do break
+		section = section[hex_quote + 1:]
+		hex_quote = strings.index(section, "\"")
+		if hex_quote < 0 do break
+		section = section[hex_quote + 1:]
+		hex_value_quote := strings.index(section, "\"")
+		if hex_value_quote < 0 do break
+		section = section[hex_value_quote + 1:]
+		hex_end := strings.index(section, "\"")
+		if hex_end < 0 do break
+		hex_text := section[:hex_end]
+		after_hex := section[hex_end + 1:]
+		next_hex := strings.index(after_hex, "\"hex\"")
+		sample_section := after_hex
+		if next_hex >= 0 do sample_section = after_hex[:next_hex]
+		if strings.contains(sample_section, steam_needle) {
+			best_hex = hex_text
+		}
+		section = after_hex
+	}
+	if best_hex == "" do return nil, false
+	body, ok := hex.decode(transmute([]byte)best_hex, allocator)
+	if !ok do return nil, false
+	return body, true
 }
 
 simple_party_member_status_updated_body :: proc(
@@ -801,9 +1120,9 @@ simple_party_member_status_known_members_body :: proc(
 ) -> Party_MemberStatusUpdated_Body {
 	user_ids := make([dynamic]string, allocator)
 	if simple_server_state.user_id != "" do append(&user_ids, simple_server_state.user_id)
-	if g_simple_state_by_user_id != nil {
+	if g_simple_client_id_by_user_id != nil {
 		others := make([dynamic]string, allocator)
-		for user_id, _ in g_simple_state_by_user_id {
+		for user_id, _ in g_simple_client_id_by_user_id {
 			if user_id != "" && user_id != simple_server_state.user_id do append(&others, user_id)
 		}
 		simple_sort_strings(others[:])

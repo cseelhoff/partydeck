@@ -11,6 +11,20 @@ get_response_from_request :: proc(
 	ok: bool,
 ) {
 	#partial switch request_message in message {
+	case Connected_Ping:
+		simple_server_state.connected_ping = request_message
+		append(
+			&response_messages,
+			Connected_Pong{
+				echo_clock = request_message.clock,
+				clock = server_time_ms(),
+			},
+		)
+	case Connected_Pong:
+		simple_server_state.connected_pong = request_message
+	case New_Incoming_Connection:
+		simple_server_state.new_incoming_connection = request_message
+		append(&response_messages, Connected_Ping{clock = server_time_ms()})
 	case Connection_Request:
 		// predict_caleb sent_human_readable t=2026-06-06T01:03:47.962577337Z line=  "sent_human_readable": "Connection_Request guid=0dd000327154492d time=216649998 sec=false",
 		simple_server_state.connection_request = request_message

@@ -11,6 +11,17 @@ get_system_request_response :: proc(
 	ok: bool,
 ) {
 	#partial switch message.msg_id {
+	case System_Request_Id.Ping:
+		args := message.args.(Ping_Args) or_return
+		simple_server_state.ping_args = args
+		append(
+			&response_messages,
+			Response_Msg{
+				req_id = message.req_id,
+				data = Ping_Response{server_clock = server_time_ms(), echo_clock = args.clock},
+			},
+			Response_Complete{req_id = message.req_id, has_values = true},
+		)
 	case System_Request_Id.Set_Metadata:
 //  "sent": ["860005008fb073746f726d616e6365722e7061727479ac323032322d30362d30392e31a776657273696f6ea0ab7365727665722e6e616d65a964742d6c6976652d31a774696d656f7574a435303030ae7365727665722e76657273696f6ea7392e332e302e32b773746f726d616e6365722e70617274792e706c7567696eac323032302d30382d32312e31ba73746f726d616e6365722e70617274796d616e6167656d656e74ac323032302d30352d32302e31d92673746f726d616e6365722e706c7567696e732e67616d6566696e6465722e70726f746f636f6ca9323032303036303931a7706c7567696e73d9d452504328312e302e30293b20557365727328312e302e30293b20506172747928323032302d30382d32312e31293b2050617274794d657267696e6728312e302e30293b2047616d6546696e64657228323032303036303931293b2047616d6553657373696f6e28312e302e30293b2047616d6556657273696f6e28312e302e30293b20467269656e647328322e302e30293b20506c617965725265706f72747328312e302e30293b204461726b54616c65732e47616d6553657373696f6e7328312e302e30293b20537465616d28312e302e3029ab73657269616c697a657273ad6d73677061636b2f6172726179a97472616e73706f7274a672616b6e6574a8706c6174666f726da557696e3634a870726f746f636f6ca134a474797065a6736572766572aa73657269616c697a6572ad6d73677061636b2f6172726179"],
 //   "sent_human_readable": "System_Request msg_id=Set_Metadata req=5 args=Set_Metadata {stormancer.party=\"2022-06-09.1\", version=\"\", server.name=\"dt-live-1\", timeout=\"5000\", server.version=\"9.3.0.2\", stormancer.party.plugin=\"2020-08-21.1\", stormancer.partymanagement=\"2020-05-20.1\", stormancer.plugins.gamefinder.protocol=\"202006091\", plugins=\"RPC(1.0.0); Users(1.0.0); Party(2020-08-21.1); PartyMerging(1.0.0); GameFinder(202006091); GameSession(1.0.0); GameVersion(1.0.0); Friends(2.0.0); PlayerReports(1.0.0); DarkTales.GameSessions(1.0.0); Steam(1.0.0)\", serializers=\"msgpack/array\", transport=\"raknet\", platform=\"Win64\", protocol=\"4\", type=\"server\", serializer=\"msgpack/array\"}",
@@ -27,13 +38,14 @@ get_system_request_response :: proc(
 // "sent_human_readable": "System_Request msg_id=Get_Session_Token req=1 args=(none)",
 // "real_human_readable": "Response_Msg req=1 data=Session_Token sid=\"mK3b_FfCGU6pNfjn4w8Pxg\" jwt=JWT{header={\"alg\":\"none\",\"typ\":\"JWT\",\"clusterId\":\"passtech-live\"} payload={\"Stormancer/sessionId\":\"mK3b_FfCGU6pNfjn4w8Pxg\",\"nbf\":1780707829,\"exp\":1780794229,\"iat\":1780707829,\"iss\":\"passtech-live\"} sig=0B} | Response_Complete req=1 has_values=true",
 		simple_server_state.no_args = No_Args{}
+		session_id := "mK3b_FfCGU6pNfjn4w8Pxg"
         append(
 			&response_messages,
 			Response_Msg{
                 req_id = message.req_id,
                 data = Session_Token {
-                    jwt = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIiwiY2x1c3RlcklkIjoicGFzc3RlY2gtbGl2ZSJ9.eyJTdG9ybWFuY2VyL3Nlc3Npb25JZCI6Im1LM2JfRmZDRVU2cE5fjn4w8PxgIiwibmJmIjoxNzgwNzA3ODI5LCJleHAiOjE3ODA3OTQyMjksImlhdCI6MTc4MDcwNzgyOSwiaXNzIjoicGFzc3RlY2gtbGl2ZSJ9.",
-                    session_id = "mK3b_FfCGU6pNfjn4w8Pxg",
+					jwt = session_token_jwt_for_id(session_id),
+					session_id = session_id,
                 },
             },
             Response_Complete{
@@ -104,6 +116,7 @@ get_system_request_response :: proc(
 					},
 				)
 			}
+			simple_queue_owner_party_join_ready_messages(simple_server_state)
 		}
 		if is_initial_matchmaking_ready && party_handle_ok && has_pending_settings_update {
 			simple_server_state.party_member_connected_after_settings_ack = client_id > 1
@@ -348,7 +361,7 @@ get_system_request_response :: proc(
             req_id = message.req_id,
             data = Scene_Connection_Result {
 				scene_handle = u64(len(simple_server_state.scenes) + SCENE_HANDLE_MIN),
-                routes = args.routes,
+				routes = args.routes,
             },
         }, Response_Complete {
 			req_id = message.req_id,

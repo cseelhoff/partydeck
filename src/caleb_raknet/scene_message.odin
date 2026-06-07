@@ -306,7 +306,7 @@ get_response_from_scene_message :: proc(
         if len(simple_server_state.user_id) == 0 {
             simple_server_state.user_id = fmt.aprintf("%032s", simple_server_state.steam_id)
         }
-		if g_simple_state_by_user_id != nil do g_simple_state_by_user_id[simple_server_state.user_id] = simple_server_state
+		if g_simple_client_id_by_user_id != nil do g_simple_client_id_by_user_id[simple_server_state.user_id] = client_id
 		steam_identity := fmt.aprintf("steam:%s", simple_server_state.steam_id)
 		append(
             &response_messages,
@@ -472,7 +472,7 @@ get_response_from_scene_message :: proc(
 		if invitation_code := json_string_value(body.custom_data_json, "InvitationCode"); invitation_code != "" {
 			if g_simple_party_scene_by_invite != nil do g_simple_party_scene_by_invite[invitation_code] = scene_suffix(scene.scene_id)
 			if g_simple_party_owner_by_invite != nil {
-				if _, owner_known := g_simple_party_owner_by_invite[invitation_code]; !owner_known do g_simple_party_owner_by_invite[invitation_code] = simple_server_state.user_id
+				g_simple_party_owner_by_invite[invitation_code] = simple_server_state.user_id
 			}
 			if g_simple_steam_lobby_by_invite != nil && simple_server_state.steam_lobby_id != 0 {
 				g_simple_steam_lobby_by_invite[invitation_code] = simple_server_state.steam_lobby_id
@@ -529,8 +529,12 @@ get_response_from_scene_message :: proc(
 		if !simple_scene_is_party(scene) do break
 		party_handle, party_handle_ok := simple_first_party_scene_handle(simple_server_state)
 		if party_handle_ok && u64(message.scene_handle) == party_handle {
-			if body.rpc_id != 9 do break
+			announced_members := simple_announced_party_members(simple_server_state)
+			if body.rpc_id != 9 && len(announced_members) <= 1 do break
 			party_state := simple_party_state_known_members_response(body.rpc_id, simple_server_state, scene)
+			if len(announced_members) > 1 {
+				party_state = simple_party_state_response_from_members(body.rpc_id, simple_server_state, scene, announced_members, 8, 5)
+			}
 			simple_server_state.party_get_party_state2 = body
 			simple_server_state.party_leader_user_id = party_state.leader_user_id
 			append(
@@ -654,6 +658,7 @@ get_response_from_scene_message :: proc(
 				g_simple_party_scene_by_invite[invitation_code] = scene_suffix(party.scene_id)
 			}
 		}
+		if g_simple_party_owner_by_invite != nil do g_simple_party_owner_by_invite[invitation_code] = simple_server_state.user_id
 		append(
 			&response_messages,
 			Scene_Message{
@@ -707,6 +712,7 @@ get_response_from_scene_message :: proc(
 	case "partymanagement.createsession":
 		body := message.body.(PartyManagement_CreateSession_Body) or_return
 		simple_server_state.party_create_session = body
+		party_scene := simple_party_scene_for_client(client_id, simple_server_state)
 //   "sent_human_readable": "Scene_Message handle=143 route=4(partymanagement.createsession) rpc=1 [[\"\", \"matchmaking\", \"\", {}, true, true, false, json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}]]",
 //   "real_human_readable": "Scene_Message handle=143 route=2(stormancer.rpc.next) rpc=1 [json:{\"token\":\"i6lBY2NvdW50SWSpZGFya3RhbGVzq0FwcGxpY2F0aW9urGxpdmUtMS0wNS0wMKZJc3N1ZWTX/\\u002BwFPxBqI3H\\u002BqkV4cGlyYXRpb27X/\\u002BwFQKBqI3MqqFVzZXJEYXRhxQF6eyJSZXF1ZXN0ZWRIZXJvIjozLCJSZXF1ZXN0ZWRTa2luIjowLCJJbkxvYmJ5Ijp0cnVlLCJQbGF5ZXJOYW1lIjoiTWFqb3IgSG9mZiIsIkxvYmJ5U3RhdGUiOjEsIlVubG9ja2VkR2FtZURpZmZpY3VsdHkiOjAsIk1lbWJlckRhdGFJbml0aWFsaXplZCI6ZmFsc2UsIlVubG9ja2VkSGVyb0ZsYWciOjMxLCJtX3NFb3NVc2VySWQiOiIwMDAyZWEyYzcwZmE0Zjg5YTVkODc2MDY1YTU1Yzc4NiIsIm1fc1N0ZWFtVXNlcklkIjo3NjU2MTE5Nzk3Nzg3MDI2NywibV91Vm9pY2VDaGF0TW9kZSI6MCwibV9lUGxhdGZvcm0iOjIsIlJhbmRvbVNraW5JbmRleCI6WzAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMF19q0NvbnRlbnRUeXBlrnBhcnR5L3VzZXJkYXRhqUVuZHBvaW50c8CnU2NlbmVJZNlWc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvZGFya3RhbGVzL2xpdmUtMS0wNS0wMC9wYXJ0eS01YmJiMzY3Ny00NDVhLTQyZDEtYTlhOS04MzA5NGJlMzYzOWGnUm91dGluZ8CsRGVwbG95bWVudElk2SQyNTY0ZDhiZS0yZGJiLTQ5NjctYjZiYi0wZTE1N2FhN2Y2M2anVmVyc2lvbgI=-y5VzHtKC\\u002BKnrwGogKxORjWH0KuOtxDJYnSr3D35g1xI=\",\"endpoints\":{\"raknet\":[\"dt-live.passtechgames.com:30100\",\"dt-live-2.passtechgames.com:30100\"]},\"encryption\":{\"algorithm\":\"aes256\",\"mode\":\"GCM\",\"key\":\"9Xn3Pg/Z/7oScHtjgghiAnhT3ii6UqtuahNh/fz6T4g=\",\"token\":\"xBDnDQaJoyQZS435Ce47IdMpGQsi4pQh/fpwMzemwvTzGy/LDzHe420pXA6uwY5jKuiKB2CFgUUeCD4P/GXM\\u002BEhyumPm5\\u002Bsxzbc=\"}}, 78, 97, 109, 101, \"UserSession.GetUserOptions\", \"Handle\", 14, \"Metadata\", {\"stormancer.plugins.rpc\": \"1.1.0\"}, {\"Name\": \"UserSession.UpdateUserOptions\", \"Handle\": 15, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, {\"Name\": \"NX.GetAdvertisedParties\", \"Handle\": 16, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, {\"Name\": \"Steam.QueryUserIds\", \"Handle\": 17, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, {\"Name\": \"Steam.DecodePartyDataBearerTokens\", \"Handle\": 18, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, {\"Name\": \"Locator.GetSceneConnectionToken\", \"Handle\": 19, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, \"SelectedSerializer\", \"msgpack/array\", 97, 99, 53, 51, 102, 54, 48, 48, 100, 101, 56, 100, 52, 57, 51, 97, 56, 48, 53, 99, 99, 50, 57, 53, 54, 55, 98, 97, 97, 100, 51, 52, nil, -32, 24, -18, 98, \"\\u007f\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x18o\\x9el\\xf0\\u007f\\x00\\x00\", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -32, 111, [108, -16, 127, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0, 0, 0, 0, 0, 0, 0, 24, 88, \"f\\xf0\", 127, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 56, {[91, \"\\u007f\\x00\\x00\\x00\\x00\\x00\\x00\\x94\\x00\\x00\\x00\\x94\\x00\\x00\\x00\\x00\\x01\\x00\\x00\", 0, 0, 1, 0, 0, 0, 0]: 0, 0: 0, 0: 0, 0: 0, 0: 0}, 0, 0, 0, 0, 0, 0, 0, 0, -32, 23, 23, 103, -16, 127, 0, 0, ext(125)<16>, 0, 0, 0, 0, 0, 0, 72, 120, [91, \"\\u007f\\x00\\x00p\\x8e\\nh\\xb0\\u007f\\x00\\x00\\xf0x\\x99[\\xb3\\u007f\\x00\\x00\", 0, 0, 0, 0, 0, 0, 0], 0] | Scene_Message handle=143 route=1(stormancer.rpc.completed) rpc=257 [0]",
   
@@ -718,8 +724,8 @@ get_response_from_scene_message :: proc(
 				body = Stormancer_Rpc_Next_Body {
 					rpc_id = body.rpc_id,
 					kind = .Scene_Connection_Token,
-					token_scene = "party-manager",
-					token_json = scene_token_json("party-manager"),
+					token_scene = party_scene,
+					token_json = scene_token_json(party_scene),
 				},
 			},
 		)
@@ -737,15 +743,19 @@ get_response_from_scene_message :: proc(
 	case "PartyManagement.CreateConnectionTokenFromInvitationCode":
 		body := message.body.(PartyManagement_CreateConnectionTokenFromInvitationCode_Body) or_return
 		simple_server_state.party_conn_token_from_code = body
-		party_scene := ""
-		if g_simple_party_scene_by_invite != nil {
-			if known_scene, ok := g_simple_party_scene_by_invite[body.invitation_code]; ok do party_scene = known_scene
-		}
+		party_scene := simple_party_scene_for_invitation_code(body.invitation_code, simple_server_state)
+		owner_id := simple_party_owner_for_invitation_code(body.invitation_code, simple_server_state)
 		if len(party_scene) == 0 {
 			if party_handle, ok := simple_first_party_scene_handle(simple_server_state); ok {
 			party, _ := simple_scene_from_handle(simple_server_state, party_handle)
 			party_scene = scene_suffix(party.scene_id)
 			}
+		}
+		if verbose do fmt.printfln("simple join-code %s -> scene=%s owner=%s requester=%s", body.invitation_code, party_scene, owner_id, simple_server_state.user_id)
+		if verbose && owner_id != "" && owner_id != simple_server_state.user_id {
+			fmt.printfln("simple cross party-join deferred owner=%s joiner=%s until joined-party ready", owner_id, simple_server_state.user_id)
+		} else if verbose && owner_id == simple_server_state.user_id {
+			fmt.printfln("simple cross party-join skipped: requester owns code owner=%s", owner_id)
 		}
 		append(
 			&response_messages,
@@ -788,10 +798,8 @@ get_response_from_scene_message :: proc(
 		}
 		if other_user_id := simple_other_known_user_id(simple_server_state.user_id); other_user_id != "" {
 			other_state: u64 = 0
-			if g_simple_state_by_user_id != nil {
-				if other_simple_state, ok := g_simple_state_by_user_id[other_user_id]; ok && other_simple_state.game_session_ready {
+			if other_simple_state, ok := simple_state_for_user_id(other_user_id); ok && other_simple_state.game_session_ready {
 					other_state = 1
-				}
 			}
 			append(
 				&response_messages,
@@ -811,7 +819,7 @@ get_response_from_scene_message :: proc(
 			},
 		)
 		simple_server_state.game_session_ready = true
-		if g_simple_state_by_user_id != nil && simple_server_state.user_id != "" do g_simple_state_by_user_id[simple_server_state.user_id] = simple_server_state
+		if g_simple_client_id_by_user_id != nil && simple_server_state.user_id != "" do g_simple_client_id_by_user_id[simple_server_state.user_id] = client_id
 	case "Friends.UpdateFriendList":
 		body := message.body.(Friends_UpdateFriendList_Body) or_return
 		simple_server_state.friends_update_friend_list = body

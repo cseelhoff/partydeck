@@ -260,7 +260,7 @@ write_system_request_args :: proc(sb: ^strings.Builder, args: System_Request_Arg
 		strings.write_string(sb, "Get_Scene_Infos token=")
 		write_connection_token(sb, a.token)
 	case Set_Metadata_Args:
-		fmt.sbprintf(sb, "Set_Metadata {server.name=%q, platform=%q, type=%q}", a.server_name, a.platform, a.connection_type)
+		fmt.sbprintf(sb, "Set_Metadata {{server.name=%q, platform=%q, type=%q}}", a.server_name, a.platform, a.connection_type)
 	case Scene_Ready_Args:
 		fmt.sbprintf(sb, "Scene_Ready handle=%d", a.scene_handle)
 	case Disconnect_From_Scene_Args:

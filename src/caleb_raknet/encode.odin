@@ -162,6 +162,16 @@ encode_scene_infos_response :: proc(info: Scene_Infos, allocator := context.allo
 
 	routes := make([dynamic][]byte, allocator)
 	for route_name, route_index in info.routes {
+		route_metadata := mpe_byte(MP_EMPTY_MAP, allocator)
+		if scene_infos_route_is_rpc(route_name) {
+			route_metadata = mpe_map(
+				{
+					mpe_str("stormancer.plugins.rpc", allocator),
+					mpe_str("1.1.0", allocator),
+				},
+				allocator,
+			)
+		}
 		append(&routes, mpe_map(
 			{
 				mpe_str("Name", allocator),
@@ -169,7 +179,7 @@ encode_scene_infos_response :: proc(info: Scene_Infos, allocator := context.allo
 				mpe_str("Handle", allocator),
 				mpe_uint(u64(route_index), allocator),
 				mpe_str("Metadata", allocator),
-				mpe_byte(MP_EMPTY_MAP, allocator),
+				route_metadata,
 			},
 			allocator,
 		))
@@ -190,6 +200,31 @@ encode_scene_infos_response :: proc(info: Scene_Infos, allocator := context.allo
 		},
 		allocator,
 	)
+}
+
+scene_infos_route_is_rpc :: proc(route_name: string) -> bool {
+	switch route_name {
+	case "stormancer.rpc.next",
+	     "stormancer.rpc.cancel",
+	     "stormancer.rpc.error",
+	     "stormancer.rpc.completed",
+	     "gameVersion.update",
+	     "serverVersion.update",
+	     "users.renewCredentials",
+	     "friends.notification",
+	     "gamefinder.update",
+	     "player.update",
+	     "party.getPartyStateResponse",
+	     "party.settingsUpdated",
+	     "party.memberDataUpdated",
+	     "party.memberStatusUpdated",
+	     "party.memberConnected",
+	     "party.memberDisconnected",
+	     "party.leaderChanged",
+	     "party.gameFinderFailed":
+		return false
+	}
+	return route_name != ""
 }
 
 encode_scene_infos_metadata_pair :: proc(

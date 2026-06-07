@@ -818,6 +818,8 @@ live_predict_handle_offline :: proc(
 	conn := &wire.conns[idx]
 	clear(&wire.outbox)
 	switch data[0] {
+	case ID_UNCONNECTED_PING, ID_UNCONNECTED_PING_OPEN_CONN:
+		on_unconnected_ping(wire, conn, data)
 	case ID_OPEN_CONNECTION_REQUEST_1:
 		on_ocr1(wire, conn, data)
 	case ID_OPEN_CONNECTION_REQUEST_2:
@@ -4340,6 +4342,7 @@ scene_suffix_for_service :: proc(service, name: string) -> string {
 }
 
 connection_data_msgpack :: proc(scene_id: string, allocator := context.allocator) -> []byte {
+	now := u64(time.now()._nsec / i64(time.Second))
 	return mpe_map(
 		{
 			mpe_str("AccountId", allocator),
@@ -4347,9 +4350,9 @@ connection_data_msgpack :: proc(scene_id: string, allocator := context.allocator
 			mpe_str("Application", allocator),
 			mpe_str("live-1-05-00", allocator),
 			mpe_str("Issued", allocator),
-			mpe_timestamp(1_780_537_212, allocator = allocator),
+			mpe_timestamp(now, allocator = allocator),
 			mpe_str("Expiration", allocator),
-			mpe_timestamp(1_780_537_512, allocator = allocator),
+			mpe_timestamp(now + 300, allocator = allocator),
 			mpe_str("UserData", allocator),
 			mpe_bin({}, allocator),
 			mpe_str("ContentType", allocator),
@@ -4375,6 +4378,25 @@ scene_token_json :: proc(scene_suffix: string, allocator := context.allocator) -
 		env_string("RAKNET_ENDPOINT", DEFAULT_RAKNET_ENDPOINT, allocator),
 		allocator,
 	)
+}
+
+session_token_jwt_for_id :: proc(session_id: string, allocator := context.allocator) -> string {
+	now := u64(time.now()._nsec / i64(time.Second))
+	hdr := `{"alg":"none","typ":"JWT","clusterId":"passtech-live"}`
+	body_builder := strings.builder_make(allocator)
+	strings.write_string(&body_builder, `{"Stormancer/sessionId":"`)
+	strings.write_string(&body_builder, session_id)
+	strings.write_string(&body_builder, `","nbf":`)
+	strings.write_string(&body_builder, fmt.aprint(now, allocator = allocator))
+	strings.write_string(&body_builder, `,"exp":`)
+	strings.write_string(&body_builder, fmt.aprint(now + 86400, allocator = allocator))
+	strings.write_string(&body_builder, `,"iat":`)
+	strings.write_string(&body_builder, fmt.aprint(now, allocator = allocator))
+	strings.write_string(&body_builder, `,"iss":"passtech-live"}`)
+	body := strings.to_string(body_builder)
+	hdr_b64 := b64url(transmute([]byte)hdr, allocator)
+	body_b64 := b64url(transmute([]byte)body, allocator)
+	return fmt.aprintf("%s.%s.", hdr_b64, body_b64, allocator = allocator)
 }
 
 scene_token_json_endpoint :: proc(
