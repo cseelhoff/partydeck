@@ -105,7 +105,7 @@ scan_system_request_args :: proc(
 		scan_routes(a.routes, "Connect_To_Scene.Routes", sink)
 		scan_connect_to_scene_args(a, sink)
 	case Get_Scene_Infos_Args:
-		scan_token(a.token, "Get_Scene_Infos.Token", sink, allocator)
+		scan_connection_token(a.token, "Get_Scene_Infos.Token", sink)
 	case Set_Metadata_Args:
 		scan_set_metadata_args(a, sink)
 	case Scene_Ready_Args, Disconnect_From_Scene_Args, Ping_Args, No_Args:
@@ -170,6 +170,19 @@ scan_token :: proc(
 		kind = .Base64_String,
 		field = field,
 		detail = fmt.tprintf("token %dB did not decode", len(token)),
+	})
+}
+
+scan_connection_token :: proc(
+	token: Connection_Token,
+	field: string,
+	sink: ^[dynamic]Completeness_Issue,
+) {
+	if len(token.raw) == 0 || token.ok do return
+	append(sink, Completeness_Issue {
+		kind = .Base64_String,
+		field = field,
+		detail = fmt.tprintf("token %dB did not decode", len(token.raw)),
 	})
 }
 
@@ -271,9 +284,9 @@ scan_connect_to_scene_args :: proc(a: Connect_To_Scene_Args, sink: ^[dynamic]Com
 	scan_string(a.connection_serializer, "Connect_To_Scene.ConnectionMetadata.serializer", sink)
 }
 
-scan_routes :: proc(routes: []Scene_Route, field: string, sink: ^[dynamic]Completeness_Issue) {
-	for r in routes {
-		scan_metadata(r.metadata, field, sink)
+scan_routes :: proc(routes: Routes, field: string, sink: ^[dynamic]Completeness_Issue) {
+	for route_name in routes {
+		scan_string(route_name, field, sink)
 	}
 }
 

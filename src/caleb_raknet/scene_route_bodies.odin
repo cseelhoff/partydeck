@@ -13,10 +13,16 @@ Scene_Raw_Body :: struct {
 Stormancer_Rpc_Completed_Body :: struct {
 	rpc_id:       u16,
 	message_sent: bool,
-	raw:          []byte,
+}
+
+Stormancer_Rpc_Next_Kind :: enum u8 {
+	Unknown,
+	Authentication_Login_Result,
+	Scene_Connection_Token,
 }
 
 Stormancer_Rpc_Next_Body :: struct {
+	kind:           Stormancer_Rpc_Next_Kind,
 	rpc_id:         u16,
 	result_is_nil:  bool,
 	success:        bool,
@@ -26,6 +32,8 @@ Stormancer_Rpc_Next_Body :: struct {
 	steam_identity: string,
 	steam_id:       string,
 	metadata_count: int,
+	token_json:     string,
+	token_scene:    string,
 }
 
 Stormancer_Rpc_Error_Body :: struct {
@@ -357,9 +365,7 @@ scene_message_with_route_body :: proc(
 }
 
 parse_stormancer_rpc_completed_body :: proc(raw: []byte) -> Stormancer_Rpc_Completed_Body {
-	out := Stormancer_Rpc_Completed_Body {
-		raw = raw,
-	}
+	out := Stormancer_Rpc_Completed_Body{}
 	if len(raw) >= 3 {
 		out.message_sent = raw[0] != 0
 		out.rpc_id = read_u16_le(raw, 1)
@@ -370,10 +376,18 @@ parse_stormancer_rpc_completed_body :: proc(raw: []byte) -> Stormancer_Rpc_Compl
 parse_stormancer_rpc_next_body :: proc(body: Scene_Body) -> Stormancer_Rpc_Next_Body {
 	nodes := body.values.nodes
 	root := scene_seq_root(body, 0)
+	if root >= 0 && root < len(nodes) && nodes[root].kind == .Str {
+		return Stormancer_Rpc_Next_Body {
+			kind = .Scene_Connection_Token,
+			rpc_id = body.rpc_id,
+			token_json = nodes[root].str,
+		}
+	}
 	identities := scene_array_child(nodes, root, 4)
 	metadata := scene_array_child(nodes, root, 5)
 	steam_identity := scene_map_string(nodes, identities, "steam")
 	return Stormancer_Rpc_Next_Body {
+		kind = .Authentication_Login_Result,
 		rpc_id = body.rpc_id,
 		result_is_nil = scene_node_is_nil(nodes, scene_array_child(nodes, root, 0)),
 		success = scene_node_bool(nodes, scene_array_child(nodes, root, 1)),

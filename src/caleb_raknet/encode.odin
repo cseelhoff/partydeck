@@ -97,7 +97,7 @@ encode_message :: proc(message: Decoded_Message, allocator := context.allocator)
 		// scene_handle is itself the leading id byte (>= SCENE_HANDLE_MIN).
 		append(&b, f.scene_handle)
 		write_u16_le(&b, f.route_handle)
-		append(&b, ..f.raw_body)
+		append(&b, ..encode_scene_message_body(f.body, f.raw_body, allocator))
 
 	case Malformed_Message:
 		// Could not be parsed; `raw` is the full original message (id included).
@@ -109,6 +109,59 @@ encode_message :: proc(message: Decoded_Message, allocator := context.allocator)
 	}
 
 	return b[:]
+}
+
+encode_scene_message_body :: proc(
+	body: Scene_Message_Body,
+	fallback_raw_body: []byte,
+	allocator := context.allocator,
+) -> []byte {
+	#partial switch b in body {
+	case Scene_Raw_Body:
+		return b.raw
+	case Stormancer_Rpc_Completed_Body:
+		out := make([dynamic]byte, allocator)
+		append(&out, b.message_sent ? 1 : 0)
+		write_u16_le(&out, b.rpc_id)
+		return out[:]
+	case Stormancer_Rpc_Next_Body:
+		return encode_stormancer_rpc_next_body(b, allocator)
+	}
+	return fallback_raw_body
+}
+
+encode_stormancer_rpc_next_body :: proc(
+	body: Stormancer_Rpc_Next_Body,
+	allocator := context.allocator,
+) -> []byte {
+	out := make([dynamic]byte, allocator)
+	write_u16_le(&out, body.rpc_id)
+	#partial switch body.kind {
+	case .Scene_Connection_Token:
+		append(&out, ..mpe_str(body.token_json, allocator))
+	case .Authentication_Login_Result:
+		result := body.result_is_nil ? mpe_nil(allocator) : mpe_bool(false, allocator)
+		identities := mpe_byte(MP_EMPTY_MAP, allocator)
+		if len(body.steam_identity) > 0 {
+			identities = mpe_map({mpe_str("steam", allocator), mpe_str(body.steam_identity, allocator)}, allocator)
+		}
+		append(
+			&out,
+			..mpe_array(
+				{
+					result,
+					mpe_bool(body.success, allocator),
+					mpe_str(body.user_id, allocator),
+					mpe_str(body.error_message, allocator),
+					identities,
+					mpe_byte(MP_EMPTY_MAP, allocator),
+				},
+				allocator,
+			),
+		)
+	case:
+	}
+	return out[:]
 }
 
 // True when `encode_message(decode_message(original))` reproduces `original`

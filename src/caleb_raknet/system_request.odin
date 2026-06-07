@@ -62,7 +62,7 @@ Connect_To_Scene_Args :: struct {
 // Get_Scene_Infos (136): ask for a scene's route/serializer info before joining.
 // Same `token` as Connect plus the client's connection metadata fields.
 Get_Scene_Infos_Args :: struct {
-	token:                                  string,
+	token:                                  Connection_Token,
 	stormancer_party:                       string,
 	version:                                string,
 	server_name:                            string,
@@ -186,7 +186,7 @@ parse_system_request_args :: proc(
 		if !args.ok || len(n) == 0 || n[0].kind != .Map do return Unparsed_Args{args.raw}
 		metadata := collect_metadata(n, msgpack_map_get(n, 0, "Metadata"), allocator)
 		return Get_Scene_Infos_Args {
-			token                                  = node_str(n, msgpack_map_get(n, 0, "Token")),
+			token                                  = parse_connection_token(node_str(n, msgpack_map_get(n, 0, "Token")), allocator),
 			stormancer_party                       = metadata_value(metadata, "stormancer.party"),
 			version                                = metadata_value(metadata, "version"),
 			server_name                            = metadata_value(metadata, "server.name"),
@@ -289,23 +289,16 @@ metadata_value :: proc(metadata: []Metadata_Entry, key: string) -> string {
 }
 
 // Read an array of {Name, Handle, Metadata} route maps at `arr_idx`.
-collect_routes :: proc(nodes: []Msgpack_Node, arr_idx: int, allocator := context.allocator) -> []Scene_Route {
-	if arr_idx < 0 || arr_idx >= len(nodes) || nodes[arr_idx].kind != .Array do return nil
+collect_routes :: proc(nodes: []Msgpack_Node, arr_idx: int, allocator := context.allocator) -> Routes {
+	if arr_idx < 0 || arr_idx >= len(nodes) || nodes[arr_idx].kind != .Array do return {}
 	count := nodes[arr_idx].count
-	out := make([dynamic]Scene_Route, 0, count, allocator)
+	out := Routes{}
 	j := arr_idx + 1
 	for _ in 0 ..< count {
-		append(
-			&out,
-			Scene_Route {
-				name = node_str(nodes, msgpack_map_get(nodes, j, "Name")),
-				handle = u16(node_uint(nodes, msgpack_map_get(nodes, j, "Handle"))),
-				metadata = collect_metadata(nodes, msgpack_map_get(nodes, j, "Metadata"), allocator),
-			},
-		)
+		append(&out, node_str(nodes, msgpack_map_get(nodes, j, "Name")))
 		j += nodes[j].subtree
 	}
-	return out[:]
+	return out
 }
 
 // --- debug rendering --------------------------------------------------------
@@ -348,10 +341,11 @@ write_system_request_args :: proc(sb: ^strings.Builder, args: System_Request_Arg
 			a.connection_serializer,
 		)
 	case Get_Scene_Infos_Args:
+		strings.write_string(sb, "Get_Scene_Infos token=")
+		write_connection_token(sb, a.token)
 		fmt.sbprintf(
 			sb,
-			"Get_Scene_Infos token=%dB metadata={stormancer.party=%q, version=%q, server.name=%q, timeout=%q, server.version=%q, stormancer.party.plugin=%q, stormancer.partymanagement=%q, stormancer.plugins.gamefinder.protocol=%q, plugins=%q, serializers=%q, transport=%q, platform=%q, protocol=%q, type=%q, serializer=%q}",
-			len(a.token),
+			" metadata={stormancer.party=%q, version=%q, server.name=%q, timeout=%q, server.version=%q, stormancer.party.plugin=%q, stormancer.partymanagement=%q, stormancer.plugins.gamefinder.protocol=%q, plugins=%q, serializers=%q, transport=%q, platform=%q, protocol=%q, type=%q, serializer=%q}",
 			a.stormancer_party,
 			a.version,
 			a.server_name,
@@ -412,11 +406,11 @@ write_metadata :: proc(sb: ^strings.Builder, md: []Metadata_Entry) {
 	strings.write_byte(sb, '}')
 }
 
-write_routes :: proc(sb: ^strings.Builder, routes: []Scene_Route) {
+write_routes :: proc(sb: ^strings.Builder, routes: Routes) {
 	strings.write_byte(sb, '[')
-	for r, i in routes {
+	for route_name, i in routes {
 		if i > 0 do strings.write_string(sb, ", ")
-		fmt.sbprintf(sb, "%s#%d", r.name, r.handle)
+		fmt.sbprintf(sb, "%s#%d", route_name, i)
 	}
 	strings.write_byte(sb, ']')
 }

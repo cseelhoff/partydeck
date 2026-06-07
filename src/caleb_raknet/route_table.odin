@@ -10,8 +10,8 @@ package caleb_raknet
 // transform:
 //   * client -> server (RPC invocations): the route table is the Routes list in a
 //     Get_Scene_Infos reply (Scene_Infos.routes, response.odin). Keyed by SceneId.
-//   * server -> client (pushes / RPC replies): the route table is the scene slot
-//     in a Connect_To_Scene reply (Scene_Connection_Result.scenes). Keyed by the
+//   * server -> client (pushes / RPC replies): the route table is RouteMappings in
+//     a Connect_To_Scene reply (Scene_Connection_Result.routes). Keyed by the
 //     RakNet scene-handle byte the connect assigned.
 // The connect reply carries only the handle, not the SceneId, so the SceneId is
 // recovered by correlating the reply's req_id back to the Connect_To_Scene request's
@@ -127,56 +127,54 @@ route_registry_observe :: proc(
 		case Scene_Infos:
 			learn_server_routes(reg, scene_suffix(d.scene_id), d.routes)
 		case Scene_Connection_Result:
-			learn_client_scenes(reg, f.req_id, d.scenes)
+			learn_client_routes(reg, f.req_id, u8(d.scene_handle), d.routes)
 		}
 	}
 }
 
 // Record a scene's client->server routes (from a Scene_Infos reply), keyed by its
 // SceneId. Idempotent: a scene is announced once per client, so re-adds are skipped.
-learn_server_routes :: proc(reg: ^Route_Registry, scene: string, routes: []Scene_Route) {
-	for r in routes {
+learn_server_routes :: proc(reg: ^Route_Registry, scene: string, routes: Routes) {
+	for route_name, route_index in routes {
+		if len(route_name) == 0 do continue
 		exists := false
 		for e in reg.server_routes {
-			if e.scene == scene && e.route == r.handle {
+			if e.scene == scene && e.route == u16(route_index) {
 				exists = true
 				break
 			}
 		}
-		if !exists do append(&reg.server_routes, Server_Route{scene = scene, route = r.handle, name = r.name})
+		if !exists do append(&reg.server_routes, Server_Route{scene = scene, route = u16(route_index), name = route_name})
 	}
 }
 
-// Record scene handles' server->client routes (from a Connect reply). Latest-wins:
-// handles may be reused for a different scene later, so any prior bindings for a
-// populated handle are dropped first. Binds handle->scene when the connect's req_id
-// is still known.
-learn_client_scenes :: proc(
+// Record a scene handle's server->client routes (from a Connect reply). Latest-wins:
+// handles may be reused for a different scene later, so any prior bindings for it
+// are dropped first. Binds handle->scene when the connect's req_id is still known.
+learn_client_routes :: proc(
 	reg: ^Route_Registry,
 	req_id: u16,
-	scenes: [dynamic; SCENE_CONNECTION_RESULT_MAX_SCENES]Scene,
+	handle: u8,
+	routes: Routes,
 ) {
-	for scene, scene_index in scenes {
-		if len(scene.routes) == 0 do continue
-		handle := u8(SCENE_HANDLE_MIN + scene_index)
-		if scene_id, ok := reg.req_scene[req_id]; ok do reg.handle_scene[handle] = scene_id
+	if len(routes) == 0 do return
+	if scene_id, ok := reg.req_scene[req_id]; ok do reg.handle_scene[handle] = scene_id
 
-		w := 0
-		for e in reg.client_routes {
-			if e.handle != handle {
-				reg.client_routes[w] = e
-				w += 1
-			}
+	w := 0
+	for e in reg.client_routes {
+		if e.handle != handle {
+			reg.client_routes[w] = e
+			w += 1
 		}
-		resize(&reg.client_routes, w)
+	}
+	resize(&reg.client_routes, w)
 
-		for route_name, route_index in scene.routes {
-			if len(route_name) == 0 do continue
-			append(
-				&reg.client_routes,
-				Client_Route{handle = handle, route = u16(route_index + 1), name = route_name},
-			)
-		}
+	for route_name, route_index in routes {
+		if len(route_name) == 0 do continue
+		append(
+			&reg.client_routes,
+			Client_Route{handle = handle, route = u16(route_index + 1), name = route_name},
+		)
 	}
 }
 

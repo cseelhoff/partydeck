@@ -24,8 +24,8 @@ import "core:fmt"
 import "core:strings"
 
 // Scene_Infos: the reply to Get_Scene_Infos (msg_id 136). Describes a scene before
-// the client joins it -- its id, decoded metadata fields, the routes it exposes
-// (reusing the Scene_Route shape registered on connect), and the negotiated serializer.
+// the client joins it -- its id, decoded metadata fields, the routes it exposes,
+// and the negotiated serializer.
 Scene_Infos :: struct {
 	shard_id:                                      u64,
 	scene_id:                                      string,
@@ -46,17 +46,17 @@ Scene_Infos :: struct {
 	stormancer_plugins_rpc:                        string,
 	stormancer_plugins_steam:                      string,
 	stormancer_plugins_xbl_use_modern_gamertag:    string,
-	routes:                                        []Scene_Route,
+	routes:                                        Routes,
 	selected_serializer:                           string,
 }
 
 SCENE_CONNECTION_RESULT_MAX_SCENES :: 8
-SCENE_CONNECTION_RESULT_MAX_ROUTES :: 18
+SCENE_CONNECTION_RESULT_MAX_ROUTES :: 20
 
 Routes :: [dynamic; SCENE_CONNECTION_RESULT_MAX_ROUTES]string
 
 // Scene_Connection_Result: the reply to Connect_To_Scene. RouteMappings is decoded
-// into the scene slot implied by SceneHandle and routes are stored by handle index.
+// into the assigned scene handle and routes are stored by handle index.
 Scene_Connection_Result :: struct {
 	scene_handle: u64,
 	routes: Routes
@@ -168,6 +168,7 @@ collect_scene_connection_result :: proc(
 	nodes: []Msgpack_Node,
 	map_idx: int,
 ) -> (result: Scene_Connection_Result) {
+	result.scene_handle = scene_handle
 	if map_idx < 0 || map_idx >= len(nodes) || nodes[map_idx].kind != .Map do return
 	count := nodes[map_idx].count
 	j := map_idx + 1
@@ -193,22 +194,16 @@ scene_connection_result_set_route :: proc(
 	route_name: string,
 ) {
 	if scene_handle < u64(SCENE_HANDLE_MIN) do return
-	scene_index := int(scene_handle - u64(SCENE_HANDLE_MIN))
-	if scene_index < 0 || scene_index >= SCENE_CONNECTION_RESULT_MAX_SCENES do return
 	if route_handle == 0 || route_handle > u64(SCENE_CONNECTION_RESULT_MAX_ROUTES) do return
 
-	for len(result.scenes) <= scene_index do append(&result.scenes, Scene{})
-	scene := &result.scenes[scene_index]
+	result.scene_handle = scene_handle
 	route_index := int(route_handle - 1)
-	for len(scene.routes) <= route_index do append(&scene.routes, "")
-	scene.routes[route_index] = route_name
+	for len(result.routes) <= route_index do append(&result.routes, "")
+	result.routes[route_index] = route_name
 }
 
 scene_connection_result_handle :: proc(result: Scene_Connection_Result) -> u64 {
-	for scene, scene_index in result.scenes {
-		if len(scene.routes) > 0 do return u64(SCENE_HANDLE_MIN + scene_index)
-	}
-	return 0
+	return result.scene_handle
 }
 
 // Decode the Get_Session_Token reply: exactly two back-to-back top-level msgpack
@@ -327,13 +322,11 @@ write_metadata_field :: proc(sb: ^strings.Builder, wrote: ^bool, key, value: str
 write_scene_connection_result_routes :: proc(sb: ^strings.Builder, result: Scene_Connection_Result) {
 	strings.write_byte(sb, '[')
 	wrote := false
-	for scene in result.scenes {
-		for route_name, route_index in scene.routes {
-			if len(route_name) == 0 do continue
-			if wrote do strings.write_string(sb, ", ")
-			fmt.sbprintf(sb, "%s#%d", route_name, route_index + 1)
-			wrote = true
-		}
+	for route_name, route_index in result.routes {
+		if len(route_name) == 0 do continue
+		if wrote do strings.write_string(sb, ", ")
+		fmt.sbprintf(sb, "%s#%d", route_name, route_index + 1)
+		wrote = true
 	}
 	strings.write_byte(sb, ']')
 }

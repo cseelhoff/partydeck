@@ -1779,7 +1779,7 @@ predict_caleb_step :: proc(
 			case System_Request_Id.Get_Scene_Infos:
 				#partial switch args in decoded.args {
 				case Get_Scene_Infos_Args:
-					tok := parse_connection_token(args.token, scratch)
+					tok := args.token
 					if txn.label == "C1" &&
 					   tok.ok &&
 					   strings.contains(tok.scene_id, "a0567d04-4c5c-4ff3-978f-952baa342421") {
@@ -2648,11 +2648,10 @@ predict_caleb_step :: proc(
 }
 
 scene_infos_for_token :: proc(
-	token: string,
+	tok: Connection_Token,
 	infos: Predict_Caleb_Scene_Infos,
 	allocator := context.allocator,
 ) -> []byte {
-	tok := parse_connection_token(token, allocator)
 	if !tok.ok do return infos.authenticator
 	scene := scene_suffix(tok.scene_id)
 	switch {
@@ -3544,23 +3543,19 @@ scene_infos_metadata_match :: proc(real, pred: Scene_Infos) -> bool {
 	       real.stormancer_plugins_xbl_use_modern_gamertag == pred.stormancer_plugins_xbl_use_modern_gamertag
 }
 
-scene_routes_match :: proc(real, pred: []Scene_Route) -> bool {
+scene_routes_match :: proc(real, pred: Routes) -> bool {
 	if len(real) != len(pred) do return false
-	for route, i in real {
-		if route.name != pred[i].name || route.handle != pred[i].handle do return false
-		if !metadata_match(route.metadata, pred[i].metadata) do return false
+	for route_name, i in real {
+		if route_name != pred[i] do return false
 	}
 	return true
 }
 
 scene_connection_result_match :: proc(real, pred: Scene_Connection_Result) -> bool {
-	if len(real.scenes) != len(pred.scenes) do return false
-	for scene, scene_index in real.scenes {
-		pred_scene := pred.scenes[scene_index]
-		if len(scene.routes) != len(pred_scene.routes) do return false
-		for route_name, route_index in scene.routes {
-			if route_name != pred_scene.routes[route_index] do return false
-		}
+	if real.scene_handle != pred.scene_handle do return false
+	if len(real.routes) != len(pred.routes) do return false
+	for route_name, route_index in real.routes {
+		if route_name != pred.routes[route_index] do return false
 	}
 	return true
 }
@@ -4757,12 +4752,12 @@ party_state_response_learned :: proc(
 
 build_scene_connection_result_raw :: proc(
 	scene_handle: u64,
-	routes: []Scene_Route,
+	routes: Routes,
 	allocator := context.allocator,
 ) -> []byte {
 	route_pairs := make([dynamic][]byte, allocator)
-	for route, i in routes {
-		append(&route_pairs, mpe_str(route.name, allocator))
+	for route_name, i in routes {
+		append(&route_pairs, mpe_str(route_name, allocator))
 		append(&route_pairs, mpe_uint(u64(i + 1), allocator))
 	}
 
@@ -5237,7 +5232,7 @@ predict_caleb :: proc(
 				case System_Request_Id.Get_Scene_Infos:
 					#partial switch args in decoded.args {
 					case Get_Scene_Infos_Args:
-						tok := parse_connection_token(args.token, scratch)
+						tok := args.token
 						if txn.label == "C1" &&
 						   tok.ok &&
 						   strings.contains(tok.scene_id, "a0567d04-4c5c-4ff3-978f-952baa342421") {
