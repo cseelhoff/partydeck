@@ -126,6 +126,8 @@ encode_scene_message_body :: proc(
 		return out[:]
 	case Stormancer_Rpc_Next_Body:
 		return encode_stormancer_rpc_next_body(b, allocator)
+	case Friends_Notification_Body:
+		if len(b.friends) > 0 do return encode_friends_notification_body(b, allocator)
 	}
 	return fallback_raw_body
 }

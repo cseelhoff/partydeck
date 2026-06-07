@@ -1,231 +1,211 @@
 package caleb_raknet
 
-// Layer 6 (Stormancer scene messages): decode a Scene_Message body -- the bytes
-// addressed to a scene route -- into a structured Scene_Body.
-//
-// On the wire a scene message is [sceneHandle:1][routeHandle:2 LE][body] (see
-// frames.odin Scene_Message; `body` here is everything after the route handle).
-// The body's framing is set by the Stormancer RPC plugin (predict.py
-// _send_scene_msg / _on_scene_message):
-//   * an RPC invocation / streamed reply (rpc.next) / error carries
-//     [rpcRequestId:2 LE] followed by ONE OR MORE concatenated msgpack values --
-//     the serializer writes top-level values back-to-back, not wrapped in an array.
-//   * control routes carry only ids (rpc.cancel = [reqId:2], rpc.completed =
-//     [messageSent:1][reqId:2]).
-//   * a few fire-and-forget pushes carry raw msgpack with no leading id.
-// Which one applies is decided by the route NAME, which needs the per-scene route
-// table -- a higher, stateful layer. So we decode the universal shape: try the
-// rpc-framed form (strip the u16 id, decode the rest as a msgpack value list); if
-// that leaves trailing garbage, fall back to decoding the whole body as a value
-// list. Either way the msgpack structure -- and the strings inside it -- surface.
-//
-// Two Stormancer conventions hide further structure inside those strings: JSON
-// ({...}/[...]) and base64 of a JSON/text token. write_scene_body expands both, so
-// a value like "eyJQYXJ0eUlk..." shows its decoded {"PartyId":...} inline.
-
-import "core:encoding/base64"
 import "core:fmt"
-import "core:strings"
 
-// The decoded form of a Scene_Message body: an optional leading RPC request id
-// plus the trailing list of msgpack values. `values.ok` is false when the bytes
-// were not a clean value sequence (a control frame or an unmodeled push shape).
-// `raw_tail` holds the bytes past the structured value list when the body is a
-// msgpack prefix followed by a non-msgpack blob (an RPC reply whose payload is a
-// game struct of raw pointers, say); it is empty for a clean body.
-Scene_Body :: struct {
-	rpc_id:     u16,
-	has_rpc_id: bool,
-	values:     Msgpack_Seq,
-	raw_tail:   []byte,
-}
+get_response_from_scene_message :: proc(
+	client_id: int,
+	label: string,
+	message: Scene_Message,
+	verbose: bool,
+	simple_server_state: ^Simple_Server_State,
+) -> (
+	response_messages: [dynamic; SIMPLE_MAX_RESPONSES]Decoded_Message,
+	ok: bool,
+) {
+	route := simple_server_state.scenes[message.scene_handle - SCENE_HANDLE_MIN][message.route_handle]
+	switch route {
+	case "Authentication.Login":
+		body := message.body.(Authentication_Login_Body) or_return
+//         "sent_human_readable": "Scene_Message handle=141 route=6(Authentication.Login) rpc=1 [[\"steam\", {\"gameVersion.clientVersion\": \"1.05.00.05\", \"provider\": \"steam\", \"ticket\": \"140000004F316731E9C817C7BB9F0C0101001001C24E236A180000000100000005000000C7D1724E00372436898F5A0AB9000000B20000003200000004000000BB9F0C0101001001F09A1F00A7599BB88101010A00000000BC531B6A3C03376A010059C2100000000000BA6E72D9F085C7D5CD2628D22C0C0D67544C6D4C162CA664248F076E7D4D8A1CED297A86B596A9A28B2CAF53E1FC7E91B8D486F59399B96EC6C110FED6589A3B49E0846268CCC94B17B81FEAF04BB0B0DC23263FFEEA5B70A43A1FA6CC3427AF84EC70F53AFED224AE327149656DEB25CDA05E87CDF2677BA72EE53B8F905BA0\", \"version\": \"v1\", \"appId\": \"2071280\"}]]",
+//   "real_human_readable": "Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=1 [[nil, true, \"4168ffb24de245f88060d27c9580685e\", \"\", {\"steam\": \"steam:76561197977870267\"}, {}]] | Scene_Message handle=141 route=1(stormancer.rpc.completed) rpc=257 [0]",
+  
+		simple_server_state.authentication_login = body
+		simple_server_state.steam_id = steam_id_from_login_ticket(body.ticket)
+		simple_server_state.user_id = ""
+		if id, ok := g_simple_user_ids_by_steam[simple_server_state.steam_id]; ok do simple_server_state.user_id = id
+        if len(simple_server_state.user_id) == 0 {
+            simple_server_state.user_id = fmt.aprintf("%032s", simple_server_state.steam_id)
+        }
+		steam_identity := fmt.aprintf("steam:%s", simple_server_state.steam_id)
+		append(
+            &response_messages,
+            Scene_Message{
+                scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+                body = Stormancer_Rpc_Next_Body { 
+					kind = .Authentication_Login_Result,
+					rpc_id = body.rpc_id, // or maybe hardcode 1 since we know that's what the client expects?
+                    result_is_nil = true,
+                    success = true,
+                    user_id = simple_server_state.user_id,
+                    error_message = "",
+                    identity_count = 1,
+                    steam_identity = steam_identity,
+                    steam_id = simple_server_state.steam_id,
+                    metadata_count = 0,
+                },
+            },
+        )
+        append(
+            &response_messages,Scene_Message{
+                scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+                body = Stormancer_Rpc_Completed_Body {
+                    rpc_id = 257, // the client seems to expect this specific rpc_id for the completed message after login
+                    message_sent = true,
+                }
+            }
+        )
 
-// Decode a scene route payload. Both readings are tried -- rpc-framed ([reqId:2] +
-// values) and whole-body (raw concatenated msgpack) -- because the route handle
-// alone cannot say which applies. The reading with FEWER top-level values wins: a
-// wrong framing splits one value's bytes into a run of stray fixints, so the right
-// one is almost always the shorter list. Ties favour the rpc-framed reading, which
-// is the common case. A reading is only eligible if it consumed every byte cleanly.
-//
-// A body that is a clean msgpack prefix trailed by a non-msgpack blob (e.g. the
-// Authentication.Login reply: a session-token JSON string followed by a game
-// struct full of raw pointers) decodes neither way -- the trailing bytes turn into
-// a flood of bare fixints. When the winning reading did not consume cleanly we
-// re-decode it with the loose-tail guard, which stops the value list at the opaque
-// blob and surfaces that blob as `raw_tail` instead of hundreds of stray scalars.
-decode_scene_body :: proc(body: []byte, allocator := context.allocator) -> Scene_Body {
-	whole := msgpack_decode_seq(body, allocator = allocator)
-	if len(body) >= 2 {
-		framed := msgpack_decode_seq(body[2:], allocator = allocator)
-		if framed.ok && (!whole.ok || len(framed.roots) <= len(whole.roots)) {
-			return Scene_Body{rpc_id = read_u16_le(body, 0), has_rpc_id = true, values = framed}
-		}
-		// Neither reading was clean: prefer the rpc framing (strip the request id)
-		// when its structured prefix is no longer fragmented than the whole-body one
-		// AND, allowing for the 2-byte id it dropped, it explained essentially the
-		// same span. The second test rejects a non-rpc push (no leading id) whose
-		// 2-byte shift would shatter msgpack alignment and stop consuming far short
-		// of the whole-body reading. The opaque remainder becomes raw_tail.
-		if !framed.ok && !whole.ok {
-			fp := msgpack_decode_seq(body[2:], stop_at_loose_tail = true, allocator = allocator)
-			wp := msgpack_decode_seq(body, stop_at_loose_tail = true, allocator = allocator)
-			if len(fp.roots) <= len(wp.roots) && fp.consumed + 2 >= wp.consumed {
-				return Scene_Body {
-					rpc_id = read_u16_le(body, 0),
-					has_rpc_id = true,
-					values = fp,
-					raw_tail = body[2:][fp.consumed:],
-				}
+	case "Locator.GetSceneConnectionToken":
+		body := message.body.(Locator_GetSceneConnectionToken_Body) or_return
+		if body.scene_id == "stormancer.friends" {
+           // "sent_human_readable": "Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=2 [\"stormancer.friends\", \"\"] 
+            //   "real_human_readable": "Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=2 [json:{\"token\":\"i6lBY2NvdW50SWSpZGFya3RhbGVzq0FwcGxpY2F0aW9urGxpdmUtMS0wNS0wMKZJc3N1ZWTX/\\u002BoV\\u002BgBqI3H7qkV4cGlyYXRpb27X/\\u002BoV\\u002B5BqI3MnqFVzZXJEYXRhxQHhAAAB3ZmSpXN0ZWFtsTc2NTYxMTk3OTc3ODcwMjY3mNkgNDE2OGZmYjI0ZGUyNDVmODgwNjBkMjdjOTU4MDY4NWWBpXN0ZWFtgadzdGVhbWlksTc2NTYxMTk3OTc3ODcwMjY3g6Zwc2V1ZG\\u002BqTWFqb3IgSG9mZqdvcHRpb25zgaljcm9zc3BsYXmBp2VuYWJsZWTDp3N0ZWFtaWSxNzY1NjExOTc5Nzc4NzAyNjfX/zgATcBqG1ZR1/84AE3AahtWUYClc3RlYW3AxBCYrdv8V8IZTqk1\\u002BOfjDw/GgaVzdGVhbbdzdGVhbTo3NjU2MTE5Nzk3Nzg3MDI2N4Krc3RlYW0uYXBwSWTEBPCaHwC5Z2FtZVZlcnNpb24uY2xpZW50VmVyc2lvbsQPAAAAC6oxLjA1LjAwLjA11//qW1yAaiNx\\u002Btmbc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvL2Rhcmt0YWxlcy9saXZlLTEtMDUtMDAvMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmLzE/L2F1dGhlbnRpY2F0b3IjYXV0aGVudGljYXRvci8wKCspWzJlMDk1NmUxLTk0M2YtNGE0ZS1hMGIzLTFiODZkOTA2MDA5Yl3AAKtDb250ZW50VHlwZbZzdG9ybWFuY2VyL3VzZXJTZXNzaW9uqUVuZHBvaW50c8CnU2NlbmVJZNkzc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvZGFya3RhbGVzL2xpdmUtMS0wNS0wMC9mcmllbmRzp1JvdXRpbmfArERlcGxveW1lbnRJZNkkMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmp1ZlcnNpb24C-X2GmCSkYfcmmsa79XgI9bfwZsbd9ipEovC1JNbF66co=\",\"endpoints\":{\"raknet\":[\"dt-live.passtechgames.com:30100\",\"dt-live-2.passtechgames.com:30100\"]},\"encryption\":{\"algorithm\":\"aes256\",\"mode\":\"GCM\",\"key\":\"B\\u002B9QpyQucI/bPhfQ65KwHUod9twmSBi6ZQGJgL6v2tg=\",\"token\":\"xBDnDQaJoyQZS435Ce47IdMpXHVJte40NO/G6cbGtYh4rDnqMYnuuQQqx419XKPtyW1hxFKALet6kgVn4kWmqnz4ebeLKIDqyt0=\"}}, 114, 109, 97, 110, 99, 101, 114, 46, 114, 112, 99, 46, 99, 111, 109, 112, 108, 101, 116, 101, 100, \"Handle\", 0, \"Metadata\", {}, {\"Name\": \"stormancer.rpc.next\", \"Handle\": 0, \"Metadata\": {}}, {\"Name\": \"stormancer.rpc.cancel\", \"Handle\": 0, \"Metadata\": {}}, {\"Name\": \"stormancer.rpc.error\", \"Handle\": 0, \"Metadata\": {}}, {\"Name\": \"gamefinder.update\", \"Handle\": 0, \"Metadata\": {}}, \"stormancer/userSession\", nil, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 
+            //  Scene_Message handle=141 route=1(stormancer.rpc.completed) rpc=513 [0]  
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+				body = Stormancer_Rpc_Next_Body {
+					rpc_id = body.rpc_id,
+					kind = .Scene_Connection_Token,
+					token_scene = "friends",
+					token_json = scene_token_json("friends"),
+				},
 			}
-			return Scene_Body{values = wp, raw_tail = body[wp.consumed:]}
+		)
+		append(&response_messages,
+			Scene_Message{
+                scene_handle = message.scene_handle,
+                route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+                body = Stormancer_Rpc_Completed_Body {
+                    rpc_id = 513, 
+                    message_sent = true,
+                },
+            }
+		)
 		}
-	}
-	return Scene_Body{values = whole}
-}
-
-// --- debug rendering --------------------------------------------------------
-
-// Write a one-line summary of a decoded scene body into `sb`: the rpc id (when the
-// rpc-framed reading held) and the bracketed value list, with embedded JSON/base64
-// strings expanded. A non-empty `raw_tail` (a msgpack prefix trailed by an opaque
-// blob) is reported as its byte length plus a short hex preview rather than decoded;
-// a body that simply ran out mid-value is flagged `<trailing>`.
-write_scene_body :: proc(sb: ^strings.Builder, body: Scene_Body) {
-	if body.has_rpc_id do fmt.sbprintf(sb, "rpc=%d ", body.rpc_id)
-	strings.write_byte(sb, '[')
-	for root, i in body.values.roots {
-		if i > 0 do strings.write_string(sb, ", ")
-		write_scene_value(sb, body.values.nodes, root)
-	}
-	strings.write_byte(sb, ']')
-	if len(body.raw_tail) > 0 {
-		write_raw_tail(sb, body.raw_tail)
-	} else if !body.values.ok {
-		strings.write_string(sb, " <trailing>")
-	}
-}
-
-// Append the opaque trailing blob as `+<n>B raw <hex...>`: its length plus the
-// first few bytes in hex, enough to recognise it without dumping the whole struct.
-write_raw_tail :: proc(sb: ^strings.Builder, tail: []byte) {
-	preview := min(len(tail), 16)
-	fmt.sbprintf(sb, " +%dB raw ", len(tail))
-	for k in 0 ..< preview {
-		fmt.sbprintf(sb, "%02x", tail[k])
-	}
-	if len(tail) > preview do strings.write_string(sb, "...")
-}
-
-// Render one msgpack value, recursing through arrays/maps so embedded strings are
-// reached at any depth. Only the Str case differs from the generic mp_write (it
-// expands JSON / base64 tokens); every other kind defers to mp_write unchanged.
-// Bounds-checked at every step: a truncated body (values.ok == false) leaves
-// containers whose declared count outruns the pool, so the walk must stop short
-// rather than index past the end.
-write_scene_value :: proc(b: ^strings.Builder, nodes: []Msgpack_Node, i: int) -> int {
-	if i < 0 || i >= len(nodes) do return i
-	n := nodes[i]
-	#partial switch n.kind {
-	case .Str:
-		write_scene_string(b, n.str)
-		return i + 1
-	case .Bin:
-		write_scene_bin(b, n.bin)
-		return i + 1
-	case .Array:
-		strings.write_byte(b, '[')
-		j := i + 1
-		for k in 0 ..< n.count {
-			if j >= len(nodes) do break
-			if k > 0 do strings.write_string(b, ", ")
-			j = write_scene_value(b, nodes, j)
+		if body.scene_id == "stormancer.plugins.partyManagement" {
+        //  Scene_Message handle=141 route=19(Locator.GetSceneConnectionToken) rpc=3 [\"stormancer.plugins.partyManagement\", \"\"] 
+        //  Scene_Message handle=141 route=2(stormancer.rpc.next) rpc=3 [json:{\"token\":\"i6lBY2NvdW50SWSpZGFya3RhbGVzq0FwcGxpY2F0aW9urGxpdmUtMS0wNS0wMKZJc3N1ZWTX/\\u002BtaRlBqI3H7qkV4cGlyYXRpb27X/\\u002BtaRlBqI3MnqFVzZXJEYXRhxQHhAAAB3ZmSpXN0ZWFtsTc2NTYxMTk3OTc3ODcwMjY3mNkgNDE2OGZmYjI0ZGUyNDVmODgwNjBkMjdjOTU4MDY4NWWBpXN0ZWFtgadzdGVhbWlksTc2NTYxMTk3OTc3ODcwMjY3g6Zwc2V1ZG\\u002BqTWFqb3IgSG9mZqdvcHRpb25zgaljcm9zc3BsYXmBp2VuYWJsZWTDp3N0ZWFtaWSxNzY1NjExOTc5Nzc4NzAyNjfX/zgATcBqG1ZR1/84AE3AahtWUYClc3RlYW3AxBCYrdv8V8IZTqk1\\u002BOfjDw/GgaVzdGVhbbdzdGVhbTo3NjU2MTE5Nzk3Nzg3MDI2N4Krc3RlYW0uYXBwSWTEBPCaHwC5Z2FtZVZlcnNpb24uY2xpZW50VmVyc2lvbsQPAAAAC6oxLjA1LjAwLjA11//qW1yAaiNx\\u002Btmbc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvL2Rhcmt0YWxlcy9saXZlLTEtMDUtMDAvMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmLzE/L2F1dGhlbnRpY2F0b3IjYXV0aGVudGljYXRvci8wKCspWzJlMDk1NmUxLTk0M2YtNGE0ZS1hMGIzLTFiODZkOTA2MDA5Yl3AAKtDb250ZW50VHlwZbZzdG9ybWFuY2VyL3VzZXJTZXNzaW9uqUVuZHBvaW50c8CnU2NlbmVJZNk5c2NlbmU6L3Bhc3N0ZWNoLWxpdmUvZGFya3RhbGVzL2xpdmUtMS0wNS0wMC9wYXJ0eS1tYW5hZ2Vyp1JvdXRpbmfArERlcGxveW1lbnRJZNkkMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmp1ZlcnNpb24C-t\\u002BICAXrw3wUTPFnl6D39Jqe7\\u002BROYezleBqYMTcG5R3k=\",\"endpoints\":{\"raknet\":[\"dt-live.passtechgames.com:30100\",\"dt-live-2.passtechgames.com:30100\"]},\"encryption\":{\"algorithm\":\"aes256\",\"mode\":\"GCM\",\"key\":\"qNPJiED5pjKs764P0X2PKl4HcMlo\\u002BojmkQW4bxRgCZ0=\",\"token\":\"xBDnDQaJoyQZS435Ce47IdMpcML4NNNFWD75rdisPIIITL6zv2BzlxBifHyGHrExpp\\u002BWQfSVr\\u002B8\\u002BK8lD4QqhF8\\u002BZbm9QwY2go1w=\"}}, 121, 80, 120, 87, 65, 107, 122, 99, 52, 47, 57, 82, 84, 100, 101, 110, 119, 97, 114, 83, 67, 55, 119, 110, 107, 90, 78, 66, 122, 101, 66, 71, 111, 83, 113, 104, 48, 72, 79, 102, 71, 92, 117, 48, 48, 50, 66, 81, 102, 92, 117, 48, 48, 50, 66, 110, 90, 77, 110, 72, 83, 73, 107, 61, 34, 125, 125, 0, 0, 0, 25, 0, 1, 0, 0, 0, 0, 0, 7, 14, 103, 0, 0, 0, 56, 0, 0, 0, 2, 0, 1, 2, 3, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 
+        //  Scene_Message handle=141 route=1(stormancer.rpc.completed) rpc=769 [0] 
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+				body = Stormancer_Rpc_Next_Body {
+					rpc_id = body.rpc_id,
+					kind = .Scene_Connection_Token,
+					token_scene = "party-manager",
+					token_json = scene_token_json("party-manager"),
+				},
+			},
+		)
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+				body = Stormancer_Rpc_Completed_Body {
+					rpc_id = 769,
+					message_sent = true,
+				},
+			},
+		)
 		}
-		strings.write_byte(b, ']')
-		return j
-	case .Map:
-		strings.write_byte(b, '{')
-		j := i + 1
-		for k in 0 ..< n.count {
-			if j >= len(nodes) do break
-			if k > 0 do strings.write_string(b, ", ")
-			j = write_scene_value(b, nodes, j) // key
-			if j >= len(nodes) do break
-			strings.write_string(b, ": ")
-			j = write_scene_value(b, nodes, j) // value
-		}
-		strings.write_byte(b, '}')
-		return j
-	}
-	return mp_write(b, nodes, i) // scalars / bin / ext: identical to the generic render
-}
 
-// Render a string value, decoding one layer deeper when it is an encoded payload:
-// JSON is shown verbatim (already human text); a base64 token is shown decoded.
-// A plain string is quoted as usual.
-write_scene_string :: proc(b: ^strings.Builder, s: string) {
-	if is_json_like(s) {
-		fmt.sbprintf(b, "json:%s", s)
-		return
-	}
-	if decoded, ok := try_base64_text(s); ok {
-		fmt.sbprintf(b, "b64:%q", decoded)
-		return
-	}
-	fmt.sbprintf(b, "%q", s)
-}
+	case "UserSession.UpdateUserOptions":
+		body := message.body.(UserSession_UpdateUserOptions_Body) or_return
+        //  Scene_Message handle=141 route=15(UserSession.UpdateUserOptions) rpc=4 [\"crossplay\", {\"enabled\": true}]",
+        //  Scene_Message handle=141 route=1(stormancer.rpc.completed) rpc=1024 [0]",
+		simple_server_state.user_session_update_options = body
+        append(&response_messages, Scene_Message {
+            scene_handle = message.scene_handle,
+			route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+            body = Stormancer_Rpc_Completed_Body {
+                rpc_id = 1024, // the client seems to expect this specific rpc_id for the completed message after updating user options
+                message_sent = true,
+            }
+        })
 
-// Render a msgpack `bin` payload, decoding it one layer deeper when it carries
-// text. Stormancer wraps a PartyMember's userdata JSON document in a `bin` just as
-// often as it carries a random 16-byte session id or a binary P2P token, so a
-// printable payload is shown like a string (json:/b64:/quoted) while anything
-// genuinely binary stays summarized as bin<n>.
-write_scene_bin :: proc(b: ^strings.Builder, data: []byte) {
-	if is_printable_text(data) {
-		write_scene_string(b, string(data))
-		return
-	}
-	fmt.sbprintf(b, "bin<%d>", len(data))
-}
 
-// A string is JSON-like when it is a non-trivial object or array literal -- enough
-// to skip the generic quoting and show it as the structured text it already is.
-is_json_like :: proc(s: string) -> bool {
-	if len(s) < 2 do return false
-	a, z := s[0], s[len(s) - 1]
-	return (a == '{' && z == '}') || (a == '[' && z == ']')
-}
+	case "Friends.Subscribe":
+		body := message.body.(Friends_Subscribe_Body) or_return
+		simple_server_state.friends_subscribe = body
+// 		  "sent_human_readable": "Scene_Message handle=142 route=5(Friends.Subscribe) rpc=1 []",
+//   "real_human_readable": "Scene_Message handle=142 route=1(friends.notification) [[[0, [[[\"stormancer\", \"9fe2fc1fa18643e2818bbd65198d4b00\"], [\"steam\", \"76561199572083022\"]], {\"stormancer\": 0}, [\"recentlyMet\"], json:{\n  \"userId\": \"9fe2fc1fa18643e2818bbd65198d4b00\",\n  \"lastPlatform\": \"steam\",\n  \"platforms\": {\n    \"steam\": {\n      \"steamid\": 76561199572083022\n    }\n  },\n  \"crossplay\": {\n    \"Enabled\": true\n  },\n  \"pseudo\": \"elsie\"\n}], 1780707838914]], \"^#\\xe22:7,\\\"Rando\", 109, 83, 107, 105, 110, 73, 110, 100, 101, 120, 34, 58, 91, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 44, 48, 93, 125, [[\"xboxlive\", \"96bf824424eb4444b486e783f237e86f\", \"anonymous\", \"RETAIL:2535436566179448\", \"\", 0]], 2, 0, 97, 121, 0] | Scene_Message handle=142 route=2(stormancer.rpc.completed) rpc=256 [0]",
+		friends := simple_friends_for_steam_id(simple_server_state.steam_id)
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "friends.notification"),
+				body = Friends_Notification_Body {
+					friends = friends,
+					timestamp = server_time_ms(),
+				},
+			},
+		)
+		append(&response_messages, Scene_Message {
+			scene_handle = message.scene_handle,
+			route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+			body = Stormancer_Rpc_Completed_Body {
+				rpc_id = 256, // the client seems to expect this specific rpc_id for the completed message after friends subscribe
+				message_sent = true,
+			}
+		})
 
-// Try to read `s` (or its first dot-separated segment, for JWT-style tokens) as
-// base64 of printable text -- e.g. a token whose payload is JSON. Returns the
-// decoded text only when the charset is clean and the result is fully printable,
-// so random hex ids and binary tokens are left encoded. Uses the temp allocator.
-try_base64_text :: proc(s: string) -> (string, bool) {
-	seg := s
-	if dot := strings.index_byte(s, '.'); dot > 0 do seg = s[:dot]
-	if len(seg) < 8 || len(seg) % 4 != 0 do return "", false
-	for i in 0 ..< len(seg) {
-		c := seg[i]
-		clean :=
-			(c >= 'A' && c <= 'Z') ||
-			(c >= 'a' && c <= 'z') ||
-			(c >= '0' && c <= '9') ||
-			c == '+' ||
-			c == '/' ||
-			c == '='
-		if !clean do return "", false
+	case "partymanagement.createsession":
+		body := message.body.(PartyManagement_CreateSession_Body) or_return
+		simple_server_state.party_create_session = body
+//   "sent_human_readable": "Scene_Message handle=143 route=4(partymanagement.createsession) rpc=1 [[\"\", \"matchmaking\", \"\", {}, true, true, false, json:{\"RequestedHero\":3,\"RequestedSkin\":0,\"InLobby\":true,\"PlayerName\":\"Major Hoff\",\"LobbyState\":1,\"UnlockedGameDifficulty\":0,\"MemberDataInitialized\":false,\"UnlockedHeroFlag\":31,\"m_sEosUserId\":\"0002ea2c70fa4f89a5d876065a55c786\",\"m_sSteamUserId\":76561197977870267,\"m_uVoiceChatMode\":0,\"m_ePlatform\":2,\"RandomSkinIndex\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}]]",
+//   "real_human_readable": "Scene_Message handle=143 route=2(stormancer.rpc.next) rpc=1 [json:{\"token\":\"i6lBY2NvdW50SWSpZGFya3RhbGVzq0FwcGxpY2F0aW9urGxpdmUtMS0wNS0wMKZJc3N1ZWTX/\\u002BwFPxBqI3H\\u002BqkV4cGlyYXRpb27X/\\u002BwFQKBqI3MqqFVzZXJEYXRhxQF6eyJSZXF1ZXN0ZWRIZXJvIjozLCJSZXF1ZXN0ZWRTa2luIjowLCJJbkxvYmJ5Ijp0cnVlLCJQbGF5ZXJOYW1lIjoiTWFqb3IgSG9mZiIsIkxvYmJ5U3RhdGUiOjEsIlVubG9ja2VkR2FtZURpZmZpY3VsdHkiOjAsIk1lbWJlckRhdGFJbml0aWFsaXplZCI6ZmFsc2UsIlVubG9ja2VkSGVyb0ZsYWciOjMxLCJtX3NFb3NVc2VySWQiOiIwMDAyZWEyYzcwZmE0Zjg5YTVkODc2MDY1YTU1Yzc4NiIsIm1fc1N0ZWFtVXNlcklkIjo3NjU2MTE5Nzk3Nzg3MDI2NywibV91Vm9pY2VDaGF0TW9kZSI6MCwibV9lUGxhdGZvcm0iOjIsIlJhbmRvbVNraW5JbmRleCI6WzAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMF19q0NvbnRlbnRUeXBlrnBhcnR5L3VzZXJkYXRhqUVuZHBvaW50c8CnU2NlbmVJZNlWc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvZGFya3RhbGVzL2xpdmUtMS0wNS0wMC9wYXJ0eS01YmJiMzY3Ny00NDVhLTQyZDEtYTlhOS04MzA5NGJlMzYzOWGnUm91dGluZ8CsRGVwbG95bWVudElk2SQyNTY0ZDhiZS0yZGJiLTQ5NjctYjZiYi0wZTE1N2FhN2Y2M2anVmVyc2lvbgI=-y5VzHtKC\\u002BKnrwGogKxORjWH0KuOtxDJYnSr3D35g1xI=\",\"endpoints\":{\"raknet\":[\"dt-live.passtechgames.com:30100\",\"dt-live-2.passtechgames.com:30100\"]},\"encryption\":{\"algorithm\":\"aes256\",\"mode\":\"GCM\",\"key\":\"9Xn3Pg/Z/7oScHtjgghiAnhT3ii6UqtuahNh/fz6T4g=\",\"token\":\"xBDnDQaJoyQZS435Ce47IdMpGQsi4pQh/fpwMzemwvTzGy/LDzHe420pXA6uwY5jKuiKB2CFgUUeCD4P/GXM\\u002BEhyumPm5\\u002Bsxzbc=\"}}, 78, 97, 109, 101, \"UserSession.GetUserOptions\", \"Handle\", 14, \"Metadata\", {\"stormancer.plugins.rpc\": \"1.1.0\"}, {\"Name\": \"UserSession.UpdateUserOptions\", \"Handle\": 15, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, {\"Name\": \"NX.GetAdvertisedParties\", \"Handle\": 16, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, {\"Name\": \"Steam.QueryUserIds\", \"Handle\": 17, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, {\"Name\": \"Steam.DecodePartyDataBearerTokens\", \"Handle\": 18, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, {\"Name\": \"Locator.GetSceneConnectionToken\", \"Handle\": 19, \"Metadata\": {\"stormancer.plugins.rpc\": \"1.1.0\"}}, \"SelectedSerializer\", \"msgpack/array\", 97, 99, 53, 51, 102, 54, 48, 48, 100, 101, 56, 100, 52, 57, 51, 97, 56, 48, 53, 99, 99, 50, 57, 53, 54, 55, 98, 97, 97, 100, 51, 52, nil, -32, 24, -18, 98, \"\\u007f\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x18o\\x9el\\xf0\\u007f\\x00\\x00\", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -32, 111, [108, -16, 127, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0, 0, 0, 0, 0, 0, 0, 24, 88, \"f\\xf0\", 127, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 56, {[91, \"\\u007f\\x00\\x00\\x00\\x00\\x00\\x00\\x94\\x00\\x00\\x00\\x94\\x00\\x00\\x00\\x00\\x01\\x00\\x00\", 0, 0, 1, 0, 0, 0, 0]: 0, 0: 0, 0: 0, 0: 0, 0: 0}, 0, 0, 0, 0, 0, 0, 0, 0, -32, 23, 23, 103, -16, 127, 0, 0, ext(125)<16>, 0, 0, 0, 0, 0, 0, 72, 120, [91, \"\\u007f\\x00\\x00p\\x8e\\nh\\xb0\\u007f\\x00\\x00\\xf0x\\x99[\\xb3\\u007f\\x00\\x00\", 0, 0, 0, 0, 0, 0, 0], 0] | Scene_Message handle=143 route=1(stormancer.rpc.completed) rpc=257 [0]",
+  
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.next"),
+				body = Stormancer_Rpc_Next_Body {
+					rpc_id = body.rpc_id,
+					kind = .Scene_Connection_Token,
+					token_scene = "party-manager",
+					token_json = scene_token_json("party-manager"),
+				},
+			},
+		)
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "stormancer.rpc.completed"),
+				body = Stormancer_Rpc_Completed_Body {
+					rpc_id = 257,
+					message_sent = true,
+				},
+			},
+		)
+	case "Friends.UpdateFriendList":
+		body := message.body.(Friends_UpdateFriendList_Body) or_return
+		simple_server_state.friends_update_friend_list = body
+		//   "sent_human_readable": "Scene_Message handle=142 route=4(Friends.UpdateFriendList) [[[0, [[[\"steam\", \"76561197977870267\"]], {\"steam\": 2}, [\"steam\"], json:{ \"steam\":{ \"personaName\":\"Major Hoff\"},\"pseudo\":\"Major Hoff\"}], 1967872675680]]]",
+		//   "real_human_readable": "Scene_Message handle=142 route=1(friends.notification) [[[0, [[[\"steam\", \"76561197977870267\"], [\"stormancer\", \"4168ffb24de245f88060d27c9580685e\"]], {\"stormancer\": 2, \"steam\": 2}, [\"steam\"], json:{ \"steam\":{ \"personaName\":\"Major Hoff\"},\"pseudo\":\"Major Hoff\"}], 1967872675680]]]",
+		friends := simple_friends_for_steam_id(simple_server_state.steam_id)
+		append(
+			&response_messages,
+			Scene_Message{
+				scene_handle = message.scene_handle,
+				route_handle = get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "friends.notification"),
+				body = Friends_Notification_Body {
+					friends = friends,
+					timestamp = server_time_ms(),
+				},
+			},
+		)
 	}
-	decoded, err := base64.decode(seg, base64.DEC_TABLE, context.temp_allocator)
-	if err != nil || !is_printable_text(decoded) do return "", false
-	return string(decoded), true
-}
-
-// All bytes printable ASCII or common whitespace, with at least one byte -- the
-// gate that keeps base64-of-binary (session tokens, raw ids) from being "decoded".
-is_printable_text :: proc(data: []byte) -> bool {
-	if len(data) == 0 do return false
-	for c in data {
-		if c == '\t' || c == '\n' || c == '\r' do continue
-		if c < 0x20 || c > 0x7e do return false
-	}
-	return true
+	ok = true
+	return
 }

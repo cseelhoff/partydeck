@@ -63,6 +63,8 @@ Friends_UpdateFriendList_Body :: struct {
 Friends_Notification_Body :: struct {
 	notification_count: int,
 	values:             Msgpack_Seq,
+	friends:            Simple_Friends,
+	timestamp:          u64,
 }
 
 GameSession_GetP2PToken_Body :: struct {
