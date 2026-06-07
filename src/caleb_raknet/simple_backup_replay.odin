@@ -58,6 +58,7 @@ simple_backup_replay :: proc(path: string, out_path := SIMPLE_DEFAULT_PREDICT_FI
 	match_count := 0
 
 	text := string(data)
+	seed_missing_scene_connections := !strings.contains(text, "Connect_To_Scene")
 	for object_text in simple_backup_json_objects(text, scratch) {
 		rec: Simple_Backup_Record
 		if json.unmarshal_string(object_text, &rec, allocator = scratch) != nil do continue
@@ -68,6 +69,8 @@ simple_backup_replay :: proc(path: string, out_path := SIMPLE_DEFAULT_PREDICT_FI
 		sent_bytes := simple_backup_hex_array(rec.sent, scratch)
 		real_bytes := simple_backup_hex_array(rec.real, scratch)
 		sent_decoded := simple_backup_decode_for_sender(&ps.reg_real, ps.ep_client, sent_bytes, scratch)
+		real_seed_decoded := simple_backup_decode_for_sender(&ps.reg_real, ps.ep_real, real_bytes, scratch)
+		simple_backup_seed_real_values(client.state, real_seed_decoded[:], seed_missing_scene_connections)
 		pred_generated := make([dynamic]Decoded_Message, scratch)
 
 		for sent_msg in sent_decoded {
@@ -188,6 +191,97 @@ simple_backup_decode_for_sender :: proc(
 		append(&out, decoded)
 	}
 	return out[:]
+}
+
+simple_backup_seed_real_values :: proc(
+	state: ^Simple_Server_State,
+	messages: []Decoded_Message,
+	seed_scene_connections: bool,
+) {
+	pending_token_scene := ""
+	pending_scene_infos := make([dynamic]string, context.temp_allocator)
+	for msg in messages {
+		#partial switch sm in msg {
+		case Response_Msg:
+			#partial switch body in sm.data {
+			case Scene_Infos:
+				if seed_scene_connections do append(&pending_scene_infos, scene_suffix(body.scene_id))
+			case Scene_Connection_Result:
+				if seed_scene_connections do simple_backup_seed_scene_connection_result(state, body, pending_token_scene, &pending_scene_infos)
+				pending_token_scene = ""
+			}
+		case Scene_Message:
+			#partial switch body in sm.body {
+			case Stormancer_Rpc_Next_Body:
+				if body.kind == .Scene_Connection_Token && body.token_scene != "" {
+					pending_token_scene = body.token_scene
+				}
+				if body.kind == .Scene_Connection_Token && body.token.content_type == "stormancer/userSession" && len(body.token.user_data) > 0 {
+					state.user_session_data_override = body.token.user_data
+				}
+				if body.kind == .Scene_Connection_Token && strings.has_prefix(body.token_scene, "party-") {
+					state.party_scene_override = body.token_scene
+					state.party_create_session_tail = body.raw_tail
+				}
+			}
+		}
+	}
+}
+
+simple_backup_seed_scene_connection_result :: proc(
+	state: ^Simple_Server_State,
+	result: Scene_Connection_Result,
+	pending_token_scene: string,
+	pending_scene_infos: ^[dynamic]string,
+) {
+	handle := scene_connection_result_handle(result)
+	if handle < u64(SCENE_HANDLE_MIN) do return
+	scene := simple_backup_scene_for_connection_result(result, pending_token_scene, pending_scene_infos, state)
+	if scene == "" do return
+	idx := int(handle - u64(SCENE_HANDLE_MIN))
+	if idx < len(state.scenes) && state.scenes[idx].scene_id != "" do return
+	if idx > len(state.scenes) do return
+	if idx == len(state.scenes) do append(&state.scenes, Simple_Scene{})
+	state.scenes[idx] = Simple_Scene{scene_id = scene, routes = result.routes}
+}
+
+simple_backup_scene_for_connection_result :: proc(
+	result: Scene_Connection_Result,
+	pending_token_scene: string,
+	pending_scene_infos: ^[dynamic]string,
+	state: ^Simple_Server_State,
+) -> string {
+	if simple_backup_routes_have(result.routes, "gameVersion.update") do return simple_backup_pop_scene_or(pending_scene_infos, "authenticator")
+	if simple_backup_routes_have(result.routes, "friends.notification") do return simple_backup_pop_scene_or(pending_scene_infos, "friends")
+	if simple_backup_routes_have(result.routes, "gamefinder.update") do return simple_backup_pop_scene_or(pending_scene_infos, "matchmaking")
+	if simple_backup_routes_have(result.routes, "player.update") do return simple_backup_pop_scene_or(pending_scene_infos, "gamesession")
+	if simple_backup_routes_have(result.routes, "party.memberConnected") {
+		simple_backup_pop_scene_or(pending_scene_infos, "")
+		if state.party_scene_override != "" do return state.party_scene_override
+		if pending_token_scene != "" do return pending_token_scene
+		return "party-replay"
+	}
+	if len(pending_scene_infos^) > 0 do return simple_backup_pop_scene_or(pending_scene_infos, "")
+	if pending_token_scene != "" do return pending_token_scene
+	return ""
+}
+
+simple_backup_pop_scene_or :: proc(pending_scene_infos: ^[dynamic]string, fallback: string) -> string {
+	if len(pending_scene_infos^) == 0 do return fallback
+	scene := pending_scene_infos[0]
+	for i := 1; i < len(pending_scene_infos^); i += 1 {
+		pending_scene_infos[i - 1] = pending_scene_infos[i]
+	}
+	resize(pending_scene_infos, len(pending_scene_infos^) - 1)
+	if scene != "" do return scene
+	return fallback
+}
+
+simple_backup_routes_have :: proc(routes: Routes, route_name: string) -> bool {
+	for route in routes {
+		if route == route_name do return true
+	}
+	return false
 }
 
 simple_backup_encode_generated :: proc(

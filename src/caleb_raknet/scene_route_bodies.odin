@@ -1,5 +1,8 @@
 package caleb_raknet
 
+import "core:encoding/hex"
+import "core:strings"
+
 // Route-aware Scene_Message bodies. The low-level frame decoder can only see the
 // numeric route handle, so it initially stores Scene_Raw_Body; once route_table
 // resolves the route name, scene_message_with_route_body can replace that with the
@@ -35,6 +38,24 @@ Stormancer_Rpc_Next_Body :: struct {
 	metadata_count: int,
 	token_json:     string,
 	token_scene:    string,
+	token:          Connection_Token,
+	token_raknet_endpoints: []string,
+	encryption_algorithm: string,
+	encryption_mode:      string,
+	encryption_key:       string,
+	encryption_token:     string,
+	raw_tail:       []byte,
+	tail_plugin:    string,
+	tail_plugin_version: string,
+	tail_routes:    []Stormancer_Rpc_Next_Tail_Route,
+	tail_serializer: string,
+	tail_unparsed:  []byte,
+}
+
+Stormancer_Rpc_Next_Tail_Route :: struct {
+	name:     string,
+	handle:   u64,
+	metadata: []Metadata_Entry,
 }
 
 Stormancer_Rpc_Error_Body :: struct {
@@ -66,6 +87,7 @@ Friends_Notification_Body :: struct {
 	values:             Msgpack_Seq,
 	friends:            Simple_Friends,
 	timestamp:          u64,
+	raw_tail:           []byte,
 }
 
 GameSession_GetP2PToken_Body :: struct {
@@ -81,6 +103,7 @@ Gamefinder_Update_Body :: struct {
 	status:     u64,
 	token_json: string,
 	values:     Msgpack_Seq,
+	raw_tail:   []byte,
 }
 
 Locator_GetSceneConnectionToken_Body :: struct {
@@ -113,11 +136,25 @@ Party_State_Member :: struct {
 }
 
 Party_State_Response_Body :: struct {
-	rpc_id:         u16,
-	settings:       Scene_Party_Settings,
-	leader_user_id: string,
-	members:        []Party_State_Member,
-	revision:       u64,
+	rpc_id:              u16,
+	settings:            Scene_Party_Settings,
+	leader_user_id:      string,
+	members:             []Party_State_Member,
+	revision:            u64,
+	connection_metadata: Scene_Connection_Metadata_Trailer,
+}
+
+Scene_Connection_Metadata_Trailer :: struct {
+	raw:                    []byte,
+	plugin_suffix:          string,
+	protocol:               string,
+	server_name:            string,
+	party_management:       string,
+	server_version:         string,
+	server_type:            string,
+	serializers:            string,
+	platform:               string,
+	opaque_connection_data: []byte,
 }
 
 Scene_Platform_Identity :: struct {
@@ -184,9 +221,10 @@ Party_MemberData_Tail_Value :: struct {
 }
 
 Party_MemberConnected_Body :: struct {
-	rpc_id:  u16,
-	version: u64,
-	member:  Scene_Party_Member_Connected,
+	rpc_id:   u16,
+	version:  u64,
+	member:   Scene_Party_Member_Connected,
+	raw_tail: []byte,
 }
 
 Party_MemberDataUpdated_Body :: struct {
@@ -194,6 +232,7 @@ Party_MemberDataUpdated_Body :: struct {
 	version:     u64,
 	member:      Scene_Party_Member_Data,
 	tail_values: []Party_MemberData_Tail_Value,
+	raw_tail:    []byte,
 }
 
 Party_MemberDisconnected_Body :: struct {
@@ -213,6 +252,7 @@ Party_SettingsUpdated_Body :: struct {
 	rpc_id:   u16,
 	version:  u64,
 	settings: Scene_Party_Settings,
+	raw_tail: []byte,
 }
 
 Party_UpdateGameFinderPlayerStatus_Body :: struct {
@@ -278,10 +318,11 @@ PartyMerging_GetMergerStatus_Result_Body :: struct {
 }
 
 Player_Update_Body :: struct {
-	user_id: string,
-	state:   u64,
-	data:    string,
-	ready:   bool,
+	user_id:  string,
+	state:    u64,
+	data:     string,
+	ready:    bool,
+	raw_tail: []byte,
 }
 
 Steam_CreateLobby_Body :: struct {
@@ -356,6 +397,7 @@ parse_scene_message_body :: proc(
 	case "stormancer.rpc.completed":
 		return parse_stormancer_rpc_completed_body(raw)
 	case "stormancer.rpc.next":
+		if scene_body_is_party_state_response(decoded) do return parse_party_state_response_body(decoded, allocator)
 		return parse_stormancer_rpc_next_body(decoded)
 	case "stormancer.rpc.error":
 		return parse_stormancer_rpc_error_body(decoded)
@@ -443,15 +485,42 @@ parse_stormancer_rpc_next_body :: proc(body: Scene_Body) -> Stormancer_Rpc_Next_
 	nodes := body.values.nodes
 	root := scene_seq_root(body, 0)
 	if root >= 0 && root < len(nodes) && nodes[root].kind == .Str {
+		raw_tail := body.raw_tail
+		if end, ok := msgpack_value_end(body.values.raw, 0); ok && end < len(body.values.raw) {
+			split_tail := body.values.raw[end:]
+			if len(body.raw_tail) == 0 || bytes_equal(split_tail, body.raw_tail) {
+				raw_tail = split_tail
+			} else {
+				raw_tail = scene_concat_raw_tail(split_tail, body.raw_tail, context.allocator)
+			}
+		}
+		tail_routes, tail_plugin, tail_plugin_version, tail_serializer, tail_unparsed := parse_stormancer_rpc_next_tail(raw_tail, context.allocator)
+		token := parse_stormancer_rpc_next_token_json(nodes[root].str, context.allocator)
+		token_scene := ""
+		if token.token.ok do token_scene = scene_suffix(token.token.scene_id)
 		return Stormancer_Rpc_Next_Body {
 			kind = .Scene_Connection_Token,
 			rpc_id = body.rpc_id,
 			token_json = nodes[root].str,
+			token_scene = token_scene,
+			token = token.token,
+			token_raknet_endpoints = token.raknet_endpoints,
+			encryption_algorithm = token.encryption_algorithm,
+			encryption_mode = token.encryption_mode,
+			encryption_key = token.encryption_key,
+			encryption_token = token.encryption_token,
+			raw_tail = raw_tail,
+			tail_plugin = tail_plugin,
+			tail_plugin_version = tail_plugin_version,
+			tail_routes = tail_routes,
+			tail_serializer = tail_serializer,
+			tail_unparsed = tail_unparsed,
 		}
 	}
 	identities := scene_array_child(nodes, root, 4)
 	metadata := scene_array_child(nodes, root, 5)
 	steam_identity := scene_map_string(nodes, identities, "steam")
+	tail_routes, tail_plugin, tail_plugin_version, tail_serializer, tail_unparsed := parse_stormancer_rpc_next_tail(body.raw_tail, context.allocator)
 	return Stormancer_Rpc_Next_Body {
 		kind = .Authentication_Login_Result,
 		rpc_id = body.rpc_id,
@@ -463,7 +532,241 @@ parse_stormancer_rpc_next_body :: proc(body: Scene_Body) -> Stormancer_Rpc_Next_
 		steam_identity = steam_identity,
 		steam_id = steam_id_from_identity(steam_identity),
 		metadata_count = scene_node_count(nodes, metadata),
+		raw_tail = body.raw_tail,
+		tail_plugin = tail_plugin,
+		tail_plugin_version = tail_plugin_version,
+		tail_routes = tail_routes,
+		tail_serializer = tail_serializer,
+		tail_unparsed = tail_unparsed,
 	}
+}
+
+Stormancer_Rpc_Next_Token_JSON :: struct {
+	token:                Connection_Token,
+	raknet_endpoints:     []string,
+	encryption_algorithm: string,
+	encryption_mode:      string,
+	encryption_key:       string,
+	encryption_token:     string,
+}
+
+parse_stormancer_rpc_next_token_json :: proc(
+	token_json: string,
+	allocator := context.allocator,
+) -> Stormancer_Rpc_Next_Token_JSON {
+	out: Stormancer_Rpc_Next_Token_JSON
+	if token := json_string_value_decoded(token_json, "token", allocator); token != "" {
+		out.token = parse_connection_token(token, allocator)
+	}
+	out.raknet_endpoints = stormancer_token_raknet_endpoints(token_json, allocator)
+	encryption := json_object_section(token_json, "encryption")
+	out.encryption_algorithm = json_string_value_decoded(encryption, "algorithm", allocator)
+	out.encryption_mode = json_string_value_decoded(encryption, "mode", allocator)
+	out.encryption_key = json_string_value_decoded(encryption, "key", allocator)
+	out.encryption_token = json_string_value_decoded(encryption, "token", allocator)
+	return out
+}
+
+json_string_value_decoded :: proc(s, key: string, allocator := context.allocator) -> string {
+	needle := strings.concatenate({`"`, key, `":`}, context.temp_allocator)
+	start := strings.index(s, needle)
+	if start < 0 do return ""
+	p := start + len(needle)
+	for p < len(s) && s[p] == ' ' do p += 1
+	value, _, ok := json_string_at(s, p, allocator)
+	if !ok do return ""
+	return value
+}
+
+stormancer_token_raknet_endpoints :: proc(token_json: string, allocator := context.allocator) -> []string {
+	needle := `"raknet":[`
+	start := strings.index(token_json, needle)
+	if start < 0 do return nil
+	p := start + len(needle)
+	out := make([dynamic]string, allocator)
+	for p < len(token_json) {
+		for p < len(token_json) && (token_json[p] == ' ' || token_json[p] == ',') do p += 1
+		if p >= len(token_json) || token_json[p] == ']' do break
+		value, next, ok := json_string_at(token_json, p, allocator)
+		if !ok do break
+		append(&out, strings.clone(value, allocator))
+		p = next
+	}
+	return out[:]
+}
+
+json_object_section :: proc(s, key: string) -> string {
+	needle := strings.concatenate({`"`, key, `":{`}, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	start := strings.index(s, needle)
+	if start < 0 do return ""
+	open := start + len(needle) - 1
+	depth := 0
+	in_string := false
+	escaped := false
+	for i in open ..< len(s) {
+		ch := s[i]
+		if in_string {
+			if escaped do escaped = false
+			else if ch == '\\' do escaped = true
+			else if ch == '"' do in_string = false
+			continue
+		}
+		if ch == '"' do in_string = true
+		else if ch == '{' do depth += 1
+		else if ch == '}' {
+			depth -= 1
+			if depth == 0 do return s[open:i + 1]
+		}
+	}
+	return ""
+}
+
+json_string_at :: proc(s: string, off: int, allocator := context.allocator) -> (string, int, bool) {
+	if off < 0 || off >= len(s) || s[off] != '"' do return "", off, false
+	p := off + 1
+	out := strings.builder_make(allocator)
+	escaped := false
+	for p < len(s) {
+		ch := s[p]
+		if escaped {
+			if ch == 'u' && p + 4 < len(s) {
+				if decoded, ok := json_hex_escape_byte(s[p + 1:p + 5]); ok {
+					strings.write_byte(&out, decoded)
+					p += 4
+				} else {
+					strings.write_byte(&out, ch)
+				}
+			} else {
+				strings.write_byte(&out, ch)
+			}
+			escaped = false
+		} else if ch == '\\' {
+			escaped = true
+		} else if ch == '"' {
+			return strings.to_string(out), p + 1, true
+		} else {
+			strings.write_byte(&out, ch)
+		}
+		p += 1
+	}
+	return "", off, false
+}
+
+json_hex_escape_byte :: proc(hex_text: string) -> (byte, bool) {
+	if len(hex_text) != 4 || hex_text[0] != '0' || hex_text[1] != '0' do return 0, false
+	hi, ok_hi := json_hex_nibble(hex_text[2])
+	lo, ok_lo := json_hex_nibble(hex_text[3])
+	if !ok_hi || !ok_lo do return 0, false
+	return byte(hi << 4 | lo), true
+}
+
+json_hex_nibble :: proc(c: byte) -> (u8, bool) {
+	if c >= '0' && c <= '9' do return u8(c - '0'), true
+	if c >= 'a' && c <= 'f' do return u8(c - 'a' + 10), true
+	if c >= 'A' && c <= 'F' do return u8(c - 'A' + 10), true
+	return 0, false
+}
+
+parse_stormancer_rpc_next_tail :: proc(
+	raw: []byte,
+	allocator := context.allocator,
+) -> ([]Stormancer_Rpc_Next_Tail_Route, string, string, string, []byte) {
+	out := make([dynamic]Stormancer_Rpc_Next_Tail_Route, allocator)
+	if len(raw) == 0 do return out[:], "", "", "", nil
+	if routes, plugin, plugin_version, serializer, rest, ok := parse_stormancer_rpc_next_msgpack_tail(raw, allocator); ok {
+		return routes, plugin, plugin_version, serializer, rest
+	}
+	p := 0
+	route_name := ""
+	if handle_at := scene_tail_find_msgpack_str(raw, "Handle", 0); handle_at > 0 && scene_tail_bytes_printable(raw[:handle_at]) {
+		route_name = string(raw[:handle_at])
+		p = handle_at
+	}
+	for p < len(raw) {
+		if route_name == "" {
+			if route, next_pos, ok := scene_tail_read_route_map(raw, p, allocator); ok {
+				append(&out, route)
+				p = next_pos
+				continue
+			}
+			key, next_pos, ok := scene_tail_read_msgpack_str(raw, p)
+			if !ok || key != "Name" do break
+			route_name, p, ok = scene_tail_read_msgpack_str(raw, next_pos)
+			if !ok do break
+		}
+		key, next_pos, ok := scene_tail_read_msgpack_str(raw, p)
+		if !ok || key != "Handle" do break
+		handle, after_handle, handle_ok := scene_tail_read_msgpack_uint(raw, next_pos)
+		if !handle_ok do break
+		metadata_key, after_key, key_ok := scene_tail_read_msgpack_str(raw, after_handle)
+		if !key_ok || metadata_key != "Metadata" do break
+		metadata, meta_next, meta_ok := scene_tail_read_metadata(raw, after_key, allocator)
+		if !meta_ok do break
+		append(&out, Stormancer_Rpc_Next_Tail_Route{name = route_name, handle = handle, metadata = metadata})
+		p = meta_next
+		route_name = ""
+	}
+	serializer := ""
+	if text, next_pos, ok := scene_tail_read_msgpack_str(raw, p); ok {
+		serializer = text
+		p = next_pos
+	}
+	return out[:], "", "", serializer, raw[p:]
+}
+
+parse_stormancer_rpc_next_msgpack_tail :: proc(
+	raw: []byte,
+	allocator := context.allocator,
+) -> ([]Stormancer_Rpc_Next_Tail_Route, string, string, string, []byte, bool) {
+	out := make([dynamic]Stormancer_Rpc_Next_Tail_Route, allocator)
+	plugin_builder := strings.builder_make(allocator)
+	p := 0
+	for p < len(raw) {
+		if raw[p] > 0x7f || raw[p] < 0x20 do break
+		strings.write_byte(&plugin_builder, raw[p])
+		p += 1
+	}
+	plugin := strings.to_string(plugin_builder)
+	if plugin == "" do return nil, "", "", "", nil, false
+	if plugin != "stormancer.plugins.rpc" do return nil, "", "", "", nil, false
+	plugin_version, next_pos, ok := scene_tail_read_msgpack_str(raw, p)
+	if !ok do return nil, "", "", "", nil, false
+	p = next_pos
+	for p < len(raw) {
+		if selected, _, ok_selected := scene_tail_read_msgpack_str(raw, p); ok_selected && selected == "SelectedSerializer" do break
+		route, route_next, route_ok := scene_tail_read_route_map(raw, p, allocator)
+		if !route_ok do break
+		append(&out, route)
+		p = route_next
+	}
+	serializer := ""
+	if selected, after_selected, ok_selected := scene_tail_read_msgpack_str(raw, p); ok_selected && selected == "SelectedSerializer" {
+		if text, after_serializer, ok_serializer := scene_tail_read_msgpack_str(raw, after_selected); ok_serializer {
+			serializer = text
+			p = after_serializer
+		}
+	}
+	return out[:], plugin, plugin_version, serializer, raw[p:], true
+}
+
+scene_tail_read_route_map :: proc(
+	data: []byte,
+	off: int,
+	allocator := context.allocator,
+) -> (Stormancer_Rpc_Next_Tail_Route, int, bool) {
+	end, ok := msgpack_value_end(data, off)
+	if !ok do return {}, off, false
+	seq := msgpack_decode_seq(data[off:end], allocator = allocator)
+	if !seq.ok || len(seq.roots) == 0 do return {}, off, false
+	root := seq.roots[0]
+	if root < 0 || root >= len(seq.nodes) || seq.nodes[root].kind != .Map do return {}, off, false
+	name := scene_map_string(seq.nodes, root, "Name")
+	handle := scene_node_uint(seq.nodes, msgpack_map_get(seq.nodes, root, "Handle"))
+	metadata_idx := msgpack_map_get(seq.nodes, root, "Metadata")
+	metadata := collect_metadata(seq.nodes, metadata_idx, allocator)
+	if name == "" do return {}, off, false
+	return Stormancer_Rpc_Next_Tail_Route{name = name, handle = handle, metadata = metadata}, end, true
 }
 
 parse_stormancer_rpc_error_body :: proc(body: Scene_Body) -> Stormancer_Rpc_Error_Body {
@@ -492,10 +795,28 @@ parse_friends_update_friend_list_body :: proc(body: Scene_Body) -> Friends_Updat
 	return Friends_UpdateFriendList_Body{friends_count = count, values = body.values}
 }
 
-parse_friends_notification_body :: proc(body: Scene_Body) -> Friends_Notification_Body {
+parse_friends_notification_body :: proc(
+	body: Scene_Body,
+	allocator := context.allocator,
+) -> Friends_Notification_Body {
+	values := body.values
+	raw_tail := body.raw_tail
+	if end, ok := msgpack_value_end(body.values.raw, 0); ok && end < len(body.values.raw) {
+		values = msgpack_decode_seq(body.values.raw[:end], allocator = allocator)
+		raw_tail = scene_concat_raw_tail(body.values.raw[end:], body.raw_tail, allocator)
+	}
 	count := 0
-	if r := scene_seq_root(body, 0); r >= 0 && body.values.nodes[r].kind == .Array do count = body.values.nodes[r].count
-	return Friends_Notification_Body{notification_count = count, values = body.values}
+	if r := scene_seq_root(Scene_Body{values = values}, 0); r >= 0 && values.nodes[r].kind == .Array do count = values.nodes[r].count
+	return Friends_Notification_Body{notification_count = count, values = values, raw_tail = raw_tail}
+}
+
+scene_concat_raw_tail :: proc(a, b: []byte, allocator := context.allocator) -> []byte {
+	if len(a) == 0 do return b
+	if len(b) == 0 do return a
+	out := make([]byte, len(a) + len(b), allocator)
+	copy(out[:len(a)], a)
+	copy(out[len(a):], b)
+	return out
 }
 
 parse_gamesession_get_p2p_token_body :: proc(body: Scene_Body) -> GameSession_GetP2PToken_Body {
@@ -513,16 +834,51 @@ parse_gamefinder_update_body :: proc(body: Scene_Body) -> Gamefinder_Update_Body
 		status = scene_root_uint(body, 0),
 		token_json = token_json,
 		values = body.values,
+		raw_tail = body.raw_tail,
 	}
 }
 
 parse_locator_get_scene_connection_token_body :: proc(
 	body: Scene_Body,
 ) -> Locator_GetSceneConnectionToken_Body {
+	scene_type := scene_root_text(body, 0)
+	scene_id := scene_root_text(body, 1)
+	if (scene_type == "" || scene_id == "") && body.has_rpc_id {
+		if text, next, ok := scene_tail_read_msgpack_str(body.values.raw, 0); ok {
+			scene_type = text
+			if text2, _, ok2 := scene_tail_read_msgpack_str(body.values.raw, next); ok2 do scene_id = text2
+		}
+	}
 	return Locator_GetSceneConnectionToken_Body {
 		rpc_id = body.rpc_id,
-		scene_type = scene_root_text(body, 0),
-		scene_id = scene_root_text(body, 1),
+		scene_type = scene_type,
+		scene_id = scene_id,
+	}
+}
+
+parse_party_state_response_body :: proc(
+	body: Scene_Body,
+	allocator := context.allocator,
+) -> Party_State_Response_Body {
+	nodes := body.values.nodes
+	root := scene_seq_root(body, 0)
+	members_idx := scene_array_child(nodes, root, 2)
+	members := make([dynamic]Party_State_Member, allocator)
+	child := members_idx + 1
+	if members_idx >= 0 && members_idx < len(nodes) && nodes[members_idx].kind == .Array {
+		for _ in 0 ..< nodes[members_idx].count {
+			if child < 0 || child >= len(nodes) do break
+			append(&members, scene_parse_party_state_member(nodes, child, allocator))
+			child += nodes[child].subtree
+		}
+	}
+	return Party_State_Response_Body {
+		rpc_id = body.rpc_id,
+		settings = scene_parse_party_settings(nodes, scene_array_child(nodes, root, 0)),
+		leader_user_id = scene_node_text(nodes, scene_array_child(nodes, root, 1)),
+		members = members[:],
+		revision = scene_node_uint(nodes, scene_array_child(nodes, root, 3)),
+		connection_metadata = scene_parse_connection_metadata_trailer(body.raw_tail),
 	}
 }
 
@@ -535,6 +891,7 @@ parse_party_member_connected_body :: proc(
 		rpc_id = body.rpc_id,
 		version = scene_root_uint(body, 0),
 		member = scene_parse_party_member_connected(nodes, scene_seq_root(body, 1), allocator),
+		raw_tail = body.raw_tail,
 	}
 }
 
@@ -551,6 +908,7 @@ parse_party_member_data_updated_body :: proc(
 			allocator,
 		),
 		tail_values = scene_member_data_tail_values(body, 2, allocator),
+		raw_tail = body.raw_tail,
 	}
 }
 
@@ -583,6 +941,7 @@ parse_party_settings_updated_body :: proc(body: Scene_Body) -> Party_SettingsUpd
 		rpc_id = body.rpc_id,
 		version = scene_root_uint(body, 0),
 		settings = scene_parse_party_settings(body.values.nodes, scene_seq_root(body, 1)),
+		raw_tail = body.raw_tail,
 	}
 }
 
@@ -675,6 +1034,7 @@ parse_player_update_body :: proc(body: Scene_Body) -> Player_Update_Body {
 		state = scene_node_uint(nodes, scene_array_child(nodes, root, 1)),
 		data = scene_node_text(nodes, scene_array_child(nodes, root, 2)),
 		ready = scene_node_bool(nodes, scene_array_child(nodes, root, 3)),
+		raw_tail = body.raw_tail,
 	}
 }
 
@@ -760,6 +1120,24 @@ scene_parse_party_member_connected :: proc(
 	}
 }
 
+scene_parse_party_state_member :: proc(
+	nodes: []Msgpack_Node,
+	idx: int,
+	allocator := context.allocator,
+) -> Party_State_Member {
+	json := scene_node_text(nodes, scene_array_child(nodes, idx, 2))
+	session_token := scene_node_bin(nodes, scene_array_child(nodes, idx, 3))
+	return Party_State_Member {
+		user_id = scene_node_text(nodes, scene_array_child(nodes, idx, 0)),
+		connection_state = scene_node_uint(nodes, scene_array_child(nodes, idx, 1)),
+		userdata_json = json,
+		userdata = parse_party_member_userdata(json),
+		session_token_hex = string(hex.encode(session_token, allocator)),
+		platforms = scene_parse_platforms(nodes, scene_array_child(nodes, idx, 4), allocator),
+		state = scene_node_uint(nodes, scene_array_child(nodes, idx, 5)),
+	}
+}
+
 scene_parse_party_settings :: proc(nodes: []Msgpack_Node, idx: int) -> Scene_Party_Settings {
 	return Scene_Party_Settings {
 		game_finder = scene_node_text(nodes, scene_array_child(nodes, idx, 0)),
@@ -835,6 +1213,159 @@ scene_seq_root :: proc(body: Scene_Body, root_index: int) -> int {
 	root := body.values.roots[root_index]
 	if root < 0 || root >= len(body.values.nodes) do return -1
 	return root
+}
+
+scene_body_is_party_state_response :: proc(body: Scene_Body) -> bool {
+	nodes := body.values.nodes
+	root := scene_seq_root(body, 0)
+	if root < 0 || root >= len(nodes) || nodes[root].kind != .Array || nodes[root].count < 4 do return false
+	settings := scene_array_child(nodes, root, 0)
+	leader := scene_array_child(nodes, root, 1)
+	members := scene_array_child(nodes, root, 2)
+	return settings >= 0 && settings < len(nodes) && nodes[settings].kind == .Array && nodes[settings].count >= 8 &&
+	       leader >= 0 && leader < len(nodes) && nodes[leader].kind == .Str &&
+	       members >= 0 && members < len(nodes) && nodes[members].kind == .Array
+}
+
+scene_parse_connection_metadata_trailer :: proc(raw: []byte) -> Scene_Connection_Metadata_Trailer {
+	out := Scene_Connection_Metadata_Trailer{raw = raw}
+	if len(raw) == 0 do return out
+	start := -1
+	for i in 0 ..< len(raw) {
+		key, _, ok := scene_tail_read_msgpack_str(raw, i)
+		if ok && scene_connection_metadata_key_known(key) {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		out.opaque_connection_data = raw
+		return out
+	}
+	out.plugin_suffix = string(raw[:start])
+	i := start
+	for i < len(raw) {
+		key, next, ok := scene_tail_read_msgpack_str(raw, i)
+		if !ok || !scene_connection_metadata_key_known(key) do break
+		value, value_next, value_ok := scene_tail_read_msgpack_str(raw, next)
+		if !value_ok do break
+		scene_connection_metadata_set(&out, key, value)
+		i = value_next
+	}
+	if i < len(raw) do out.opaque_connection_data = raw[i:]
+	return out
+}
+
+scene_connection_metadata_key_known :: proc(key: string) -> bool {
+	switch key {
+	case "protocol", "server.name", "stormancer.partymanagement", "server.version", "type", "serializers", "platform":
+		return true
+	}
+	return false
+}
+
+scene_connection_metadata_set :: proc(out: ^Scene_Connection_Metadata_Trailer, key, value: string) {
+	switch key {
+	case "protocol":
+		out.protocol = value
+	case "server.name":
+		out.server_name = value
+	case "stormancer.partymanagement":
+		out.party_management = value
+	case "server.version":
+		out.server_version = value
+	case "type":
+		out.server_type = value
+	case "serializers":
+		out.serializers = value
+	case "platform":
+		out.platform = value
+	}
+}
+
+scene_tail_read_msgpack_str :: proc(data: []byte, off: int) -> (string, int, bool) {
+	if off < 0 || off >= len(data) do return "", off, false
+	c := data[off]
+	p := off + 1
+	n := 0
+	switch {
+	case c >= 0xa0 && c <= 0xbf:
+		n = int(c & 0x1f)
+	case c == 0xd9:
+		if p >= len(data) do return "", off, false
+		n = int(data[p]); p += 1
+	case c == 0xda:
+		if p + 2 > len(data) do return "", off, false
+		n = int(read_u16_be(data, p)); p += 2
+	case c == 0xdb:
+		if p + 4 > len(data) do return "", off, false
+		n = int(read_u32_be(data, p)); p += 4
+	case:
+		return "", off, false
+	}
+	if n < 0 || p + n > len(data) do return "", off, false
+	return string(data[p:p + n]), p + n, true
+}
+
+scene_tail_find_msgpack_str :: proc(data: []byte, value: string, start: int) -> int {
+	for i in start ..< len(data) {
+		text, _, ok := scene_tail_read_msgpack_str(data, i)
+		if ok && text == value do return i
+	}
+	return -1
+}
+
+scene_tail_bytes_printable :: proc(data: []byte) -> bool {
+	if len(data) == 0 do return false
+	for c in data {
+		if c < 0x20 || c > 0x7e do return false
+	}
+	return true
+}
+
+scene_tail_read_msgpack_uint :: proc(data: []byte, off: int) -> (u64, int, bool) {
+	if off < 0 || off >= len(data) do return 0, off, false
+	c := data[off]
+	p := off + 1
+	switch {
+	case c <= 0x7f:
+		return u64(c), p, true
+	case c == 0xcc:
+		if p + 1 > len(data) do return 0, off, false
+		return u64(data[p]), p + 1, true
+	case c == 0xcd:
+		if p + 2 > len(data) do return 0, off, false
+		return u64(read_u16_be(data, p)), p + 2, true
+	case c == 0xce:
+		if p + 4 > len(data) do return 0, off, false
+		return u64(read_u32_be(data, p)), p + 4, true
+	}
+	return 0, off, false
+}
+
+scene_tail_read_metadata :: proc(
+	data: []byte,
+	off: int,
+	allocator := context.allocator,
+) -> ([]Metadata_Entry, int, bool) {
+	end, ok := msgpack_value_end(data, off)
+	if !ok do return nil, off, false
+	seq := msgpack_decode_seq(data[off:end], allocator = allocator)
+	if !seq.ok || len(seq.roots) == 0 do return nil, off, false
+	root := seq.roots[0]
+	if root < 0 || root >= len(seq.nodes) || seq.nodes[root].kind != .Map do return nil, off, false
+	out := make([dynamic]Metadata_Entry, allocator)
+	j := root + 1
+	for _ in 0 ..< seq.nodes[root].count {
+		if j < 0 || j >= len(seq.nodes) do break
+		key := scene_node_text(seq.nodes, j)
+		j += seq.nodes[j].subtree
+		if j < 0 || j >= len(seq.nodes) do break
+		value := scene_node_text(seq.nodes, j)
+		j += seq.nodes[j].subtree
+		append(&out, Metadata_Entry{key, value})
+	}
+	return out[:], end, true
 }
 
 scene_root_text :: proc(body: Scene_Body, root_index: int) -> string {

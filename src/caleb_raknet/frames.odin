@@ -14,6 +14,7 @@ package caleb_raknet
 //
 // No OOP, no methods -- a union of plain structs and one free decode function.
 
+import "core:encoding/base64"
 import "core:fmt"
 import "core:net"
 import "core:strings"
@@ -436,6 +437,45 @@ write_decoded_message :: proc(sb: ^strings.Builder, message: Decoded_Message, ro
 				return
 			}
 		}
+		if body, ok := f.body.(Friends_Notification_Body); ok {
+			strings.write_byte(sb, ' ')
+			write_friends_notification_body(sb, body)
+			return
+		}
+		if body, ok := f.body.(Stormancer_Rpc_Next_Body); ok {
+			strings.write_byte(sb, ' ')
+			write_stormancer_rpc_next_body(sb, body)
+			return
+		}
+		if body, ok := f.body.(Locator_GetSceneConnectionToken_Body); ok {
+			strings.write_byte(sb, ' ')
+			fmt.sbprintf(sb, "rpc=%d [", body.rpc_id)
+			write_scene_string(sb, body.scene_type)
+			strings.write_string(sb, ", ")
+			write_scene_string(sb, body.scene_id)
+			strings.write_byte(sb, ']')
+			return
+		}
+		if strings.contains(route_name, "stormancer.rpc.next") {
+			strings.write_byte(sb, ' ')
+			write_stormancer_rpc_next_body(sb, parse_stormancer_rpc_next_body(f.decoded))
+			return
+		}
+		if scene_body_has_token_envelope(f.decoded) {
+			strings.write_byte(sb, ' ')
+			write_stormancer_rpc_next_body(sb, parse_stormancer_rpc_next_body(f.decoded))
+			return
+		}
+		if (f.scene_handle == 141 || f.scene_handle == 143) && f.route_handle == 2 && f.decoded.has_rpc_id {
+			strings.write_byte(sb, ' ')
+			write_stormancer_rpc_next_body(sb, parse_stormancer_rpc_next_body(f.decoded))
+			return
+		}
+		if body, ok := f.body.(Party_State_Response_Body); ok {
+			strings.write_byte(sb, ' ')
+			write_party_state_response_body(sb, body)
+			return
+		}
 		// Show the raw byte length only when the body did not decode cleanly --
 		// otherwise the decoded value list already accounts for every byte.
 		if f.decoded.values.ok do strings.write_byte(sb, ' ')
@@ -460,6 +500,264 @@ write_party_member_connected_body :: proc(sb: ^strings.Builder, body: Party_Memb
 	fmt.sbprintf(sb, "rpc=%d [%d, ", body.rpc_id, body.version)
 	write_party_connected_member(sb, body.member)
 	strings.write_byte(sb, ']')
+	write_quoted_printable_tail(sb, body.raw_tail)
+}
+
+write_friends_notification_body :: proc(sb: ^strings.Builder, body: Friends_Notification_Body) {
+	write_scene_body(sb, Scene_Body{values = body.values, raw_tail = body.raw_tail})
+}
+
+write_stormancer_rpc_next_body :: proc(sb: ^strings.Builder, body: Stormancer_Rpc_Next_Body) {
+	fmt.sbprintf(sb, "rpc=%d [", body.rpc_id)
+	#partial switch body.kind {
+	case .Scene_Connection_Token:
+		write_stormancer_rpc_next_token(sb, body)
+	case .Authentication_Login_Result:
+		fmt.sbprintf(
+			sb,
+			"login success=%v user=%q steam=%q metadata=%d",
+			body.success,
+			body.user_id,
+			body.steam_id,
+			body.metadata_count,
+		)
+	case .GameSession_P2PToken_Result:
+		strings.write_string(sb, "[nil, false, nil]")
+	case:
+		strings.write_string(sb, "unknown")
+	}
+	strings.write_byte(sb, ']')
+	write_stormancer_rpc_next_tail(sb, body)
+}
+
+write_stormancer_rpc_next_token :: proc(sb: ^strings.Builder, body: Stormancer_Rpc_Next_Body) {
+	if !body.token.ok {
+		write_scene_string(sb, body.token_json)
+		return
+	}
+	strings.write_string(sb, "token=")
+	write_connection_token(sb, body.token)
+	fmt.sbprintf(sb, " content=%q user_data=", body.token.content_type)
+	write_token_user_data(sb, body.token.user_data, body.token.content_type)
+	strings.write_string(sb, " endpoints=[")
+	for endpoint, i in body.token_raknet_endpoints {
+		if i > 0 do strings.write_string(sb, ", ")
+		fmt.sbprintf(sb, "%q", endpoint)
+	}
+	strings.write_string(sb, "]")
+	fmt.sbprintf(sb, " encryption={{algorithm=%q, mode=%q, key=", body.encryption_algorithm, body.encryption_mode)
+	write_base64_decoded_bytes(sb, body.encryption_key)
+	strings.write_string(sb, ", token=")
+	write_base64_decoded_bytes(sb, body.encryption_token)
+	strings.write_byte(sb, '}')
+}
+
+write_token_user_data :: proc(sb: ^strings.Builder, user_data: []byte, content_type: string) {
+	if len(user_data) == 0 {
+		strings.write_string(sb, "bin<0>")
+		return
+	}
+	if content_type == "stormancer/userSession" {
+		write_user_session_data(sb, parse_user_session_data(user_data, context.temp_allocator))
+		return
+	}
+	decoded := msgpack_decode_seq(user_data, allocator = context.temp_allocator)
+	if decoded.ok && len(decoded.roots) > 0 {
+		strings.write_string(sb, "msgpack=[")
+		for root, i in decoded.roots {
+			if i > 0 do strings.write_string(sb, ", ")
+			write_scene_value(sb, decoded.nodes, root)
+		}
+		strings.write_byte(sb, ']')
+		return
+	}
+	write_scene_bin(sb, user_data)
+}
+
+write_user_session_token_data :: proc(sb: ^strings.Builder, data: []byte) {
+	fmt.sbprintf(sb, "userSession{{bytes=%d", len(data))
+	decoded_payload := false
+	if len(data) >= 4 {
+		payload_len := int(read_u32_be(data, 0))
+		fmt.sbprintf(sb, ", payload_len=%d", payload_len)
+		if payload_len >= 0 && payload_len == len(data) - 4 {
+			decoded := msgpack_decode_seq(data[4:], allocator = context.temp_allocator)
+			if decoded.ok && len(decoded.roots) == 1 {
+				write_user_session_payload_fields(sb, decoded.nodes, decoded.roots[0])
+				decoded_payload = true
+			}
+		}
+	}
+	if !decoded_payload {
+		strings.write_string(sb, ", raw_bytes=")
+		write_byte_values(sb, data)
+	}
+	strings.write_byte(sb, '}')
+}
+
+write_user_session_payload_fields :: proc(sb: ^strings.Builder, nodes: []Msgpack_Node, root: int) {
+	if root < 0 || root >= len(nodes) || nodes[root].kind != .Array do return
+	strings.write_string(sb, ", fields={")
+	child := root + 1
+	for index := 0; index < nodes[root].count; index += 1 {
+		if child < 0 || child >= len(nodes) do break
+		if index > 0 do strings.write_string(sb, ", ")
+		fmt.sbprintf(sb, "%02d=", index)
+		write_user_session_value(sb, nodes, child)
+		child += nodes[child].subtree
+	}
+	strings.write_byte(sb, '}')
+}
+
+write_user_session_value :: proc(sb: ^strings.Builder, nodes: []Msgpack_Node, i: int) -> int {
+	if i < 0 || i >= len(nodes) do return i
+	n := nodes[i]
+	#partial switch n.kind {
+	case .Str:
+		write_scene_string(sb, n.str)
+		return i + 1
+	case .Bin:
+		if is_printable_text(n.bin) {
+			write_scene_string(sb, string(n.bin))
+		} else {
+			strings.write_string(sb, "bytes=")
+			write_byte_values(sb, n.bin)
+		}
+		return i + 1
+	case .Ext:
+		if n.ext_type == -1 && len(n.bin) == 8 {
+			seconds := read_u64_be(n.bin, 0) & 0x3_FFFF_FFFF
+			fmt.sbprintf(sb, "timestamp{{sec=%d, bytes=", seconds)
+			write_byte_values(sb, n.bin)
+			strings.write_byte(sb, '}')
+		} else {
+			fmt.sbprintf(sb, "ext(%d){{bytes=", n.ext_type)
+			write_byte_values(sb, n.bin)
+			strings.write_byte(sb, '}')
+		}
+		return i + 1
+	case .Array:
+		strings.write_byte(sb, '[')
+		j := i + 1
+		for index in 0 ..< n.count {
+			if j >= len(nodes) do break
+			if index > 0 do strings.write_string(sb, ", ")
+			j = write_user_session_value(sb, nodes, j)
+		}
+		strings.write_byte(sb, ']')
+		return j
+	case .Map:
+		strings.write_byte(sb, '{')
+		j := i + 1
+		for index in 0 ..< n.count {
+			if j >= len(nodes) do break
+			if index > 0 do strings.write_string(sb, ", ")
+			j = write_user_session_value(sb, nodes, j)
+			if j >= len(nodes) do break
+			strings.write_string(sb, ": ")
+			j = write_user_session_value(sb, nodes, j)
+		}
+		strings.write_byte(sb, '}')
+		return j
+	}
+	return mp_write(sb, nodes, i)
+}
+
+write_base64_decoded_bytes :: proc(sb: ^strings.Builder, value: string) {
+	decoded, err := base64.decode(value, base64.DEC_TABLE, context.temp_allocator)
+	if err != nil {
+		fmt.sbprintf(sb, "%q", value)
+		return
+	}
+	fmt.sbprintf(sb, "base64<%d> ", len(decoded))
+	write_byte_values(sb, decoded)
+}
+
+write_stormancer_rpc_next_tail :: proc(sb: ^strings.Builder, body: Stormancer_Rpc_Next_Body) {
+	if len(body.raw_tail) == 0 do return
+	write_quoted_printable_tail(sb, body.raw_tail)
+}
+
+tail_all_zero :: proc(data: []byte) -> bool {
+	if len(data) == 0 do return false
+	for b in data {
+		if b != 0 do return false
+	}
+	return true
+}
+
+write_party_state_response_body :: proc(sb: ^strings.Builder, body: Party_State_Response_Body) {
+	fmt.sbprintf(sb, "rpc=%d [", body.rpc_id)
+	write_party_settings(sb, body.settings)
+	fmt.sbprintf(sb, ", %q, [", body.leader_user_id)
+	for member, i in body.members {
+		if i > 0 do strings.write_string(sb, ", ")
+		write_party_state_member(sb, member)
+	}
+	fmt.sbprintf(sb, "], %d]", body.revision)
+	write_connection_metadata_trailer(sb, body.connection_metadata)
+}
+
+write_party_settings :: proc(sb: ^strings.Builder, settings: Scene_Party_Settings) {
+	strings.write_byte(sb, '[')
+	fmt.sbprintf(sb, "%q, ", settings.game_finder)
+	write_scene_string(sb, settings.custom_data_json)
+	fmt.sbprintf(
+		sb,
+		", %d, %v, %v, ",
+		settings.revision,
+		settings.only_leader_invite,
+		settings.is_joinable,
+	)
+	if settings.server_status != "" || settings.server_status_details != "" {
+		fmt.sbprintf(
+			sb,
+			"{\"stormancer.partyStatus\": %q, \"stormancer.partyStatus.details\": %q}",
+			settings.server_status,
+			settings.server_status_details,
+		)
+	} else {
+		strings.write_string(sb, "{}")
+	}
+	fmt.sbprintf(sb, ", %q, %q]", settings.public_data, settings.party_id)
+}
+
+write_party_state_member :: proc(sb: ^strings.Builder, member: Party_State_Member) {
+	strings.write_byte(sb, '[')
+	fmt.sbprintf(sb, "%q, %d, ", member.user_id, member.connection_state)
+	write_scene_string(sb, member.userdata_json)
+	strings.write_string(sb, ", ")
+	write_hex_text(sb, member.session_token_hex)
+	strings.write_string(sb, ", ")
+	write_scene_platforms(sb, member.platforms)
+	fmt.sbprintf(sb, ", %d]", member.state)
+}
+
+write_connection_metadata_trailer :: proc(sb: ^strings.Builder, meta: Scene_Connection_Metadata_Trailer) {
+	if len(meta.raw) == 0 do return
+	strings.write_string(sb, " conn_meta={")
+	wrote := false
+	write_connection_metadata_field(sb, &wrote, "plugin_suffix", meta.plugin_suffix)
+	write_connection_metadata_field(sb, &wrote, "protocol", meta.protocol)
+	write_connection_metadata_field(sb, &wrote, "server.name", meta.server_name)
+	write_connection_metadata_field(sb, &wrote, "stormancer.partymanagement", meta.party_management)
+	write_connection_metadata_field(sb, &wrote, "server.version", meta.server_version)
+	write_connection_metadata_field(sb, &wrote, "type", meta.server_type)
+	write_connection_metadata_field(sb, &wrote, "serializers", meta.serializers)
+	write_connection_metadata_field(sb, &wrote, "platform", meta.platform)
+	if len(meta.opaque_connection_data) > 0 {
+		if wrote do strings.write_string(sb, ", ")
+		fmt.sbprintf(sb, "opaque<%d>", len(meta.opaque_connection_data))
+		wrote = true
+	}
+	strings.write_byte(sb, '}')
+}
+
+write_connection_metadata_field :: proc(sb: ^strings.Builder, wrote: ^bool, name, value: string) {
+	if len(value) == 0 do return
+	if wrote^ do strings.write_string(sb, ", ")
+	fmt.sbprintf(sb, "%s=%q", name, value)
+	wrote^ = true
 }
 
 write_party_connected_member :: proc(sb: ^strings.Builder, member: Scene_Party_Member_Connected) {
@@ -467,10 +765,80 @@ write_party_connected_member :: proc(sb: ^strings.Builder, member: Scene_Party_M
 	fmt.sbprintf(sb, "%q, %d, ", member.user_id, member.connection_state)
 	write_scene_string(sb, member.userdata_json)
 	strings.write_string(sb, ", ")
-	write_scene_bin(sb, member.session_token)
+	write_hex_bytes(sb, member.session_token)
 	strings.write_string(sb, ", ")
 	write_scene_platforms(sb, member.platforms)
 	fmt.sbprintf(sb, ", %d]", member.state)
+}
+
+write_quoted_printable_hex :: proc(sb: ^strings.Builder, hex_text: string) {
+	bytes := make([dynamic]byte, context.temp_allocator)
+	for i := 0; i + 1 < len(hex_text); i += 2 {
+		hi, ok_hi := hex_nibble(hex_text[i])
+		lo, ok_lo := hex_nibble(hex_text[i + 1])
+		if !ok_hi || !ok_lo do break
+		append(&bytes, byte(hi << 4 | lo))
+	}
+	write_quoted_printable_bytes(sb, bytes[:])
+}
+
+write_hex_text :: proc(sb: ^strings.Builder, hex_text: string) {
+	fmt.sbprintf(sb, "hex<%d> \"", len(hex_text) / 2)
+	for ch in hex_text {
+		if ch >= 'a' && ch <= 'f' {
+			strings.write_byte(sb, byte(ch - 32))
+		} else {
+			strings.write_byte(sb, byte(ch))
+		}
+	}
+	strings.write_byte(sb, '"')
+}
+
+write_quoted_printable_bytes :: proc(sb: ^strings.Builder, data: []byte) {
+	fmt.sbprintf(sb, "quoted_printable<%d> ", len(data))
+	strings.write_byte(sb, '"')
+	for value in data {
+		if quoted_printable_literal(value) {
+			strings.write_byte(sb, value)
+		} else {
+			strings.write_byte(sb, '=')
+			strings.write_byte(sb, hex_upper(value >> 4))
+			strings.write_byte(sb, hex_upper(value & 0x0f))
+		}
+	}
+	strings.write_byte(sb, '"')
+}
+
+write_quoted_printable_tail :: proc(sb: ^strings.Builder, data: []byte) {
+	if len(data) == 0 do return
+	fmt.sbprintf(sb, " tail={{bytes=%d, quoted_printable=", len(data))
+	write_quoted_printable_bytes(sb, data)
+	strings.write_byte(sb, '}')
+}
+
+write_hex_bytes :: proc(sb: ^strings.Builder, data: []byte) {
+	fmt.sbprintf(sb, "hex<%d> \"", len(data))
+	for value in data {
+		strings.write_byte(sb, hex_upper(value >> 4))
+		strings.write_byte(sb, hex_upper(value & 0x0f))
+	}
+	strings.write_byte(sb, '"')
+}
+
+quoted_printable_literal :: proc(value: byte) -> bool {
+	return value >= 0x21 && value <= 0x7e && value != '='
+}
+
+hex_nibble :: proc(value: byte) -> (u8, bool) {
+	if value >= '0' && value <= '9' do return u8(value - '0'), true
+	if value >= 'a' && value <= 'f' do return u8(value - 'a' + 10), true
+	if value >= 'A' && value <= 'F' do return u8(value - 'A' + 10), true
+	return 0, false
+}
+
+hex_upper :: proc(value: byte) -> byte {
+	if value < 10 do return '0' + value
+	return 'A' + (value - 10)
 }
 
 write_party_member_data_updated_body :: proc(sb: ^strings.Builder, body: Party_MemberDataUpdated_Body) {
@@ -481,6 +849,7 @@ write_party_member_data_updated_body :: proc(sb: ^strings.Builder, body: Party_M
 		write_party_member_data_tail(sb, body.tail_values)
 	}
 	strings.write_byte(sb, ']')
+	write_raw_tail(sb, body.raw_tail)
 }
 
 write_party_member_data_tail :: proc(sb: ^strings.Builder, values: []Party_MemberData_Tail_Value) {

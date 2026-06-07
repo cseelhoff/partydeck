@@ -106,6 +106,8 @@ main :: proc() {
 		err = simple_backup_replay(args[2], out_path)
 	} else if len(args) > 1 && args[1] == "simple" {
 		err = simple_net(datagrams, msgs, reasm)
+	} else if len(args) > 1 && strings.has_prefix(args[1], "--relay-") {
+		err = net_listen(datagrams, msgs, reasm)
 	} else if len(args) > 1 {
 		err = replay(datagrams, msgs, reasm, args[1])
 	} else {
@@ -296,6 +298,16 @@ net_relay_listen :: proc(
 	// its datagrams are held so its reliable window stays open. Lone ping datagrams
 	// (nothing else held) still go out immediately.
 	relay_gate_ms := env_int("RELAY_GATE_MS", 0)
+	relay_takeover_stage := cli_int_arg("--relay-takeover-stage", env_int("RELAY_TAKEOVER_STAGE", 0))
+	if relay_takeover_stage == 0 do relay_takeover_stage = cli_int_arg("--relay-stage", 0)
+	takeover_wire := new_world()
+	takeover_peers: [dynamic]Live_Peer_Wire
+	takeover := Relay_Takeover{
+		cutoff_stage = relay_takeover_stage,
+		wire = &takeover_wire,
+		peers = &takeover_peers,
+		trace = env_truthy("RELAY_STAGE_TRACE"),
+	}
 
 	clients: [dynamic]Relay_Client
 	pending_client_dgs: [dynamic]Relay_Pending_Client_Datagram
@@ -312,6 +324,14 @@ net_relay_listen :: proc(
 		relay_gate_ms > 0 ? "on" : "off",
 	)
 	if simple_shadow.enabled do fmt.printfln("simple relay shadow predict -> %s", simple_shadow.out_path)
+	if relay_takeover_stage > 0 {
+		fmt.printfln(
+			"relay predictor takeover -> stage >= %d (%s); trace=%v",
+			relay_takeover_stage,
+			relay_stage_name(relay_takeover_stage),
+			takeover.trace,
+		)
+	}
 
 	buf: [MAX_UDP_SIZE]byte
 	polls: [128]posix.pollfd
@@ -334,6 +354,7 @@ net_relay_listen :: proc(
 				reasm,
 				&live,
 				&simple_shadow,
+				&takeover,
 				predict_out_path,
 				capture,
 				log_scratch,
@@ -355,6 +376,7 @@ net_relay_listen :: proc(
 					capture,
 					log_scratch,
 					predict_scratch,
+					&takeover,
 					relay_resp_wait_ms,
 					relay_resp_idle_ms,
 					relay_gate_ms,
@@ -377,6 +399,8 @@ net_relay_listen :: proc(
 					now_tick,
 					&live,
 					&simple_shadow,
+					&takeover,
+					sock,
 					upstream,
 					dgrams,
 					msgs,
@@ -447,6 +471,7 @@ net_relay_listen :: proc(
 				reasm,
 				&live,
 				&simple_shadow,
+				&takeover,
 				predict_out_path,
 				capture,
 				log_scratch,
@@ -468,6 +493,7 @@ net_relay_listen :: proc(
 					capture,
 					log_scratch,
 					predict_scratch,
+					&takeover,
 					relay_resp_wait_ms,
 					relay_resp_idle_ms,
 					relay_gate_ms,
@@ -494,6 +520,7 @@ net_relay_listen :: proc(
 				capture,
 				log_scratch,
 				predict_scratch,
+				&takeover,
 				relay_gate_ms,
 			)
 		}
@@ -532,6 +559,7 @@ relay_handle_c2s :: proc(
 	reasm: ^Reassembly,
 	live: ^Predict_Caleb_Live,
 	simple_shadow: ^Simple_Relay_Shadow,
+	takeover: ^Relay_Takeover,
 	predict_out_path: string,
 	capture: ^os.File,
 	log_scratch: mem.Allocator,
@@ -547,6 +575,13 @@ relay_handle_c2s :: proc(
 	// a working live game / join code. Returns true so the caller collects responses.
 	if gate_ms <= 0 {
 		if !is_content_datagram(data) || datagram_is_health_channel(data) {
+			if relay_takeover_active(takeover) {
+				if datagram_is_health_channel(data) {
+					relay_takeover_seed_wire(client, takeover)
+					live_predict_handle_health(sock, takeover.wire, endpoint_peer_addr(client.client), data)
+				}
+				return false
+			}
 			net.send_udp(client.socket, data, upstream)
 			return false
 		}
@@ -557,15 +592,21 @@ relay_handle_c2s :: proc(
 		} else {
 			process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
 		}
-		net.send_udp(client.socket, data, upstream)
 		ps := find_peer(&live.peers, client.peer, &live.nidx)
 		sent_msgs := filter_health_messages(
 			reassemble_side(ps, .C2S, {data}, predict_scratch),
 			predict_scratch,
 		)
 		if len(sent_msgs) == 0 do return false
-		predict_caleb_step(live, client.peer, client.client, sent_msgs)
+		relay_stage_observe_sent(takeover, client, live, client.peer, sent_msgs, predict_scratch)
+		if relay_takeover_active(takeover) {
+			net.send_udp(sock, make_ack(read_u24_le(data, 1), predict_scratch), client.client)
+			relay_takeover_predict(sock, client, clients^[:], live, simple_shadow, takeover, sent_msgs, predict_out_path, predict_scratch)
+			return false
+		}
+		net.send_udp(client.socket, data, upstream)
 		simple_relay_shadow_step(simple_shadow, clients^[:], client.peer, client.client, sent_msgs, predict_scratch)
+		predict_caleb_step(live, client.peer, client.client, sent_msgs)
 		return true
 	}
 
@@ -576,7 +617,27 @@ relay_handle_c2s :: proc(
 	// join code. Non-content datagrams (handshake, the client's own ACK/NAK) pass
 	// straight through immediately.
 	if !is_content_datagram(data) {
+		if relay_takeover_active(takeover) do return false
 		net.send_udp(client.socket, data, upstream)
+		return false
+	}
+	if relay_takeover_active(takeover) {
+		if datagram_is_health_channel(data) {
+			relay_takeover_seed_wire(client, takeover)
+			live_predict_handle_health(sock, takeover.wire, endpoint_peer_addr(client.client), data)
+			return false
+		}
+		net.send_udp(sock, make_ack(read_u24_le(data, 1), predict_scratch), client.client)
+		ps := find_peer(&live.peers, client.peer, &live.nidx)
+		sent_msgs := filter_health_messages(
+			reassemble_side(ps, .C2S, {data}, predict_scratch),
+			predict_scratch,
+		)
+		if len(sent_msgs) > 0 {
+			log_relay_datagram(capture, log_scratch, "c2s", client.peer, time.now(), data)
+			relay_stage_observe_sent(takeover, client, live, client.peer, sent_msgs, predict_scratch)
+			relay_takeover_predict(sock, client, clients^[:], live, simple_shadow, takeover, sent_msgs, predict_out_path, predict_scratch)
+		}
 		return false
 	}
 	// A lone ping datagram with nothing already held can go immediately: it cannot
@@ -616,6 +677,8 @@ relay_release_due :: proc(
 	now_tick: i64,
 	live: ^Predict_Caleb_Live,
 	simple_shadow: ^Simple_Relay_Shadow,
+	takeover: ^Relay_Takeover,
+	sock: net.UDP_Socket,
 	upstream: net.Endpoint,
 	dgrams: ^UDP_Datagram_Store,
 	msgs: ^RakNet_Message_Store,
@@ -631,7 +694,6 @@ relay_release_due :: proc(
 		resize(&client.pending, len(client.pending) - 1)
 
 		wall := time.now()
-		net.send_udp(client.socket, held.data, upstream)
 
 		ps := find_peer(&live.peers, client.peer, &live.nidx)
 		sent_msgs := filter_health_messages(
@@ -645,8 +707,23 @@ relay_release_due :: proc(
 			} else {
 				process_udp_datagram(dgrams, msgs, reasm, dgrams.count - 1)
 			}
-			predict_caleb_step(live, client.peer, client.client, sent_msgs)
-			simple_relay_shadow_step(simple_shadow, clients, client.peer, client.client, sent_msgs, predict_scratch)
+			relay_stage_observe_sent(takeover, client, live, client.peer, sent_msgs, predict_scratch)
+			if relay_takeover_active(takeover) {
+				relay_takeover_predict(sock, client, clients, live, simple_shadow, takeover, sent_msgs, "", predict_scratch)
+			} else {
+				net.send_udp(client.socket, held.data, upstream)
+				simple_relay_shadow_step(simple_shadow, clients, client.peer, client.client, sent_msgs, predict_scratch)
+				predict_caleb_step(live, client.peer, client.client, sent_msgs)
+			}
+		} else {
+			if relay_takeover_active(takeover) {
+				if datagram_is_health_channel(held.data) {
+					relay_takeover_seed_wire(client, takeover)
+					live_predict_handle_health(sock, takeover.wire, endpoint_peer_addr(client.client), held.data)
+				}
+			} else {
+				net.send_udp(client.socket, held.data, upstream)
+			}
 		}
 		delete(held.data)
 		released = true
@@ -668,15 +745,18 @@ relay_handle_s2c :: proc(
 	capture: ^os.File,
 	log_scratch: mem.Allocator,
 	predict_scratch: mem.Allocator,
+	takeover: ^Relay_Takeover,
 	gate_ms := 0,
 ) {
 	if idx < 0 || idx >= len(clients) do return
+	if relay_takeover_active(takeover) do return
 	// Client datagrams are always forwarded to the upstream verbatim (immediate mode
 	// and raw-delay mode both preserve the client's own sequence space), so the
 	// upstream's ACK/NAK reference sequence numbers the client knows. Forward
 	// everything to the client unchanged, in both directions.
 	net.send_udp(sock, data, clients[idx].client)
 	if !is_content_datagram(data) || datagram_is_health_channel(data) do return
+	relay_client_observe_s2c(&clients[idx], data)
 
 	now := time.now()
 	log_relay_datagram(capture, log_scratch, "s2c", clients[idx].peer, now, data)
@@ -722,6 +802,7 @@ relay_wait_for_responses :: proc(
 	capture: ^os.File,
 	log_scratch: mem.Allocator,
 	predict_scratch: mem.Allocator,
+	takeover: ^Relay_Takeover,
 	wait_ms, idle_ms: int,
 	gate_ms := 0,
 ) {
@@ -812,6 +893,7 @@ relay_wait_for_responses :: proc(
 				capture,
 				log_scratch,
 				predict_scratch,
+				takeover,
 				gate_ms,
 			)
 			if meaningful_response {
@@ -932,6 +1014,58 @@ live_flush_outbox :: proc(sock: net.UDP_Socket, wire: ^World) {
 		net.send_udp(sock, out.data, endpoint_from_peer_addr(out.addr))
 	}
 	clear(&wire.outbox)
+}
+
+relay_client_observe_s2c :: proc(client: ^Relay_Client, data: []byte) {
+	if !is_content_datagram(data) || datagram_is_health_channel(data) || len(data) < 4 do return
+	seq := read_u24_le(data, 1)
+	if !client.s2c_seen || seq + 1 > client.next_s2c_datagram {
+		client.next_s2c_datagram = seq + 1
+	}
+	client.s2c_seen = true
+	packets: [MAX_INTERNAL_PACKETS]RakNet_Internal_Packet
+	n := parse_internal_packets(data, packets[:])
+	for i in 0 ..< n {
+		#partial switch packets[i].reliability {
+		case .Reliable, .Reliable_Ordered, .Reliable_Sequenced:
+			next := packets[i].reliable_message_number + 1
+			if next > client.next_s2c_reliable do client.next_s2c_reliable = next
+		}
+	}
+}
+
+relay_takeover_seed_wire :: proc(client: ^Relay_Client, takeover: ^Relay_Takeover) {
+	if takeover == nil || takeover.wire == nil do return
+	idx := conn_index(takeover.wire, endpoint_peer_addr(client.client))
+	conn := &takeover.wire.conns[idx]
+	conn.established = true
+	conn.accepted_valid = true
+	conn.conn_result_sent = true
+	if client.s2c_seen && client.next_s2c_datagram > conn.next_datagram do conn.next_datagram = client.next_s2c_datagram
+	if client.next_s2c_reliable > conn.next_reliable do conn.next_reliable = client.next_s2c_reliable
+}
+
+relay_takeover_predict :: proc(
+	sock: net.UDP_Socket,
+	client: ^Relay_Client,
+	clients: []Relay_Client,
+	live: ^Predict_Caleb_Live,
+	simple_shadow: ^Simple_Relay_Shadow,
+	takeover: ^Relay_Takeover,
+	sent_msgs: [][]byte,
+	predict_out_path: string,
+	scratch: mem.Allocator,
+) {
+	if len(sent_msgs) == 0 do return
+	relay_takeover_seed_wire(client, takeover)
+	simple_relay_shadow_step(simple_shadow, clients, client.peer, client.client, sent_msgs, scratch)
+	preds := predict_caleb_step(live, client.peer, client.client, sent_msgs)
+	live_send_predictions(sock, takeover.wire, client.client, preds, scratch)
+	if takeover.peers != nil {
+		live_peer_index(takeover.peers, client.client)
+		live_flush_cross_predictions(sock, takeover.wire, live, takeover.peers^[:], scratch)
+	}
+	if predict_out_path != "" do predict_caleb_live_write(live, predict_out_path)
 }
 
 open_log :: proc() -> (^os.File, os.Error) {
@@ -1113,6 +1247,10 @@ Relay_Client :: struct {
 	client:  net.Endpoint,
 	peer:    string,
 	socket:  net.UDP_Socket,
+	stage:   int,
+	s2c_seen: bool,
+	next_s2c_datagram: u32,
+	next_s2c_reliable: u32,
 	// Content datagrams held for raw-delay, in arrival (== sequence) order. Each is
 	// forwarded VERBATIM (exact bytes / sequence number / reliability / fragments)
 	// once its deadline passes; FIFO release preserves datagram ordering to the
@@ -1120,6 +1258,15 @@ Relay_Client :: struct {
 	// are only ever held to stay behind an already-held datagram, never reordered
 	// ahead of one.
 	pending: [dynamic]Relay_Held_Datagram,
+}
+
+Relay_Takeover :: struct {
+	cutoff_stage: int,
+	stage:        int,
+	active:       bool,
+	trace:        bool,
+	wire:         ^World,
+	peers:        ^[dynamic]Live_Peer_Wire,
 }
 
 // One client->upstream content datagram held for raw-delay: the exact original
@@ -1165,12 +1312,271 @@ env_int :: proc(key: string, fallback: int) -> int {
 	buf: [64]u8
 	value := os.get_env(buf[:], key)
 	if value == "" do return fallback
+	return parse_positive_int(value, fallback)
+}
+
+parse_positive_int :: proc(value: string, fallback: int) -> int {
 	out := 0
 	for c in value {
 		if c < '0' || c > '9' do return fallback
 		out = out * 10 + int(c - '0')
 	}
 	return out
+}
+
+cli_int_arg :: proc(name: string, fallback: int) -> int {
+	args := os.args
+	prefix := strings.concatenate({name, "="}, context.temp_allocator)
+	for arg, i in args {
+		if arg == name && i + 1 < len(args) do return parse_positive_int(args[i + 1], fallback)
+		if strings.has_prefix(arg, prefix) do return parse_positive_int(arg[len(prefix):], fallback)
+	}
+	return fallback
+}
+
+Relay_Stage_Transport_Connected :: 10
+Relay_Stage_Session_Token       :: 20
+Relay_Stage_Auth_Infos          :: 30
+Relay_Stage_Auth_Connected      :: 40
+Relay_Stage_Auth_Ready          :: 45
+Relay_Stage_Auth_Login          :: 50
+Relay_Stage_User_Options        :: 55
+Relay_Stage_Static_Tokens       :: 60
+Relay_Stage_Friends_Ready       :: 70
+Relay_Stage_Party_Manager_Ready :: 75
+Relay_Stage_Party_Create        :: 90
+Relay_Stage_Party_Connected     :: 100
+Relay_Stage_Party_Ready         :: 110
+Relay_Stage_Invitation_Code     :: 120
+Relay_Stage_Matchmaking_Token   :: 130
+Relay_Stage_Matchmaking_Ready   :: 140
+Relay_Stage_Party_Join_Token    :: 150
+Relay_Stage_Party_Join_Ready    :: 154
+Relay_Stage_Party_Join_Ack      :: 156
+Relay_Stage_Party_Join_Complete :: 157
+Relay_Stage_Party_Join_State    :: 158
+Relay_Stage_Party_Join_Userdata :: 159
+Relay_Stage_GameSession_Token   :: 160
+Relay_Stage_GameSession_Ready   :: 180
+Relay_Stage_Player_Ready        :: 190
+
+relay_stage_name :: proc(stage: int) -> string {
+	switch {
+	case stage >= Relay_Stage_Player_Ready:
+		return "player_ready"
+	case stage >= Relay_Stage_GameSession_Ready:
+		return "gamesession_ready"
+	case stage >= Relay_Stage_GameSession_Token:
+		return "gamesession_token"
+	case stage >= Relay_Stage_Party_Join_Userdata:
+		return "party_join_userdata"
+	case stage >= Relay_Stage_Party_Join_State:
+		return "party_join_state"
+	case stage >= Relay_Stage_Party_Join_Complete:
+		return "party_join_complete"
+	case stage >= Relay_Stage_Party_Join_Ack:
+		return "party_join_ack"
+	case stage >= Relay_Stage_Party_Join_Ready:
+		return "party_join_ready"
+	case stage >= Relay_Stage_Party_Join_Token:
+		return "party_join_token"
+	case stage >= Relay_Stage_Matchmaking_Ready:
+		return "matchmaking_ready"
+	case stage >= Relay_Stage_Matchmaking_Token:
+		return "matchmaking_token"
+	case stage >= Relay_Stage_Invitation_Code:
+		return "invitation_code"
+	case stage >= Relay_Stage_Party_Ready:
+		return "party_ready"
+	case stage >= Relay_Stage_Party_Connected:
+		return "party_connected"
+	case stage >= Relay_Stage_Party_Create:
+		return "party_create"
+	case stage >= Relay_Stage_Party_Manager_Ready:
+		return "party_manager_ready"
+	case stage >= Relay_Stage_Friends_Ready:
+		return "friends_ready"
+	case stage >= Relay_Stage_Static_Tokens:
+		return "static_scene_tokens"
+	case stage >= Relay_Stage_User_Options:
+		return "user_options"
+	case stage >= Relay_Stage_Auth_Login:
+		return "auth_login"
+	case stage >= Relay_Stage_Auth_Ready:
+		return "auth_ready"
+	case stage >= Relay_Stage_Auth_Connected:
+		return "auth_connected"
+	case stage >= Relay_Stage_Auth_Infos:
+		return "auth_infos"
+	case stage >= Relay_Stage_Session_Token:
+		return "session_token"
+	case stage >= Relay_Stage_Transport_Connected:
+		return "transport_connected"
+	}
+	return "initial"
+}
+
+relay_takeover_active :: proc(takeover: ^Relay_Takeover) -> bool {
+	return takeover != nil && takeover.cutoff_stage > 0 && takeover.active
+}
+
+relay_stage_observe_sent :: proc(
+	takeover: ^Relay_Takeover,
+	client: ^Relay_Client,
+	live: ^Predict_Caleb_Live,
+	label: string,
+	sent_msgs: [][]byte,
+	allocator := context.allocator,
+) {
+	if takeover == nil do return
+	for msg in sent_msgs {
+		decoded := decode_message(msg, allocator)
+		stage := relay_stage_for_message(live, label, decoded)
+		stage = relay_stage_refine_after_message(stage, takeover.stage, client.stage, live, label, decoded)
+		if stage <= 0 do continue
+		if stage > client.stage {
+			old := client.stage
+			client.stage = stage
+			if takeover.trace do fmt.printfln("relay stage %s %d(%s) -> %d(%s)", client.peer, old, relay_stage_name(old), stage, relay_stage_name(stage))
+		}
+		if stage > takeover.stage {
+			old := takeover.stage
+			takeover.stage = stage
+			if takeover.trace do fmt.printfln("relay global stage %d(%s) -> %d(%s)", old, relay_stage_name(old), stage, relay_stage_name(stage))
+		}
+	}
+	if takeover.cutoff_stage > 0 && !takeover.active && takeover.stage >= takeover.cutoff_stage {
+		takeover.active = true
+		stamp, _ := time.time_to_rfc3339(time.now(), allocator = context.temp_allocator)
+		fmt.printfln("%s relay predictor takeover activated at stage %d (%s); cutoff=%d", stamp, takeover.stage, relay_stage_name(takeover.stage), takeover.cutoff_stage)
+	}
+}
+
+relay_stage_for_message :: proc(live: ^Predict_Caleb_Live, label: string, msg: Decoded_Message) -> int {
+	#partial switch m in msg {
+	case Connection_Request:
+		return Relay_Stage_Transport_Connected
+	case System_Request:
+		#partial switch m.msg_id {
+		case .Get_Session_Token:
+			return Relay_Stage_Session_Token
+		case .Get_Scene_Infos:
+			if args, ok := m.args.(Get_Scene_Infos_Args); ok do return relay_stage_for_scene_info(scene_suffix(args.token.scene_id))
+		case .Connect_To_Scene:
+			if args, ok := m.args.(Connect_To_Scene_Args); ok do return relay_stage_for_connect(scene_suffix(args.token.scene_id))
+		case .Scene_Ready, .Scene_Ready2:
+			if args, ok := m.args.(Scene_Ready_Args); ok do return relay_stage_for_ready(relay_stage_scene_for_handle(live, label, u8(args.scene_handle)))
+		case .Set_Metadata:
+			return 25
+		}
+	case Scene_Message:
+		return relay_stage_for_scene_message(live, label, m)
+	}
+	return 0
+}
+
+relay_stage_refine_after_message :: proc(
+	stage, global_stage, client_stage: int,
+	live: ^Predict_Caleb_Live,
+	label: string,
+	msg: Decoded_Message,
+) -> int {
+	join_started := max(global_stage, client_stage) >= Relay_Stage_Party_Join_Token
+	if !join_started do return stage
+	#partial switch m in msg {
+	case System_Request:
+		#partial switch m.msg_id {
+		case .Scene_Ready, .Scene_Ready2:
+			if args, ok := m.args.(Scene_Ready_Args); ok {
+				scene := relay_stage_scene_for_handle(live, label, u8(args.scene_handle))
+				if predict_caleb_is_party_scene(scene) do return max(stage, Relay_Stage_Party_Join_Ready)
+			}
+		}
+	case Scene_Message:
+		scene := relay_stage_scene_for_handle(live, label, m.scene_handle)
+		if predict_caleb_is_party_scene(scene) || (m.scene_handle >= 144 && m.scene_handle <= 147) {
+			if m.route_handle == 0 do return max(stage, Relay_Stage_Party_Join_Ack)
+			if m.route_handle == 3 do return max(stage, Relay_Stage_Party_Join_Complete)
+			if m.route_handle == 11 do return max(stage, Relay_Stage_Party_Join_State)
+			if m.route_handle == 6 || m.route_handle == 9 do return max(stage, Relay_Stage_Party_Join_Userdata)
+		}
+	}
+	return stage
+}
+
+relay_stage_for_scene_info :: proc(scene: string) -> int {
+	switch {
+	case scene == "authenticator": return Relay_Stage_Auth_Infos
+	case scene == "friends": return 65
+	case scene == "party-manager": return 66
+	case scene == "matchmaking": return 125
+	case predict_caleb_is_party_scene(scene): return 95
+	case strings.has_prefix(scene, "gamesession") || looks_uuid(scene): return 165
+	}
+	return 0
+}
+
+relay_stage_for_connect :: proc(scene: string) -> int {
+	switch {
+	case scene == "authenticator": return Relay_Stage_Auth_Connected
+	case scene == "friends": return 68
+	case scene == "party-manager": return 72
+	case scene == "matchmaking": return 135
+	case predict_caleb_is_party_scene(scene): return Relay_Stage_Party_Connected
+	case strings.has_prefix(scene, "gamesession") || looks_uuid(scene): return 170
+	}
+	return 0
+}
+
+relay_stage_for_ready :: proc(scene: string) -> int {
+	switch {
+	case scene == "authenticator": return Relay_Stage_Auth_Ready
+	case scene == "friends": return Relay_Stage_Friends_Ready
+	case scene == "party-manager": return Relay_Stage_Party_Manager_Ready
+	case scene == "matchmaking": return Relay_Stage_Matchmaking_Ready
+	case predict_caleb_is_party_scene(scene): return Relay_Stage_Party_Ready
+	case strings.has_prefix(scene, "gamesession") || looks_uuid(scene): return Relay_Stage_GameSession_Ready
+	}
+	return 0
+}
+
+relay_stage_for_scene_message :: proc(live: ^Predict_Caleb_Live, label: string, msg: Scene_Message) -> int {
+	scene := relay_stage_scene_for_handle(live, label, msg.scene_handle)
+	if msg.scene_handle == 141 && msg.route_handle == 6 do return Relay_Stage_Auth_Login
+	if msg.scene_handle == 141 && msg.route_handle == 15 do return Relay_Stage_User_Options
+	if msg.scene_handle == 141 && msg.route_handle == 19 {
+		kind := scene_root_text(msg.decoded, 0)
+		if strings.contains(kind, "gamefinder") do return Relay_Stage_Matchmaking_Token
+		return Relay_Stage_Static_Tokens
+	}
+	if scene == "party-manager" || scene == "party" {
+		if msg.route_handle == 4 do return Relay_Stage_Party_Create
+		if msg.route_handle == 5 do return Relay_Stage_Party_Join_Token
+	}
+	if predict_caleb_is_party_scene(scene) || (msg.scene_handle >= 144 && msg.scene_handle <= 147) {
+		switch msg.route_handle {
+		case 13: return Relay_Stage_Invitation_Code
+		case 10: return 128
+		case 6, 7: return 112
+		}
+	}
+	if strings.has_prefix(scene, "gamesession") || looks_uuid(scene) {
+		if msg.route_handle == 8 do return Relay_Stage_Player_Ready
+		if msg.route_handle == 9 do return Relay_Stage_GameSession_Token
+	}
+	return 0
+}
+
+relay_stage_scene_for_handle :: proc(live: ^Predict_Caleb_Live, label: string, handle: u8) -> string {
+	if live != nil {
+		if scene, ok := predict_caleb_scene_for_handle(live.scene_handles[:], label, handle); ok do return scene
+	}
+	switch handle {
+	case 141: return "authenticator"
+	case 142: return "friends"
+	case 143: return "party-manager"
+	}
+	return ""
 }
 
 endpoint_peer_addr :: proc(ep: net.Endpoint) -> Peer_Addr {
@@ -1333,34 +1739,52 @@ live_host_steam_lobby :: proc(live: ^Predict_Caleb_Live) -> u64 {
 	return live_steam_lobby(live, "C1", 109775242850226431)
 }
 
-predict_caleb_set_identity :: proc(live: ^Predict_Caleb_Live, label, identity: string) {
+predict_caleb_set_identity_entry :: proc(
+	identities: ^[dynamic]Predict_Caleb_Peer_Identity,
+	label, identity: string,
+) {
 	if identity == "" do return
-	for &entry in live.peer_identities {
+	for &entry in identities^ {
 		if entry.label == label {
 			entry.identity = identity
 			return
 		}
 	}
-	append(&live.peer_identities, Predict_Caleb_Peer_Identity{label = label, identity = identity})
+	append(identities, Predict_Caleb_Peer_Identity{label = label, identity = identity})
 }
 
-predict_caleb_identity_label :: proc(live: ^Predict_Caleb_Live, label: string) -> string {
-	for entry in live.peer_identities {
+predict_caleb_set_identity :: proc(live: ^Predict_Caleb_Live, label, identity: string) {
+	predict_caleb_set_identity_entry(&live.peer_identities, label, identity)
+}
+
+predict_caleb_identity_label_from_entries :: proc(
+	identities: []Predict_Caleb_Peer_Identity,
+	label: string,
+) -> string {
+	for entry in identities {
 		if entry.label == label do return entry.identity
 	}
 	return label
+}
+
+predict_caleb_identity_label :: proc(live: ^Predict_Caleb_Live, label: string) -> string {
+	return predict_caleb_identity_label_from_entries(live.peer_identities[:], label)
 }
 
 predict_caleb_identity_from_raw :: proc(raw: []byte) -> string {
 	s := string(raw)
 	if strings.contains(s, `"PlayerName":"Major Hoff"`) ||
 	   strings.contains(s, `"m_sSteamUserId":76561197977870267`) ||
-	   strings.contains(s, `"m_sEosUserId":"0002ea2c70fa4f89a5d876065a55c786"`) {
+	   strings.contains(s, `"m_sEosUserId":"0002ea2c70fa4f89a5d876065a55c786"`) ||
+	   strings.contains(s, "BB9F0C0101001001") ||
+	   strings.contains(s, "bb9f0c0101001001") {
 		return "C2"
 	}
 	if strings.contains(s, `"PlayerName":"elsie"`) ||
 	   strings.contains(s, `"m_sSteamUserId":76561199572083022`) ||
-	   strings.contains(s, `"m_sEosUserId":"000239105cf443abbdf0238c827bd9e8"`) {
+	   strings.contains(s, `"m_sEosUserId":"000239105cf443abbdf0238c827bd9e8"`) ||
+	   strings.contains(s, "4E61126001001001") ||
+	   strings.contains(s, "4e61126001001001") {
 		return "C1"
 	}
 	return ""
@@ -1392,6 +1816,11 @@ predict_caleb_userdata_for_label :: proc(
 	initialized: bool,
 	lobby_state: int,
 ) -> string {
+	if identity != "" {
+		for entry in userdata {
+			if entry.label == identity && entry.json != "" do return entry.json
+		}
+	}
 	for entry in userdata {
 		if entry.label == label && entry.json != "" do return entry.json
 	}
@@ -1471,6 +1900,12 @@ predict_caleb_ensure_party_state :: proc(
 	for &state in states^ {
 		if state.scene == scene {
 			if state.owner_label == "" do state.owner_label = owner_label
+			return
+		}
+	}
+	for &state in states^ {
+		if state.owner_label == owner_label {
+			state.scene = scene
 			return
 		}
 	}
@@ -1555,12 +1990,41 @@ predict_caleb_party_invite_for_scene :: proc(
 	return invite_code_for_peer(fallback_label)
 }
 
+predict_caleb_party_state_count :: proc(states: []Predict_Caleb_Party_State) -> int {
+	count := 0
+	for state in states {
+		if predict_caleb_is_party_scene(state.scene) do count += 1
+	}
+	return count
+}
+
+predict_caleb_latest_party_owner_label :: proc(
+	states: []Predict_Caleb_Party_State,
+) -> (string, bool) {
+	for i := len(states) - 1; i >= 0; i -= 1 {
+		state := states[i]
+		if state.owner_label != "" && predict_caleb_is_party_scene(state.scene) {
+			return state.owner_label, true
+		}
+	}
+	return "", false
+}
+
+predict_caleb_latest_party_scene :: proc(states: []Predict_Caleb_Party_State) -> (string, bool) {
+	for i := len(states) - 1; i >= 0; i -= 1 {
+		state := states[i]
+		if predict_caleb_is_party_scene(state.scene) do return state.scene, true
+	}
+	return "", false
+}
+
 predict_caleb_party_owner_for_invite :: proc(
 	states: []Predict_Caleb_Party_State,
 	code, fallback: string,
 ) -> string {
 	if code != "" {
-		for state in states {
+		for i := len(states) - 1; i >= 0; i -= 1 {
+			state := states[i]
 			if state.invitation_code == code && state.owner_label != "" do return state.owner_label
 		}
 	}
@@ -1572,7 +2036,8 @@ predict_caleb_party_scene_for_invite :: proc(
 	code, fallback: string,
 ) -> string {
 	if code != "" {
-		for state in states {
+		for i := len(states) - 1; i >= 0; i -= 1 {
+			state := states[i]
 			if state.invitation_code == code && predict_caleb_is_party_scene(state.scene) do return state.scene
 		}
 	}
@@ -1843,6 +2308,13 @@ predict_caleb_step :: proc(
 
 			case System_Request_Id.Set_Metadata:
 				append_response_complete(&txn.preds, decoded.req_id, false, scratch)
+				predict_caleb_append_missing_auth_connection_result(
+					&txn.preds,
+					&live.scene_handles,
+					txn.label,
+					decoded.req_id + 2,
+					scratch,
+				)
 
 			case System_Request_Id.Scene_Ready, System_Request_Id.Scene_Ready2:
 				ready_handle: u64
@@ -1875,19 +2347,7 @@ predict_caleb_step :: proc(
 						scratch,
 					)
 				}
-				if ready_handle == 145 && txn.label == "C1" {
-					append_captured_push(
-						&txn.preds,
-						live.raknet_samples_text,
-						"party/party.memberDataUpdated",
-						"C1",
-						144,
-						3,
-						1,
-						scratch,
-					)
-				}
-				if ready_handle == 145 && txn.label == "C2" {
+				if ready_handle == 145 {
 					party_scene := predict_caleb_party_scene_for_handle(
 						live.party_states[:],
 						live.scene_handles[:],
@@ -2012,7 +2472,7 @@ predict_caleb_step :: proc(
 						scratch,
 					)
 				}
-				if ready_handle == 145 && txn.label == "C1" {
+				if ready_handle == 145 {
 					party_scene := predict_caleb_party_scene_for_handle(
 						live.party_states[:],
 						live.scene_handles[:],
@@ -2029,41 +2489,55 @@ predict_caleb_step :: proc(
 						party_scene,
 						txn.label,
 					)
-					append_scene_message(
-						&txn.preds,
-						144,
-						7,
-						party_settings_body_for_scene(
-							txn.label,
-							7,
-							5,
-							invite_code,
-							party_scene,
+					latest_owner, latest_ok := predict_caleb_latest_party_owner_label(live.party_states[:])
+					if latest_ok && latest_owner == txn.label && predict_caleb_party_state_count(live.party_states[:]) > 1 {
+						joiner_label := predict_caleb_other_peer_label(live, txn.label)
+						joiner_ident := predict_caleb_identity_label(live, joiner_label)
+						host_ident := predict_caleb_identity_label(live, txn.label)
+						append_scene_message(
+							&txn.preds,
+							144,
+							3,
+							party_memberdata_body(
+								joiner_ident,
+								u64(party_broadcast_rpc(9, false)),
+								9,
+								true,
+								1,
+								scratch,
+							),
 							scratch,
-						),
-						scratch,
-					)
-					append_scene_message(
-						&txn.preds,
-						144,
-						3,
-						party_memberdata_body("C2", 11, 9, true, 1, scratch),
-						scratch,
-					)
-					append_scene_message(
-						&txn.preds,
-						144,
-						3,
-						party_memberdata_body("C2", 19, 13, true, 2, scratch),
-						scratch,
-					)
-					append_scene_message(
-						&txn.preds,
-						144,
-						3,
-						party_memberdata_body("C1", 21, 14, true, 2, scratch),
-						scratch,
-					)
+						)
+						append_scene_message(
+							&txn.preds,
+							144,
+							3,
+							party_memberdata_body(
+								host_ident,
+								u64(party_broadcast_rpc(13, false)),
+								13,
+								true,
+								2,
+								scratch,
+							),
+							scratch,
+						)
+					} else {
+						append_scene_message(
+							&txn.preds,
+							144,
+							7,
+							party_settings_body_for_scene(
+								txn.label,
+								8,
+								7,
+								invite_code,
+								party_scene,
+								scratch,
+							),
+							scratch,
+						)
+					}
 				}
 				if ready_handle == 146 && predict_caleb_is_joiner(live, txn.label) {
 					joiner_identity := predict_caleb_identity_label(live, txn.label)
@@ -2242,20 +2716,27 @@ predict_caleb_step :: proc(
 						decoded.scene_handle,
 						1,
 						decoded.decoded.rpc_id,
-						false,
+						true,
 						scratch,
 					)
 				}
 			case 3:
 				if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 257 {
-					append_captured_push(
+					ident := predict_caleb_identity_label(live, txn.label)
+					hero := predict_caleb_hero_for_identity_or_label(live.peer_userdata[:], ident, txn.label)
+					userdata_json := party_userdata_json(ident, false, 1, hero, scratch)
+					append_scene_message(
 						&txn.preds,
-						live.raknet_samples_text,
-						"party/party.memberConnected",
-						predict_caleb_identity_label(live, txn.label),
 						decoded.scene_handle,
 						9,
-						0,
+						party_member_connected_body_with_userdata(
+							ident,
+							2,
+							2,
+							0,
+							userdata_json,
+							scratch,
+						),
 						scratch,
 					)
 				} else if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 2816 {
@@ -2360,7 +2841,7 @@ predict_caleb_step :: proc(
 							decoded.scene_handle,
 							1,
 							decoded.decoded.rpc_id,
-							false,
+							true,
 							scratch,
 						)
 					}
@@ -2527,12 +3008,15 @@ predict_caleb_step :: proc(
 						&txn.preds,
 						decoded.scene_handle,
 						decoded.decoded.rpc_id,
-						scene_token_response_for_body(decoded.decoded, scratch),
+						scene_token_response_for_body(decoded.decoded, predict_caleb_identity_label(live, txn.label), scratch),
 						scratch,
 					)
 				}
 			case 5:
 				join_code, has_join_code := scene_body_find_invitation_code(decoded.decoded)
+				if !has_join_code {
+					join_code, has_join_code = raw_find_invitation_code(decoded.raw_body)
+				}
 				if route_name == "PartyManagement.CreateConnectionTokenFromInvitationCode" ||
 				   has_join_code {
 					live.joiner_label = txn.label
@@ -2550,23 +3034,21 @@ predict_caleb_step :: proc(
 							party_scene_for_peer(host_label),
 						),
 					)
+					if join_code != "" {
+						if mapped_scene := predict_caleb_party_scene_for_invite(live.party_states[:], join_code, ""); mapped_scene == "" {
+							if latest_scene, latest_ok := predict_caleb_latest_party_scene(live.party_states[:]); latest_ok do host_scene = latest_scene
+						}
+					}
 					predict_caleb_ensure_party_state(&live.party_states, host_label, host_scene)
 					append_auth_rpc_response(
 						&txn.preds,
 						decoded.scene_handle,
 						decoded.decoded.rpc_id,
-						scene_token_response_for_suffix(host_scene, scratch),
+						scene_token_response_for_suffix(host_scene, "party/userdata", transmute([]byte)scene_body_find_party_userdata(decoded.decoded), scratch),
 						scratch,
 					)
 				} else if route_name == "Friends.Subscribe" || decoded.decoded.has_rpc_id {
-					if body := captured_friend_notification(
-						live.steam_friends_text,
-						txn.label,
-						0,
-						scratch,
-					); body != nil {
-						append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
-					}
+					append_scene_message(&txn.preds, decoded.scene_handle, 1, friend_subscribe_notification(txn.label, scratch), scratch)
 					append_scene_rpc_complete(
 						&txn.preds,
 						decoded.scene_handle,
@@ -2586,7 +3068,16 @@ predict_caleb_step :: proc(
 					)
 				}
 			case 4:
-				if route_name == "Friends.UpdateFriendList" {
+				if decoded.scene_handle == 142 && scene_body_is_create_session(decoded.decoded) {
+					append_scene_rpc_complete(
+						&txn.preds,
+						decoded.scene_handle,
+						1,
+						decoded.decoded.rpc_id,
+						true,
+						scratch,
+					)
+				} else if route_name == "Friends.UpdateFriendList" {
 					if body := captured_friend_notification_for_body(
 						live.steam_friends_text,
 						decoded.decoded,
@@ -2597,7 +3088,7 @@ predict_caleb_step :: proc(
 						append_scene_message(&txn.preds, decoded.scene_handle, 1, body, scratch)
 					}
 				} else if route_name == "partymanagement.createsession" ||
-				   scene_body_is_create_session(decoded.decoded) {
+				   (decoded.scene_handle != 142 && scene_body_is_create_session(decoded.decoded)) {
 					party_scene := predict_caleb_party_scene_for_owner(
 						live.party_states[:],
 						txn.label,
@@ -2608,7 +3099,7 @@ predict_caleb_step :: proc(
 						&txn.preds,
 						decoded.scene_handle,
 						decoded.decoded.rpc_id,
-						scene_token_response_for_suffix(party_scene, scratch),
+						scene_token_response_for_suffix(party_scene, "party/userdata", transmute([]byte)scene_body_find_party_userdata(decoded.decoded), scratch),
 						scratch,
 					)
 				} else if decoded.scene_handle == 142 || decoded.scene_handle == 143 {
@@ -2915,6 +3406,7 @@ predict_caleb_learn_sent_party_values :: proc(
 	if json_text := scene_body_find_party_userdata(msg.decoded); json_text != "" {
 		identity := predict_caleb_identity_from_raw(transmute([]byte)json_text)
 		if identity == "" do identity = label
+		if identity != label do predict_caleb_set_peer_userdata(userdata, label, json_text)
 		predict_caleb_set_peer_userdata(userdata, identity, json_text)
 	}
 }
@@ -2929,10 +3421,21 @@ predict_caleb_learn_real_values :: proc(
 ) {
 	decoded := decode_message(msg, allocator)
 	#partial switch sm in decoded {
+	case Response_Msg:
+		#partial switch data in sm.data {
+		case Scene_Infos:
+			scene := scene_suffix(data.scene_id)
+			if predict_caleb_is_party_scene(scene) {
+				predict_caleb_ensure_party_state(states, peer.label, scene)
+			}
+		}
 	case Scene_Message:
-		if token_scene, ok := scene_token_body_scene(sm.decoded, allocator);
-		   ok && strings.has_prefix(token_scene, "party-") {
-			predict_caleb_ensure_party_state(states, peer.label, token_scene)
+		if body := parse_stormancer_rpc_next_body(sm.decoded); body.kind == .Scene_Connection_Token && strings.has_prefix(body.token_scene, "party-") {
+			owner := peer.label
+			if len(body.token.user_data) > 0 {
+				if identity := predict_caleb_identity_from_raw(body.token.user_data); identity != "" do owner = identity
+			}
+			predict_caleb_ensure_party_state(states, owner, body.token_scene)
 		}
 		if code, ok := scene_body_find_invitation_code(sm.decoded); ok {
 			if scene, scene_ok := predict_caleb_scene_for_handle(
@@ -3106,12 +3609,29 @@ render_decoded_burst :: proc(
 		route_name := ""
 		if sm, ok := rendered.(Scene_Message); ok {
 			route_name = route_registry_resolve(reg, ep, sm.scene_handle, sm.route_handle)
+			if route_name == "" do route_name = scene_message_infer_route_name(sm, allocator)
 			rendered = scene_message_with_route_body(rendered, route_name, allocator)
 		}
 		write_decoded_message(&sb, rendered, route_name)
 	}
 	return strings.to_string(sb)
 }
+
+	scene_message_infer_route_name :: proc(sm: Scene_Message, allocator := context.allocator) -> string {
+		if sm.route_handle == 1 {
+			body := parse_friends_notification_body(sm.decoded, allocator)
+			if body.notification_count > 0 do return "friends.notification"
+			if sm.decoded.has_rpc_id do return "stormancer.rpc.completed"
+		}
+		if sm.route_handle == 2 && sm.decoded.has_rpc_id {
+			body := parse_stormancer_rpc_next_body(sm.decoded)
+			if body.kind != .Unknown do return "stormancer.rpc.next"
+			if scene_body_has_token_envelope(sm.decoded) do return "stormancer.rpc.next"
+		}
+		if sm.scene_handle >= 144 && sm.route_handle == 7 do return "party.settingsUpdated"
+		if sm.scene_handle == 141 && sm.route_handle == 19 do return "Locator.GetSceneConnectionToken"
+		return ""
+	}
 
 encode_decoded_messages :: proc(
 	msgs: []Decoded_Message,
@@ -3184,8 +3704,16 @@ decoded_message_match :: proc(
 	case Scene_Message:
 		p, ok := pred.(Scene_Message)
 		if !ok || r.scene_handle != p.scene_handle || r.route_handle != p.route_handle do return false
-		if r.scene_handle == 142 && r.route_handle == 1 do return true
-		if scene_message_dynamic_party_route_match(r.scene_handle, r.route_handle, r.decoded, p.decoded) do return true
+		if r.route_handle == 1 {
+			real_friends := parse_friends_notification_body(r.decoded, allocator)
+			pred_friends := parse_friends_notification_body(p.decoded, allocator)
+			if real_friends.notification_count > 0 && pred_friends.notification_count > 0 {
+				return scene_body_friends_notification_match(r.decoded, p.decoded, allocator)
+			}
+		}
+		if r.scene_handle >= 144 && r.route_handle == 9 {
+			return scene_body_party_member_connected_match(r.decoded, p.decoded, allocator)
+		}
 		return scene_body_match(r.decoded, p.decoded, allocator)
 	case Disconnection_Notification:
 		_, ok := pred.(Disconnection_Notification)
@@ -3218,22 +3746,6 @@ decoded_message_is_transport_noise :: proc(msg: Decoded_Message) -> bool {
 		case Ping_Response:
 			return true
 		}
-	case Response_Complete:
-		return m.has_values
-	}
-	return false
-}
-
-scene_message_dynamic_party_route_match :: proc(
-	scene_handle: u8,
-	route_handle: u16,
-	real, pred: Scene_Body,
-) -> bool {
-	if scene_handle < 144 do return false
-	if real.has_rpc_id != pred.has_rpc_id || real.rpc_id != pred.rpc_id do return false
-	switch route_handle {
-	case 1, 3, 7, 8, 9, 10, 14, 16:
-		return true
 	}
 	return false
 }
@@ -3287,6 +3799,162 @@ response_data_match :: proc(real, pred: Response_Data, allocator := context.allo
 	return false
 }
 
+scene_body_token_envelope_match :: proc(real, pred: Scene_Body, allocator := context.allocator) -> bool {
+	real_body := parse_stormancer_rpc_next_body(real)
+	pred_body := parse_stormancer_rpc_next_body(pred)
+	if real_body.kind != .Scene_Connection_Token || pred_body.kind != .Scene_Connection_Token do return false
+	if !connection_token_match(real_body.token, pred_body.token) do return false
+	if !string_slice_equal(real_body.token_raknet_endpoints, pred_body.token_raknet_endpoints) do return false
+	if real_body.encryption_algorithm != pred_body.encryption_algorithm do return false
+	if real_body.encryption_mode != pred_body.encryption_mode do return false
+	if real_body.encryption_key != pred_body.encryption_key do return false
+	if real_body.encryption_token != pred_body.encryption_token do return false
+	return bytes_equal(real_body.raw_tail, pred_body.raw_tail)
+}
+
+connection_token_match :: proc(real, pred: Connection_Token) -> bool {
+	if real.ok != pred.ok do return false
+	if !real.ok do return real.raw == pred.raw
+	if real.account_id != pred.account_id do return false
+	if real.application != pred.application do return false
+	if real.scene_id != pred.scene_id do return false
+	if real.deployment_id != pred.deployment_id do return false
+	if real.content_type != pred.content_type do return false
+	if real.version != pred.version do return false
+	return bytes_equal(real.user_data, pred.user_data)
+}
+
+string_slice_equal :: proc(a, b: []string) -> bool {
+	if len(a) != len(b) do return false
+	for value, i in a {
+		if value != b[i] do return false
+	}
+	return true
+}
+
+scene_body_friends_notification_match :: proc(
+	real, pred: Scene_Body,
+	allocator := context.allocator,
+) -> bool {
+	real_body := parse_friends_notification_body(real, allocator)
+	pred_body := parse_friends_notification_body(pred, allocator)
+	if !bytes_equal(real_body.raw_tail, pred_body.raw_tail) do return false
+	real_root := scene_seq_root(Scene_Body{values = real_body.values}, 0)
+	pred_root := scene_seq_root(Scene_Body{values = pred_body.values}, 0)
+	if real_root < 0 || pred_root < 0 do return false
+	if real_body.values.nodes[real_root].kind != .Array || pred_body.values.nodes[pred_root].kind != .Array do return false
+	if real_body.values.nodes[real_root].count != pred_body.values.nodes[pred_root].count do return false
+	real_item := real_root + 1
+	pred_item := pred_root + 1
+	for _ in 0 ..< real_body.values.nodes[real_root].count {
+		if !friends_notification_item_match(real_body.values.nodes, real_item, pred_body.values.nodes, pred_item) do return false
+		real_item += real_body.values.nodes[real_item].subtree
+		pred_item += pred_body.values.nodes[pred_item].subtree
+	}
+	return true
+}
+
+friends_notification_item_match :: proc(
+	real_nodes: []Msgpack_Node,
+	real_item: int,
+	pred_nodes: []Msgpack_Node,
+	pred_item: int,
+) -> bool {
+	real_kind := scene_node_uint(real_nodes, scene_array_child(real_nodes, real_item, 0))
+	pred_kind := scene_node_uint(pred_nodes, scene_array_child(pred_nodes, pred_item, 0))
+	if real_kind != pred_kind do return false
+	real_data := scene_array_child(real_nodes, real_item, 1)
+	pred_data := scene_array_child(pred_nodes, pred_item, 1)
+	return friends_notification_data_match(real_nodes, real_data, pred_nodes, pred_data)
+}
+
+friends_notification_data_match :: proc(
+	real_nodes: []Msgpack_Node,
+	real_data: int,
+	pred_nodes: []Msgpack_Node,
+	pred_data: int,
+) -> bool {
+	real_stormancer := friends_notification_platform_id(real_nodes, real_data, "stormancer")
+	pred_stormancer := friends_notification_platform_id(pred_nodes, pred_data, "stormancer")
+	if real_stormancer != pred_stormancer do return false
+	real_steam := friends_notification_platform_id(real_nodes, real_data, "steam")
+	pred_steam := friends_notification_platform_id(pred_nodes, pred_data, "steam")
+	if real_steam != pred_steam do return false
+	real_stormancer_meta := friends_notification_metadata_uint(real_nodes, real_data, "stormancer")
+	pred_stormancer_meta := friends_notification_metadata_uint(pred_nodes, pred_data, "stormancer")
+	if real_stormancer_meta != pred_stormancer_meta do return false
+	real_steam_meta := friends_notification_metadata_uint(real_nodes, real_data, "steam")
+	pred_steam_meta := friends_notification_metadata_uint(pred_nodes, pred_data, "steam")
+	if real_steam_meta != pred_steam_meta do return false
+	real_category := friends_notification_first_category(real_nodes, real_data)
+	pred_category := friends_notification_first_category(pred_nodes, pred_data)
+	if real_category != pred_category do return false
+	real_details := scene_node_text(real_nodes, scene_array_child(real_nodes, real_data, 3))
+	pred_details := scene_node_text(pred_nodes, scene_array_child(pred_nodes, pred_data, 3))
+	return real_details == pred_details
+}
+
+friends_notification_platform_id :: proc(nodes: []Msgpack_Node, data_idx: int, provider: string) -> string {
+	platforms := scene_array_child(nodes, data_idx, 0)
+	if platforms < 0 || platforms >= len(nodes) || nodes[platforms].kind != .Array do return ""
+	item := platforms + 1
+	for _ in 0 ..< nodes[platforms].count {
+		if scene_node_text(nodes, scene_array_child(nodes, item, 0)) == provider {
+			return scene_node_text(nodes, scene_array_child(nodes, item, 1))
+		}
+		item += nodes[item].subtree
+	}
+	return ""
+}
+
+friends_notification_metadata_uint :: proc(nodes: []Msgpack_Node, data_idx: int, key: string) -> u64 {
+	metadata := scene_array_child(nodes, data_idx, 1)
+	return scene_node_uint(nodes, msgpack_map_get(nodes, metadata, key))
+}
+
+friends_notification_first_category :: proc(nodes: []Msgpack_Node, data_idx: int) -> string {
+	categories := scene_array_child(nodes, data_idx, 2)
+	return scene_node_text(nodes, scene_array_child(nodes, categories, 0))
+}
+
+scene_body_party_member_connected_match :: proc(
+	real, pred: Scene_Body,
+	allocator := context.allocator,
+) -> bool {
+	if real.has_rpc_id != pred.has_rpc_id || real.rpc_id != pred.rpc_id do return false
+	real_body := parse_party_member_connected_body(real, allocator)
+	pred_body := parse_party_member_connected_body(pred, allocator)
+	if real_body.version != pred_body.version do return false
+	return scene_party_connected_member_match(real_body.member, pred_body.member)
+}
+
+scene_party_connected_member_match :: proc(
+	real, pred: Scene_Party_Member_Connected,
+) -> bool {
+	if real.user_id != pred.user_id do return false
+	if real.connection_state != pred.connection_state do return false
+	if real.userdata_json != pred.userdata_json do return false
+	if real.state != pred.state do return false
+	return scene_platform_identities_match(real.platforms, pred.platforms)
+}
+
+scene_platform_identities_match :: proc(
+	real, pred: []Scene_Platform_Identity,
+) -> bool {
+	if len(real) != len(pred) do return false
+	for platform, i in real {
+		other := pred[i]
+		if platform.provider != other.provider do return false
+		if platform.user_id != other.user_id do return false
+		if platform.visibility != other.visibility do return false
+		if platform.platform_id != other.platform_id do return false
+		if platform.extra_is_nil != other.extra_is_nil do return false
+		if platform.extra != other.extra do return false
+		if platform.flags != other.flags do return false
+	}
+	return true
+}
+
 scene_body_match :: proc(real, pred: Scene_Body, allocator := context.allocator) -> bool {
 	if real.has_rpc_id && pred.has_rpc_id && real.rpc_id == pred.rpc_id {
 		if scene_body_has_party_state(real) || scene_body_has_party_state(pred) {
@@ -3298,11 +3966,7 @@ scene_body_match :: proc(real, pred: Scene_Body, allocator := context.allocator)
 		}
 		if scene_body_has_matchmaking_stats(real) && scene_body_has_matchmaking_stats(pred) do return true
 		if scene_body_has_token_envelope(real) && scene_body_has_token_envelope(pred) {
-			if real_token_scene, ok := scene_token_body_scene(real, allocator); ok {
-				pred_token_scene, pred_ok := scene_token_body_scene(pred, allocator)
-				return !pred_ok || token_scene_kind_match(real_token_scene, pred_token_scene)
-			}
-			return true
+			return scene_body_token_envelope_match(real, pred, allocator)
 		}
 	}
 	if real.has_rpc_id == pred.has_rpc_id &&
@@ -3409,7 +4073,7 @@ scene_body_invitation_code :: proc(body: Scene_Body) -> (string, bool) {
 	root := body.values.roots[0]
 	if root < 0 || root >= len(body.values.nodes) do return "", false
 	node := body.values.nodes[root]
-	if node.kind != .Str || len(node.str) != 6 do return "", false
+	if node.kind != .Str || (len(node.str) != 5 && len(node.str) != 6) do return "", false
 	for ch in node.str {
 		if ch < '0' || ch > '9' do return "", false
 	}
@@ -3419,7 +4083,7 @@ scene_body_invitation_code :: proc(body: Scene_Body) -> (string, bool) {
 scene_body_find_invitation_code :: proc(body: Scene_Body) -> (string, bool) {
 	for node in body.values.nodes {
 		if node.kind != .Str do continue
-		if len(node.str) == 6 {
+		if len(node.str) == 5 || len(node.str) == 6 {
 			all_digits := true
 			for ch in node.str {
 				if ch < '0' || ch > '9' {
@@ -3430,6 +4094,40 @@ scene_body_find_invitation_code :: proc(body: Scene_Body) -> (string, bool) {
 			if all_digits do return node.str, true
 		}
 		if code := json_string_value(node.str, "InvitationCode"); code != "" do return code, true
+	}
+	for i in 0 ..< len(body.values.raw) {
+		text, _, ok := scene_tail_read_msgpack_str(body.values.raw, i)
+		if !ok do continue
+		if len(text) == 5 || len(text) == 6 {
+			all_digits := true
+			for ch in text {
+				if ch < '0' || ch > '9' {
+					all_digits = false
+					break
+				}
+			}
+			if all_digits do return text, true
+		}
+		if code := json_string_value(text, "InvitationCode"); code != "" do return code, true
+	}
+	return "", false
+}
+
+raw_find_invitation_code :: proc(raw: []byte) -> (string, bool) {
+	for i in 0 ..< len(raw) {
+		text, _, ok := scene_tail_read_msgpack_str(raw, i)
+		if !ok do continue
+		if len(text) == 5 || len(text) == 6 {
+			all_digits := true
+			for ch in text {
+				if ch < '0' || ch > '9' {
+					all_digits = false
+					break
+				}
+			}
+			if all_digits do return text, true
+		}
+		if code := json_string_value(text, "InvitationCode"); code != "" do return code, true
 	}
 	return "", false
 }
@@ -3771,6 +4469,16 @@ predict_caleb_hero_for_label :: proc(
 	return -1
 }
 
+predict_caleb_hero_for_identity_or_label :: proc(
+	userdata: []Predict_Caleb_Peer_Userdata,
+	identity, label: string,
+) -> int {
+	if identity != "" {
+		if hero := predict_caleb_hero_for_label(userdata, identity); hero >= 0 do return hero
+	}
+	return predict_caleb_hero_for_label(userdata, label)
+}
+
 // Override the `RequestedHero` value in a userdata JSON blob with `hero` (a
 // session-specific player choice). `hero < 0` leaves the blob untouched.
 apply_requested_hero :: proc(
@@ -3805,16 +4513,16 @@ party_userdata_json :: proc(
 
 party_userdata_json_template :: proc(peer: string, initialized: bool, lobby_state: int) -> string {
 	if peer == "C2" {
-		if initialized && lobby_state == 2 do return `{"RequestedHero":1,"RequestedSkin":0,"InLobby":true,"PlayerName":"Major Hoff","LobbyState":2,"UnlockedGameDifficulty":0,"MemberDataInitialized":true,"UnlockedHeroFlag":31,"m_sEosUserId":"0002ea2c70fa4f89a5d876065a55c786","m_sSteamUserId":76561197977870267,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
-		if initialized do return `{"RequestedHero":1,"RequestedSkin":0,"InLobby":true,"PlayerName":"Major Hoff","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":true,"UnlockedHeroFlag":31,"m_sEosUserId":"0002ea2c70fa4f89a5d876065a55c786","m_sSteamUserId":76561197977870267,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
+		if initialized && lobby_state == 2 do return `{"RequestedHero":3,"RequestedSkin":0,"InLobby":true,"PlayerName":"Major Hoff","LobbyState":2,"UnlockedGameDifficulty":0,"MemberDataInitialized":true,"UnlockedHeroFlag":31,"m_sEosUserId":"0002ea2c70fa4f89a5d876065a55c786","m_sSteamUserId":76561197977870267,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
+		if initialized do return `{"RequestedHero":3,"RequestedSkin":0,"InLobby":true,"PlayerName":"Major Hoff","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":true,"UnlockedHeroFlag":31,"m_sEosUserId":"0002ea2c70fa4f89a5d876065a55c786","m_sSteamUserId":76561197977870267,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
 		return(
-			`{"RequestedHero":1,"RequestedSkin":0,"InLobby":true,"PlayerName":"Major Hoff","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":false,"UnlockedHeroFlag":31,"m_sEosUserId":"0002ea2c70fa4f89a5d876065a55c786","m_sSteamUserId":76561197977870267,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}` \
+			`{"RequestedHero":3,"RequestedSkin":0,"InLobby":true,"PlayerName":"Major Hoff","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":false,"UnlockedHeroFlag":31,"m_sEosUserId":"0002ea2c70fa4f89a5d876065a55c786","m_sSteamUserId":76561197977870267,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}` \
 		)
 	}
-	if initialized && lobby_state == 2 do return `{"RequestedHero":2,"RequestedSkin":0,"InLobby":true,"PlayerName":"elsie","LobbyState":2,"UnlockedGameDifficulty":0,"MemberDataInitialized":true,"UnlockedHeroFlag":15,"m_sEosUserId":"000239105cf443abbdf0238c827bd9e8","m_sSteamUserId":76561199572083022,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
-	if initialized do return `{"RequestedHero":2,"RequestedSkin":0,"InLobby":true,"PlayerName":"elsie","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":true,"UnlockedHeroFlag":15,"m_sEosUserId":"000239105cf443abbdf0238c827bd9e8","m_sSteamUserId":76561199572083022,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
+	if initialized && lobby_state == 2 do return `{"RequestedHero":1,"RequestedSkin":0,"InLobby":true,"PlayerName":"elsie","LobbyState":2,"UnlockedGameDifficulty":0,"MemberDataInitialized":true,"UnlockedHeroFlag":15,"m_sEosUserId":"000239105cf443abbdf0238c827bd9e8","m_sSteamUserId":76561199572083022,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
+	if initialized do return `{"RequestedHero":1,"RequestedSkin":0,"InLobby":true,"PlayerName":"elsie","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":true,"UnlockedHeroFlag":15,"m_sEosUserId":"000239105cf443abbdf0238c827bd9e8","m_sSteamUserId":76561199572083022,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
 	return(
-		`{"RequestedHero":2,"RequestedSkin":0,"InLobby":true,"PlayerName":"elsie","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":false,"UnlockedHeroFlag":15,"m_sEosUserId":"000239105cf443abbdf0238c827bd9e8","m_sSteamUserId":76561199572083022,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}` \
+		`{"RequestedHero":1,"RequestedSkin":0,"InLobby":true,"PlayerName":"elsie","LobbyState":1,"UnlockedGameDifficulty":0,"MemberDataInitialized":false,"UnlockedHeroFlag":15,"m_sEosUserId":"000239105cf443abbdf0238c827bd9e8","m_sSteamUserId":76561199572083022,"m_uVoiceChatMode":0,"m_ePlatform":2,"RandomSkinIndex":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}` \
 	)
 }
 
@@ -4062,8 +4770,6 @@ party_member_connected_body_with_userdata :: proc(
 	body := make([dynamic]byte, allocator)
 	write_u16_le(&body, rpc_id)
 	append(&body, ..mpe_uint(version, allocator))
-	append(&body, 0)
-	append(&body, ..mpe_uint(version, allocator))
 	append(&body, ..party_full_member_with_userdata(peer, status, userdata_json, false, allocator))
 	return body[:]
 }
@@ -4236,12 +4942,12 @@ player_update_body :: proc(peer: string, state: u64, allocator := context.alloca
 
 // Party server pushes (memberConnected, memberDataUpdated, memberStatusUpdated, ...)
 // are broadcast from one global per-party counter: each event at party `version` is
-// delivered to BOTH connections with consecutive rpc_ids -- the JOINER's scene gets
-// 2*version-7, the HOST's scene gets 2*version-6. So the rpc_id a given member sees
+// delivered to BOTH connections with consecutive rpc_ids -- the HOST's scene gets
+// 2*version-7, the JOINER's scene gets 2*version-6. So the rpc_id a given member sees
 // for its own broadcast depends on whether that member is the joiner or the host, not
 // on its connection label or identity.
 party_broadcast_rpc :: proc(version: u64, is_joiner: bool) -> u16 {
-	return u16(2 * version - 7 + (is_joiner ? 0 : 1))
+	return u16(2 * version - 7 + (is_joiner ? 1 : 0))
 }
 
 party_member_status_body :: proc(
@@ -4362,6 +5068,20 @@ scene_suffix_for_service :: proc(service, name: string) -> string {
 }
 
 connection_data_msgpack :: proc(scene_id: string, allocator := context.allocator) -> []byte {
+	return connection_data_msgpack_with_payload(
+		scene_id,
+		"text/plain; charset=utf-8, application/msgpack",
+		nil,
+		allocator,
+	)
+}
+
+connection_data_msgpack_with_payload :: proc(
+	scene_id: string,
+	content_type: string,
+	user_data: []byte,
+	allocator := context.allocator,
+) -> []byte {
 	now := u64(time.now()._nsec / i64(time.Second))
 	return mpe_map(
 		{
@@ -4374,9 +5094,9 @@ connection_data_msgpack :: proc(scene_id: string, allocator := context.allocator
 			mpe_str("Expiration", allocator),
 			mpe_timestamp(now + 300, allocator = allocator),
 			mpe_str("UserData", allocator),
-			mpe_bin({}, allocator),
+			mpe_bin(user_data, allocator),
 			mpe_str("ContentType", allocator),
-			mpe_str("text/plain; charset=utf-8, application/msgpack", allocator),
+			mpe_str(content_type, allocator),
 			mpe_str("Endpoints", allocator),
 			mpe_nil(allocator),
 			mpe_str("SceneId", allocator),
@@ -4423,8 +5143,23 @@ scene_token_json_endpoint :: proc(
 	scene_suffix, raknet_endpoint: string,
 	allocator := context.allocator,
 ) -> string {
+	return scene_token_json_endpoint_with_payload(
+		scene_suffix,
+		raknet_endpoint,
+		"text/plain; charset=utf-8, application/msgpack",
+		nil,
+		allocator,
+	)
+}
+
+scene_token_json_endpoint_with_payload :: proc(
+	scene_suffix, raknet_endpoint: string,
+	content_type: string,
+	user_data: []byte,
+	allocator := context.allocator,
+) -> string {
 	scene_id := fmt.aprintf("%s%s", SCENE_ID_BASE, scene_suffix, allocator = allocator)
-	cd := connection_data_msgpack(scene_id, allocator)
+	cd := connection_data_msgpack_with_payload(scene_id, content_type, user_data, allocator)
 	cd_b64, _ := base64.encode(cd, base64.ENC_TABLE, allocator)
 	sig := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 	b := strings.builder_make(allocator)
@@ -4441,7 +5176,71 @@ scene_token_json_endpoint :: proc(
 	return strings.to_string(b)
 }
 
-scene_token_response_for_body :: proc(body: Scene_Body, allocator := context.allocator) -> []byte {
+scene_token_json_with_payload :: proc(
+	scene_suffix: string,
+	content_type: string,
+	user_data: []byte,
+	allocator := context.allocator,
+) -> string {
+	return scene_token_json_endpoint_with_payload(
+		scene_suffix,
+		env_string("RAKNET_ENDPOINT", DEFAULT_RAKNET_ENDPOINT, allocator),
+		content_type,
+		user_data,
+		allocator,
+	)
+}
+
+simple_user_session_data :: proc(simple_server_state: ^Simple_Server_State, allocator := context.allocator) -> []byte {
+	if len(simple_server_state.user_session_data_override) > 0 do return simple_server_state.user_session_data_override
+	steam_id := simple_server_state.steam_id
+	user_id := simple_server_state.user_id
+	if steam_id == "" do steam_id = "0"
+	if user_id == "" do user_id = g_simple_user_ids_by_steam[steam_id]
+	now := u64(time.now()._nsec / i64(time.Second))
+	return encode_user_session_data(
+		User_Session_Data{
+			login_provider = "steam",
+			login_provider_id = steam_id,
+			user = User_Session_User{
+				user_id = user_id,
+				steam_id = steam_id,
+				profile = User_Session_Profile{
+					pseudo = simple_friend_pseudo(steam_id),
+					steam_id = steam_id,
+					crossplay_enabled = true,
+					has_crossplay = true,
+				},
+				created = Stormancer_Timestamp{seconds = now},
+				updated = Stormancer_Timestamp{seconds = now},
+				provider = "steam",
+				reserved_nil = true,
+			},
+			session_id = user_session_id_from_user_id(user_id, steam_id, allocator),
+			steam_identity = fmt.aprintf("steam:%s", steam_id, allocator = allocator),
+			metadata = User_Session_Metadata{
+				steam_app_id = 2071280,
+				has_steam_app_id = true,
+				client_version = "1.05.00.05",
+			},
+			expiration = Stormancer_Timestamp{seconds = now + 7 * 24 * 60 * 60},
+			authenticator_scene = simple_authenticator_scene_ref(user_id, allocator),
+			reserved_nil = true,
+			flags = 0,
+		},
+		allocator,
+	)
+}
+
+simple_authenticator_scene_ref :: proc(user_id: string, allocator := context.allocator) -> string {
+	return fmt.aprintf(
+		"scene:/passtech-live//darktales/live-1-05-00/2564d8be-2dbb-4967-b6bb-0e157aa7f63f/1?/authenticator#authenticator/0(+)[%s]",
+		user_id,
+		allocator = allocator,
+	)
+}
+
+scene_token_response_for_body :: proc(body: Scene_Body, peer := "C1", allocator := context.allocator) -> []byte {
 	if len(body.values.roots) == 0 do return mpe_str(scene_token_json("", allocator), allocator)
 	root := body.values.roots[0]
 	if root < 0 || root >= len(body.values.nodes) || body.values.nodes[root].kind != .Str do return mpe_str(scene_token_json("", allocator), allocator)
@@ -4451,14 +5250,51 @@ scene_token_response_for_body :: proc(body: Scene_Body, allocator := context.all
 		root2 := body.values.roots[1]
 		if root2 >= 0 && root2 < len(body.values.nodes) && body.values.nodes[root2].kind == .Str do name = body.values.nodes[root2].str
 	}
-	return mpe_str(scene_token_json(scene_suffix_for_service(service, name), allocator), allocator)
+	suffix := scene_suffix_for_service(service, name)
+	return mpe_str(scene_token_json_with_payload(suffix, "stormancer/userSession", user_session_data_for_peer(peer, allocator), allocator), allocator)
 }
 
 scene_token_response_for_suffix :: proc(
 	scene_suffix: string,
+	content_type := "text/plain; charset=utf-8, application/msgpack",
+	user_data: []byte = nil,
 	allocator := context.allocator,
 ) -> []byte {
-	return mpe_str(scene_token_json(scene_suffix, allocator), allocator)
+	return mpe_str(scene_token_json_with_payload(scene_suffix, content_type, user_data, allocator), allocator)
+}
+
+user_session_data_for_peer :: proc(peer: string, allocator := context.allocator) -> []byte {
+	steam_id := party_member_steam_id_for_peer(peer)
+	user_id := user_id_for_peer(peer)
+	now := u64(time.now()._nsec / i64(time.Second))
+	return encode_user_session_data(
+		User_Session_Data{
+			login_provider = "steam",
+			login_provider_id = steam_id,
+			user = User_Session_User{
+				user_id = user_id,
+				steam_id = steam_id,
+				profile = User_Session_Profile{
+					pseudo = simple_friend_pseudo(steam_id),
+					steam_id = steam_id,
+					crossplay_enabled = true,
+					has_crossplay = true,
+				},
+				created = Stormancer_Timestamp{seconds = now},
+				updated = Stormancer_Timestamp{seconds = now},
+				provider = "steam",
+				reserved_nil = true,
+			},
+			session_id = user_session_id_from_user_id(user_id, steam_id, allocator),
+			steam_identity = fmt.aprintf("steam:%s", steam_id, allocator = allocator),
+			metadata = User_Session_Metadata{steam_app_id = 2071280, has_steam_app_id = true, client_version = "1.05.00.05"},
+			expiration = Stormancer_Timestamp{seconds = now + 7 * 24 * 60 * 60},
+			authenticator_scene = simple_authenticator_scene_ref(user_id, allocator),
+			reserved_nil = true,
+			flags = 0,
+		},
+		allocator,
+	)
 }
 
 captured_friend_notification :: proc(
@@ -4468,8 +5304,32 @@ captured_friend_notification :: proc(
 ) -> []byte {
 	return captured_friend_notification_by_steam_id(
 		text,
-		steam_id_for_peer(peer),
+		party_member_steam_id_for_peer(peer),
 		index,
+		allocator,
+	)
+}
+
+friend_subscribe_notification :: proc(peer: string, allocator := context.allocator) -> []byte {
+	steam_id := party_member_steam_id_for_peer(peer)
+	friends := make(Simple_Friends, allocator)
+	append(
+		&friends,
+		Simple_Friend{
+			steam_id = steam_id,
+			stormancer_id = user_id_for_peer(peer),
+			pseudo = simple_friend_pseudo(steam_id),
+			category = "recentlyMet",
+			metadata_stormancer = simple_friend_metadata_stormancer(steam_id),
+			crossplay_enabled = true,
+		},
+	)
+	return encode_friends_notification_body(
+		Friends_Notification_Body{
+			friends = friends,
+			timestamp = server_time_ms(),
+			raw_tail = simple_friends_subscribe_tail(steam_id, allocator),
+		},
 		allocator,
 	)
 }
@@ -4487,11 +5347,11 @@ captured_friend_notification_for_body :: proc(
 		return out
 	}
 	raw := string(body.values.raw[:body.values.consumed])
-	if strings.contains(raw, steam_id_for_peer("C1")) {
-		if out := captured_friend_notification_by_steam_id(text, steam_id_for_peer("C1"), index, allocator); out != nil do return out
+	if strings.contains(raw, party_member_steam_id_for_peer("C1")) {
+		if out := captured_friend_notification_by_steam_id(text, party_member_steam_id_for_peer("C1"), index, allocator); out != nil do return out
 	}
-	if strings.contains(raw, steam_id_for_peer("C2")) {
-		if out := captured_friend_notification_by_steam_id(text, steam_id_for_peer("C2"), index, allocator); out != nil do return out
+	if strings.contains(raw, party_member_steam_id_for_peer("C2")) {
+		if out := captured_friend_notification_by_steam_id(text, party_member_steam_id_for_peer("C2"), index, allocator); out != nil do return out
 	}
 	return captured_friend_notification(text, peer, index, allocator)
 }
@@ -4501,10 +5361,12 @@ captured_friend_notification_by_steam_id :: proc(
 	index: int,
 	allocator := context.allocator,
 ) -> []byte {
-	needle := fmt.aprintf("\"%s\"", steam_id, allocator = allocator)
-	start := strings.index(text, needle)
+	friends_key := strings.index(text, "\"friends\"")
+	if friends_key < 0 do return nil
+	needle := fmt.aprintf("\"%s\":", steam_id, allocator = allocator)
+	start := strings.index(text[friends_key:], needle)
 	if start < 0 do return nil
-	section := text[start:]
+	section := text[friends_key + start:]
 	notif_key := strings.index(section, "\"notifications\"")
 	if notif_key < 0 do return nil
 	section = section[notif_key:]
@@ -4818,6 +5680,33 @@ build_scene_connection_result_raw :: proc(
 	)
 }
 
+authenticator_connection_routes :: proc() -> Routes {
+	return Routes{
+		"stormancer.rpc.completed",
+		"stormancer.rpc.next",
+		"gameVersion.update",
+		"stormancer.rpc.cancel",
+		"sendRequest",
+		"stormancer.rpc.error",
+		"serverVersion.update",
+		"users.renewCredentials",
+	}
+}
+
+predict_caleb_append_missing_auth_connection_result :: proc(
+	preds: ^[dynamic]Decoded_Message,
+	handles: ^[dynamic]Predict_Caleb_Scene_Handle,
+	label: string,
+	req_id: u16,
+	allocator := context.allocator,
+) {
+	if _, ok := predict_caleb_scene_for_handle(handles^[:], label, u8(SCENE_HANDLE_MIN)); ok do return
+	predict_caleb_set_scene_handle_entry(handles, label, "authenticator", u8(SCENE_HANDLE_MIN))
+	raw := build_scene_connection_result_raw(u64(SCENE_HANDLE_MIN), authenticator_connection_routes(), allocator)
+	append_response_msg(preds, req_id, raw, allocator)
+	append_response_complete(preds, req_id, true, allocator)
+}
+
 next_connect_scene_handle :: proc(txns: []Predict_Caleb_Txn, peer: ^Peer_State) -> u64 {
 	count := 0
 	for &txn in txns {
@@ -5019,6 +5908,7 @@ predict_caleb :: proc(
 	total_connections: u64 = 0
 	connection_result_peers: [dynamic]string
 	joiner_label := ""
+	peer_identities: [dynamic]Predict_Caleb_Peer_Identity
 	peer_userdata: [dynamic]Predict_Caleb_Peer_Userdata
 	scene_handles: [dynamic]Predict_Caleb_Scene_Handle
 	party_states: [dynamic]Predict_Caleb_Party_State
@@ -5153,6 +6043,8 @@ predict_caleb :: proc(
 		new_incoming_in_txn := false
 		set_ready_this_txn := false
 		for msg in sent_msgs {
+			predict_caleb_set_identity_entry(&peer_identities, txn.label, predict_caleb_identity_from_raw(msg))
+			txn_identity := predict_caleb_identity_label_from_entries(peer_identities[:], txn.label)
 			decoded := decode_message(msg, scratch)
 			#partial switch decoded in decoded {
 			case Connection_Request:
@@ -5316,6 +6208,13 @@ predict_caleb :: proc(
 
 				case System_Request_Id.Set_Metadata:
 					append_response_complete(&txn.preds, decoded.req_id, false, scratch)
+					predict_caleb_append_missing_auth_connection_result(
+						&txn.preds,
+						&scene_handles,
+						txn.label,
+						decoded.req_id + 2,
+						scratch,
+					)
 
 				case System_Request_Id.Scene_Ready, System_Request_Id.Scene_Ready2:
 					ready_handle: u64
@@ -5332,30 +6231,18 @@ predict_caleb :: proc(
 							predict_caleb_party_scene_for_owner(
 								party_states[:],
 								txn.label,
-								party_scene_for_peer(txn.label),
+								party_scene_for_peer(txn_identity),
 							),
 						)
 						append_scene_message(
 							&txn.preds,
 							u8(ready_handle),
 							14,
-							steam_create_lobby_body(txn.label, 1, party_scene, scratch),
+							steam_create_lobby_body(txn_identity, 1, party_scene, scratch),
 							scratch,
 						)
 					}
-					if ready_handle == 145 && txn.label == "C1" {
-						append_captured_push(
-							&txn.preds,
-							raknet_samples_text,
-							"party/party.memberDataUpdated",
-							"C1",
-							144,
-							3,
-							1,
-							scratch,
-						)
-					}
-					if ready_handle == 145 && txn.label == "C2" {
+					if ready_handle == 145 {
 						party_scene := predict_caleb_party_scene_for_handle(
 							party_states[:],
 							scene_handles[:],
@@ -5364,7 +6251,7 @@ predict_caleb :: proc(
 							predict_caleb_party_scene_for_owner(
 								party_states[:],
 								txn.label,
-								party_scene_for_peer(txn.label),
+								party_scene_for_peer(txn_identity),
 							),
 						)
 						invite_code := predict_caleb_party_invite_for_scene(
@@ -5442,13 +6329,13 @@ predict_caleb :: proc(
 							predict_caleb_party_scene_for_owner(
 								party_states[:],
 								txn.label,
-								party_scene_for_peer(txn.label),
+								party_scene_for_peer(txn_identity),
 							),
 						)
 						userdata_json := predict_caleb_userdata_for_label(
 							peer_userdata[:],
-							txn.label,
-							txn.label,
+							txn_identity,
+							txn_identity,
 							false,
 							1,
 						)
@@ -5457,7 +6344,7 @@ predict_caleb :: proc(
 							u8(ready_handle),
 							7,
 							party_settings_body_for_scene(
-								txn.label,
+									txn_identity,
 								3,
 								1,
 								"",
@@ -5471,7 +6358,7 @@ predict_caleb :: proc(
 							u8(ready_handle),
 							3,
 							party_memberdata_body_with_userdata(
-								txn.label,
+									txn_identity,
 								4,
 								4,
 								userdata_json,
@@ -5484,7 +6371,7 @@ predict_caleb :: proc(
 							u8(ready_handle),
 							7,
 							party_settings_body_for_scene(
-								txn.label,
+									txn_identity,
 								5,
 								3,
 								"",
@@ -5500,7 +6387,7 @@ predict_caleb :: proc(
 							u8(ready_handle),
 							3,
 							party_memberdata_body_with_userdata(
-								txn.label,
+									txn_identity,
 								6,
 								6,
 								userdata_json,
@@ -5509,7 +6396,7 @@ predict_caleb :: proc(
 							scratch,
 						)
 					}
-					if ready_handle == 145 && txn.label == "C1" {
+					if ready_handle == 145 {
 						party_scene := predict_caleb_party_scene_for_handle(
 							party_states[:],
 							scene_handles[:],
@@ -5526,41 +6413,53 @@ predict_caleb :: proc(
 							party_scene,
 							txn.label,
 						)
-						append_scene_message(
-							&txn.preds,
-							144,
-							7,
-							party_settings_body_for_scene(
-								txn.label,
-								7,
-								5,
-								invite_code,
-								party_scene,
+						latest_owner, latest_ok := predict_caleb_latest_party_owner_label(party_states[:])
+						if latest_ok && latest_owner == txn.label && predict_caleb_party_state_count(party_states[:]) > 1 {
+							joiner_label := predict_caleb_other_peer_label_from_states(peers[:], txn.label)
+							append_scene_message(
+								&txn.preds,
+								144,
+								3,
+								party_memberdata_body(
+									joiner_label,
+									u64(party_broadcast_rpc(9, false)),
+									9,
+									true,
+									1,
+									scratch,
+								),
 								scratch,
-							),
-							scratch,
-						)
-						append_scene_message(
-							&txn.preds,
-							144,
-							3,
-							party_memberdata_body("C2", 11, 9, true, 1, scratch),
-							scratch,
-						)
-						append_scene_message(
-							&txn.preds,
-							144,
-							3,
-							party_memberdata_body("C2", 19, 13, true, 2, scratch),
-							scratch,
-						)
-						append_scene_message(
-							&txn.preds,
-							144,
-							3,
-							party_memberdata_body("C1", 21, 14, true, 2, scratch),
-							scratch,
-						)
+							)
+							append_scene_message(
+								&txn.preds,
+								144,
+								3,
+								party_memberdata_body(
+									txn.label,
+									u64(party_broadcast_rpc(13, false)),
+									13,
+									true,
+									2,
+									scratch,
+								),
+								scratch,
+							)
+						} else {
+							append_scene_message(
+								&txn.preds,
+								144,
+								7,
+								party_settings_body_for_scene(
+									txn.label,
+									8,
+									7,
+									invite_code,
+									party_scene,
+									scratch,
+								),
+								scratch,
+							)
+						}
 					}
 					if ready_handle == 146 &&
 					   predict_caleb_label_is_joiner(joiner_label, txn.label) {
@@ -5697,22 +6596,23 @@ predict_caleb :: proc(
 							predict_caleb_party_scene_for_owner(
 								party_states[:],
 								txn.label,
-								party_scene_for_peer(txn.label),
+								party_scene_for_peer(txn_identity),
 							),
 						)
 						hero := predict_caleb_hero_for_label(peer_userdata[:], txn.label)
+						if hero < 0 do hero = predict_caleb_hero_for_label(peer_userdata[:], txn_identity)
 						state: []byte
 						if strings.has_prefix(party_scene, "party-") {
 							state = party_state_response_learned(
 								party_scene,
-								txn.label,
+								txn_identity,
 								hero,
 								scratch,
 							)
 						} else {
 							state = party_state_response_raw(
 								raknet_samples_text,
-								txn.label,
+								txn_identity,
 								scratch,
 							)
 						}
@@ -5738,14 +6638,20 @@ predict_caleb :: proc(
 				case 3:
 					// party client completed Steam.CreateLobby; server pushes memberConnected
 					if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 257 {
-						append_captured_push(
+						hero := predict_caleb_hero_for_identity_or_label(peer_userdata[:], txn_identity, txn.label)
+						userdata_json := party_userdata_json(txn_identity, false, 1, hero, scratch)
+						append_scene_message(
 							&txn.preds,
-							raknet_samples_text,
-							"party/party.memberConnected",
-							txn.label,
 							decoded.scene_handle,
 							9,
-							0,
+							party_member_connected_body_with_userdata(
+								txn_identity,
+								2,
+								2,
+								0,
+								userdata_json,
+								scratch,
+							),
 							scratch,
 						)
 					} else if decoded.scene_handle == 144 && decoded.decoded.rpc_id == 2816 {
@@ -5760,7 +6666,7 @@ predict_caleb :: proc(
 						userdata_json := predict_caleb_userdata_for_label(
 							peer_userdata[:],
 							txn.label,
-							txn.label,
+							txn_identity,
 							true,
 							1,
 						)
@@ -5775,7 +6681,7 @@ predict_caleb :: proc(
 							decoded.scene_handle,
 							9,
 							party_member_connected_body_with_userdata(
-								txn.label,
+								txn_identity,
 								mc_rpc,
 								8,
 								0,
@@ -6020,13 +6926,16 @@ predict_caleb :: proc(
 							&txn.preds,
 							decoded.scene_handle,
 							decoded.decoded.rpc_id,
-							scene_token_response_for_body(decoded.decoded, scratch),
+							scene_token_response_for_body(decoded.decoded, txn_identity, scratch),
 							scratch,
 						)
 					}
 				case 5:
 					// friends Friends.Subscribe / party-manager join-code token
 					join_code, has_join_code := scene_body_find_invitation_code(decoded.decoded)
+					if !has_join_code {
+						join_code, has_join_code = raw_find_invitation_code(decoded.raw_body)
+					}
 					if route_name == "PartyManagement.CreateConnectionTokenFromInvitationCode" ||
 					   has_join_code {
 						joiner_label = txn.label
@@ -6044,29 +6953,21 @@ predict_caleb :: proc(
 								party_scene_for_peer(host_label),
 							),
 						)
+						if join_code != "" {
+							if mapped_scene := predict_caleb_party_scene_for_invite(party_states[:], join_code, ""); mapped_scene == "" {
+								if latest_scene, latest_ok := predict_caleb_latest_party_scene(party_states[:]); latest_ok do host_scene = latest_scene
+							}
+						}
 						predict_caleb_ensure_party_state(&party_states, host_label, host_scene)
 						append_auth_rpc_response(
 							&txn.preds,
 							decoded.scene_handle,
 							decoded.decoded.rpc_id,
-							scene_token_response_for_suffix(host_scene, scratch),
+							scene_token_response_for_suffix(host_scene, "party/userdata", transmute([]byte)scene_body_find_party_userdata(decoded.decoded), scratch),
 							scratch,
 						)
 					} else if route_name == "Friends.Subscribe" || decoded.decoded.has_rpc_id {
-						if body := captured_friend_notification(
-							steam_friends_text,
-							txn.label,
-							0,
-							scratch,
-						); body != nil {
-							append_scene_message(
-								&txn.preds,
-								decoded.scene_handle,
-								1,
-								body,
-								scratch,
-							)
-						}
+						append_scene_message(&txn.preds, decoded.scene_handle, 1, friend_subscribe_notification(txn.label, scratch), scratch)
 						append_scene_rpc_complete(
 							&txn.preds,
 							decoded.scene_handle,
@@ -6087,7 +6988,16 @@ predict_caleb :: proc(
 					}
 				case 4:
 					// friends Friends.UpdateFriendList / party-manager createsession
-					if route_name == "Friends.UpdateFriendList" {
+					if decoded.scene_handle == 142 && scene_body_is_create_session(decoded.decoded) {
+						append_scene_rpc_complete(
+							&txn.preds,
+							decoded.scene_handle,
+							1,
+							decoded.decoded.rpc_id,
+							true,
+							scratch,
+						)
+					} else if route_name == "Friends.UpdateFriendList" {
 						if body := captured_friend_notification_for_body(
 							steam_friends_text,
 							decoded.decoded,
@@ -6104,7 +7014,7 @@ predict_caleb :: proc(
 							)
 						}
 					} else if route_name == "partymanagement.createsession" ||
-					   scene_body_is_create_session(decoded.decoded) {
+					   (decoded.scene_handle != 142 && scene_body_is_create_session(decoded.decoded)) {
 						party_scene := predict_caleb_party_scene_for_owner(
 							party_states[:],
 							txn.label,
@@ -6115,7 +7025,7 @@ predict_caleb :: proc(
 							&txn.preds,
 							decoded.scene_handle,
 							decoded.decoded.rpc_id,
-							scene_token_response_for_suffix(party_scene, scratch),
+							scene_token_response_for_suffix(party_scene, "party/userdata", transmute([]byte)scene_body_find_party_userdata(decoded.decoded), scratch),
 							scratch,
 						)
 					} else if decoded.scene_handle == 142 || decoded.scene_handle == 143 {

@@ -148,6 +148,9 @@ get_system_request_response :: proc(
 			simple_server_state.scene_ready_args.sent_game_version_update = true
 		}
 		append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
+		if scene_ok && scene_suffix(scene.scene_id) == "party-manager" && client_id > 1 {
+			simple_server_state.pending_response_complete_req = message.req_id + 1
+		}
 		if is_gamesession_ready {
 			append(
 				&response_messages,
@@ -299,7 +302,7 @@ get_system_request_response :: proc(
 				Scene_Message{
 					scene_handle = u8(args.scene_handle),
 					route_handle = get_route_num_from_handle(simple_server_state, args.scene_handle, "party.memberDataUpdated"),
-					body = simple_party_member_data_updated_body(11, 9, simple_server_state, true),
+					body = simple_party_member_data_updated_body(12, 9, simple_server_state, true),
 				},
 			)
 		}
@@ -540,7 +543,7 @@ get_system_request_response :: proc(
 					},
 				},
 			)
-			append(&response_messages, Response_Complete{req_id = message.req_id, has_values = true})
+			simple_server_state.pending_matchmaking_infos_complete_req = message.req_id
 
 		} else if len(scene_id) >= 6 && scene_id[:6] == "party-" {
 			simple_server_state.get_scene_infos_args = args

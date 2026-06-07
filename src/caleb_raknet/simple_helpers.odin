@@ -229,6 +229,8 @@ stormancer_rpc_completed_id :: proc(rpc_id: u16, sent_next: bool) -> u16 {
 }
 
 simple_invitation_code :: proc(client_id: int, allocator := context.allocator) -> string {
+	if client_id == 1 do return "521611"
+	if client_id == 2 do return "717937"
 	return fmt.aprintf("%06d", client_id, allocator = allocator)
 }
 
@@ -267,6 +269,7 @@ simple_party_scene_for_client :: proc(
 	simple_server_state: ^Simple_Server_State,
 	allocator := context.allocator,
 ) -> string {
+	if simple_server_state.party_scene_override != "" do return simple_server_state.party_scene_override
 	if simple_server_state.user_id != "" && len(simple_server_state.user_id) >= 32 {
 		user_id := simple_server_state.user_id
 		return strings.concatenate(
@@ -560,7 +563,7 @@ simple_known_party_member_with_lobby_state :: proc(
 		visibility = "anonymous",
 		platform_id = steam_id,
 		extra = "",
-		extra_is_nil = true,
+		extra_is_nil = false,
 		flags = 0,
 	})
 	session_token := simple_party_session_token_for_steam(steam_id, allocator)
@@ -606,7 +609,7 @@ simple_party_userdata_json_for_steam_lobby_state :: proc(
 	lobby_state: int,
 	allocator := context.allocator,
 ) -> string {
-	hero := 1
+	hero := simple_requested_hero_for_steam(steam_id)
 	player_name := simple_friend_pseudo(steam_id)
 	unlocked_hero_flag := simple_unlocked_hero_flag(steam_id)
 	eos_user_id := simple_eos_user_id(steam_id)
@@ -633,6 +636,16 @@ simple_party_userdata_json_for_steam_lobby_state :: proc(
 		},
 		allocator,
 	)
+}
+
+simple_requested_hero_for_steam :: proc(steam_id: string) -> int {
+	switch steam_id {
+	case "76561197977870267":
+		return 3
+	case "76561199572083022":
+		return 1
+	}
+	return 1
 }
 
 simple_party_settings_updated_snapshot :: proc(

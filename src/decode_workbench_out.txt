@@ -1,0 +1,460 @@
+{
+  "token": "i6lBY2NvdW50SWSpZGFya3RhbGVzq0FwcGxpY2F0aW9urGxpdmUtMS0wNS0wMKZJc3N1ZWTX/9Zo/tBqJUbAqkV4cGlyYXRpb27X/9ZpAfBqJUfsqFVzZXJEYXRhxQHhAAAB3ZmSpXN0ZWFtsTc2NTYxMTk3OTc3ODcwMjY3mNkgNDE2OGZmYjI0ZGUyNDVmODgwNjBkMjdjOTU4MDY4NWWBpXN0ZWFtgadzdGVhbWlksTc2NTYxMTk3OTc3ODcwMjY3g6Zwc2V1ZG+qTWFqb3IgSG9mZqdvcHRpb25zgaljcm9zc3BsYXmBp2VuYWJsZWTDp3N0ZWFtaWSxNzY1NjExOTc5Nzc4NzAyNjfX/zgATcBqG1ZR1/84AE3AahtWUYClc3RlYW3AxBDhZ0cF20u0R6pUVeBSrep9gaVzdGVhbbdzdGVhbTo3NjU2MTE5Nzk3Nzg3MDI2N4Krc3RlYW0uYXBwSWTEBPCaHwC5Z2FtZVZlcnNpb24uY2xpZW50VmVyc2lvbsQPAAAAC6oxLjA1LjAwLjA11/88NoIQaiVGvtmbc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvL2Rhcmt0YWxlcy9saXZlLTEtMDUtMDAvMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmLzE/L2F1dGhlbnRpY2F0b3IjYXV0aGVudGljYXRvci8wKCspWzJlMDk1NmUxLTk0M2YtNGE0ZS1hMGIzLTFiODZkOTA2MDA5Yl3AAKtDb250ZW50VHlwZbZzdG9ybWFuY2VyL3VzZXJTZXNzaW9uqUVuZHBvaW50c8CnU2NlbmVJZNkzc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvZGFya3RhbGVzL2xpdmUtMS0wNS0wMC9mcmllbmRzp1JvdXRpbmfArERlcGxveW1lbnRJZNkkMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmp1ZlcnNpb24C-gwKs6E/DihtO3t7y8pFtTBFdmBzFNCCr9EUUAhUkg5s=",
+  "endpoints": {
+    "raknet": [
+      "dt-live.passtechgames.com:30100",
+      "dt-live-2.passtechgames.com:30100"
+    ]
+  },
+  "encryption": {
+    "algorithm": "aes256",
+    "mode": "GCM",
+    "key": "FuRDCv7TgWcKeZ+r9/YJ3WBoGLITljhzYdm4NeygT6I=",
+    "token": "xBDnDQaJoyQZS435Ce47IdMpJqhOZFEiWog3+RoduhW5d3bahup8hPSGaBOlqK/gE6W0ewZraQMfHusGalPWLpskXTFCl/SAv5c=",
+    "key_decoded": {
+      "base64": "FuRDCv7TgWcKeZ+r9/YJ3WBoGLITljhzYdm4NeygT6I=",
+      "hex": "16e4430afed381670a799fabf7f609dd606818b21396387361d9b835eca04fa2",
+      "bytes": [
+        22,
+        228,
+        67,
+        10,
+        254,
+        211,
+        129,
+        103,
+        10,
+        121,
+        159,
+        171,
+        247,
+        246,
+        9,
+        221,
+        96,
+        104,
+        24,
+        178,
+        19,
+        150,
+        56,
+        115,
+        97,
+        217,
+        184,
+        53,
+        236,
+        160,
+        79,
+        162
+      ]
+    },
+    "token_decoded": {
+      "base64": "xBDnDQaJoyQZS435Ce47IdMpJqhOZFEiWog3+RoduhW5d3bahup8hPSGaBOlqK/gE6W0ewZraQMfHusGalPWLpskXTFCl/SAv5c=",
+      "hex": "c410e70d0689a324194b8df909ee3b21d32926a84e6451225a8837f91a1dba15b97776da86ea7c84f4866813a5a8afe013a5b47b066b69031f1eeb066a53d62e9b245d314297f480bf97",
+      "bytes": [
+        196,
+        16,
+        231,
+        13,
+        6,
+        137,
+        163,
+        36,
+        25,
+        75,
+        141,
+        249,
+        9,
+        238,
+        59,
+        33,
+        211,
+        41,
+        38,
+        168,
+        78,
+        100,
+        81,
+        34,
+        90,
+        136,
+        55,
+        249,
+        26,
+        29,
+        186,
+        21,
+        185,
+        119,
+        118,
+        218,
+        134,
+        234,
+        124,
+        132,
+        244,
+        134,
+        104,
+        19,
+        165,
+        168,
+        175,
+        224,
+        19,
+        165,
+        180,
+        123,
+        6,
+        107,
+        105,
+        3,
+        31,
+        30,
+        235,
+        6,
+        106,
+        83,
+        214,
+        46,
+        155,
+        36,
+        93,
+        49,
+        66,
+        151,
+        244,
+        128,
+        191,
+        151
+      ]
+    },
+    "key_hex": "16e4430afed381670a799fabf7f609dd606818b21396387361d9b835eca04fa2",
+    "token_hex": "c410e70d0689a324194b8df909ee3b21d32926a84e6451225a8837f91a1dba15b97776da86ea7c84f4866813a5a8afe013a5b47b066b69031f1eeb066a53d62e9b245d314297f480bf97"
+  },
+  "token_decoded": {
+    "data_base64": "i6lBY2NvdW50SWSpZGFya3RhbGVzq0FwcGxpY2F0aW9urGxpdmUtMS0wNS0wMKZJc3N1ZWTX/9Zo/tBqJUbAqkV4cGlyYXRpb27X/9ZpAfBqJUfsqFVzZXJEYXRhxQHhAAAB3ZmSpXN0ZWFtsTc2NTYxMTk3OTc3ODcwMjY3mNkgNDE2OGZmYjI0ZGUyNDVmODgwNjBkMjdjOTU4MDY4NWWBpXN0ZWFtgadzdGVhbWlksTc2NTYxMTk3OTc3ODcwMjY3g6Zwc2V1ZG+qTWFqb3IgSG9mZqdvcHRpb25zgaljcm9zc3BsYXmBp2VuYWJsZWTDp3N0ZWFtaWSxNzY1NjExOTc5Nzc4NzAyNjfX/zgATcBqG1ZR1/84AE3AahtWUYClc3RlYW3AxBDhZ0cF20u0R6pUVeBSrep9gaVzdGVhbbdzdGVhbTo3NjU2MTE5Nzk3Nzg3MDI2N4Krc3RlYW0uYXBwSWTEBPCaHwC5Z2FtZVZlcnNpb24uY2xpZW50VmVyc2lvbsQPAAAAC6oxLjA1LjAwLjA11/88NoIQaiVGvtmbc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvL2Rhcmt0YWxlcy9saXZlLTEtMDUtMDAvMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmLzE/L2F1dGhlbnRpY2F0b3IjYXV0aGVudGljYXRvci8wKCspWzJlMDk1NmUxLTk0M2YtNGE0ZS1hMGIzLTFiODZkOTA2MDA5Yl3AAKtDb250ZW50VHlwZbZzdG9ybWFuY2VyL3VzZXJTZXNzaW9uqUVuZHBvaW50c8CnU2NlbmVJZNkzc2NlbmU6L3Bhc3N0ZWNoLWxpdmUvZGFya3RhbGVzL2xpdmUtMS0wNS0wMC9mcmllbmRzp1JvdXRpbmfArERlcGxveW1lbnRJZNkkMjU2NGQ4YmUtMmRiYi00OTY3LWI2YmItMGUxNTdhYTdmNjNmp1ZlcnNpb24C",
+    "signature": {
+      "base64": "gwKs6E/DihtO3t7y8pFtTBFdmBzFNCCr9EUUAhUkg5s=",
+      "hex": "8302ace84fc38a1b4ededef2f2916d4c115d981cc53420abf44514021524839b",
+      "bytes": [
+        131,
+        2,
+        172,
+        232,
+        79,
+        195,
+        138,
+        27,
+        78,
+        222,
+        222,
+        242,
+        242,
+        145,
+        109,
+        76,
+        17,
+        93,
+        152,
+        28,
+        197,
+        52,
+        32,
+        171,
+        244,
+        69,
+        20,
+        2,
+        21,
+        36,
+        131,
+        155
+      ]
+    },
+    "msgpack": {
+      "AccountId": "darktales",
+      "Application": "live-1-05-00",
+      "Issued": {
+        "timestamp_seconds": 1780827840,
+        "timestamp_nanoseconds": 899301300
+      },
+      "Expiration": {
+        "timestamp_seconds": 1780828140,
+        "timestamp_nanoseconds": 899301500
+      },
+      "UserData": {
+        "bytes_hex": "000001dd9992a5737465616db1373635363131393739373738373032363798d920343136386666623234646532343566383830363064323763393538303638356581a5737465616d81a7737465616d6964b1373635363131393739373738373032363783a670736575646faa4d616a6f7220486f6666a76f7074696f6e7381a963726f7373706c617981a7656e61626c6564c3a7737465616d6964b13736353631313937393737383730323637d7ff38004dc06a1b5651d7ff38004dc06a1b565180a5737465616dc0c410e1674705db4bb447aa5455e052adea7d81a5737465616db7737465616d3a373635363131393739373738373032363782ab737465616d2e6170704964c404f09a1f00b967616d6556657273696f6e2e636c69656e7456657273696f6ec40f0000000baa312e30352e30302e3035d7ff3c3682106a2546bed99b7363656e653a2f70617373746563682d6c6976652f2f6461726b74616c65732f6c6976652d312d30352d30302f32353634643862652d326462622d343936372d623662622d3065313537616137663633662f313f2f61757468656e74696361746f722361757468656e74696361746f722f30282b295b32653039353665312d393433662d346134652d613062332d3162383664393036303039625dc000",
+        "text": "\u0000\u0000\u0001ݙ��steam�76561197977870267�� 4168ffb24de245f88060d27c9580685e��steam��steamid�76561197977870267��pseudo�Major Hoff�options��crossplay��enabledçsteamid�76561197977870267��8\u0000M�j\u001bVQ��8\u0000M�j\u001bVQ��steam��\u0010�gG\u0005�K�G�TU�R��}��steam�steam:76561197977870267��steam.appId�\u0004�\u001f\u0000�gameVersion.clientVersion�\u000f\u0000\u0000\u0000\u000b�1.05.00.05��<6�\u0010j%F�ٛscene:/passtech-live//darktales/live-1-05-00/2564d8be-2dbb-4967-b6bb-0e157aa7f63f/1?/authenticator#authenticator/0(+)[2e0956e1-943f-4a4e-a0b3-1b86d906009b]�\u0000",
+        "payload_len": 477,
+        "msgpack": [
+          [
+            "steam",
+            "76561197977870267"
+          ],
+          [
+            "4168ffb24de245f88060d27c9580685e",
+            {
+              "steam": {
+                "steamid": "76561197977870267"
+              }
+            },
+            {
+              "pseudo": "Major Hoff",
+              "options": {
+                "crossplay": {
+                  "enabled": true
+                }
+              },
+              "steamid": "76561197977870267"
+            },
+            {
+              "timestamp_seconds": 1780176465,
+              "timestamp_nanoseconds": 234886000
+            },
+            {
+              "timestamp_seconds": 1780176465,
+              "timestamp_nanoseconds": 234886000
+            },
+            {},
+            "steam",
+            null
+          ],
+          {
+            "bytes_hex": "e1674705db4bb447aa5455e052adea7d",
+            "text": "�gG\u0005�K�G�TU�R��}"
+          },
+          {
+            "steam": "steam:76561197977870267"
+          },
+          {
+            "steam.appId": {
+              "bytes_hex": "f09a1f00",
+              "text": "�\u001f\u0000"
+            },
+            "gameVersion.clientVersion": {
+              "bytes_hex": "0000000baa312e30352e30302e3035",
+              "text": "\u0000\u0000\u0000\u000b�1.05.00.05"
+            }
+          },
+          {
+            "timestamp_seconds": 1780827838,
+            "timestamp_nanoseconds": 252551300
+          },
+          "scene:/passtech-live//darktales/live-1-05-00/2564d8be-2dbb-4967-b6bb-0e157aa7f63f/1?/authenticator#authenticator/0(+)[2e0956e1-943f-4a4e-a0b3-1b86d906009b]",
+          null,
+          0
+        ],
+        "fields": {
+          "login_provider": [
+            "steam",
+            "76561197977870267"
+          ],
+          "user": {
+            "user_id": "4168ffb24de245f88060d27c9580685e",
+            "platforms": {
+              "steam": {
+                "steamid": "76561197977870267"
+              }
+            },
+            "profile": {
+              "pseudo": "Major Hoff",
+              "options": {
+                "crossplay": {
+                  "enabled": true
+                }
+              },
+              "steamid": "76561197977870267"
+            },
+            "created": {
+              "timestamp_seconds": 1780176465,
+              "timestamp_nanoseconds": 234886000
+            },
+            "updated": {
+              "timestamp_seconds": 1780176465,
+              "timestamp_nanoseconds": 234886000
+            },
+            "metadata": {},
+            "provider": "steam",
+            "reserved": null
+          },
+          "session_id": {
+            "bytes_hex": "e1674705db4bb447aa5455e052adea7d",
+            "text": "�gG\u0005�K�G�TU�R��}"
+          },
+          "identities": {
+            "steam": "steam:76561197977870267"
+          },
+          "metadata": {
+            "steam.appId": {
+              "bytes_hex": "f09a1f00",
+              "text": "�\u001f\u0000",
+              "u32_le": 2071280
+            },
+            "gameVersion.clientVersion": {
+              "bytes_hex": "0000000baa312e30352e30302e3035",
+              "text": "\u0000\u0000\u0000\u000b�1.05.00.05",
+              "u32be_msgpack": "1.05.00.05"
+            }
+          },
+          "expiration": {
+            "timestamp_seconds": 1780827838,
+            "timestamp_nanoseconds": 252551300
+          },
+          "authenticator_scene": "scene:/passtech-live//darktales/live-1-05-00/2564d8be-2dbb-4967-b6bb-0e157aa7f63f/1?/authenticator#authenticator/0(+)[2e0956e1-943f-4a4e-a0b3-1b86d906009b]",
+          "reserved": null,
+          "flags": 0
+        }
+      },
+      "ContentType": "stormancer/userSession",
+      "Endpoints": null,
+      "SceneId": "scene:/passtech-live/darktales/live-1-05-00/friends",
+      "Routing": null,
+      "DeploymentId": "2564d8be-2dbb-4967-b6bb-0e157aa7f63f",
+      "Version": 2
+    }
+  },
+  "token_msgpack": {
+    "AccountId": "darktales",
+    "Application": "live-1-05-00",
+    "Issued": {
+      "timestamp_seconds": 1780827840,
+      "timestamp_nanoseconds": 899301300
+    },
+    "Expiration": {
+      "timestamp_seconds": 1780828140,
+      "timestamp_nanoseconds": 899301500
+    },
+    "UserData": {
+      "bytes_hex": "000001dd9992a5737465616db1373635363131393739373738373032363798d920343136386666623234646532343566383830363064323763393538303638356581a5737465616d81a7737465616d6964b1373635363131393739373738373032363783a670736575646faa4d616a6f7220486f6666a76f7074696f6e7381a963726f7373706c617981a7656e61626c6564c3a7737465616d6964b13736353631313937393737383730323637d7ff38004dc06a1b5651d7ff38004dc06a1b565180a5737465616dc0c410e1674705db4bb447aa5455e052adea7d81a5737465616db7737465616d3a373635363131393739373738373032363782ab737465616d2e6170704964c404f09a1f00b967616d6556657273696f6e2e636c69656e7456657273696f6ec40f0000000baa312e30352e30302e3035d7ff3c3682106a2546bed99b7363656e653a2f70617373746563682d6c6976652f2f6461726b74616c65732f6c6976652d312d30352d30302f32353634643862652d326462622d343936372d623662622d3065313537616137663633662f313f2f61757468656e74696361746f722361757468656e74696361746f722f30282b295b32653039353665312d393433662d346134652d613062332d3162383664393036303039625dc000",
+      "text": "\u0000\u0000\u0001ݙ��steam�76561197977870267�� 4168ffb24de245f88060d27c9580685e��steam��steamid�76561197977870267��pseudo�Major Hoff�options��crossplay��enabledçsteamid�76561197977870267��8\u0000M�j\u001bVQ��8\u0000M�j\u001bVQ��steam��\u0010�gG\u0005�K�G�TU�R��}��steam�steam:76561197977870267��steam.appId�\u0004�\u001f\u0000�gameVersion.clientVersion�\u000f\u0000\u0000\u0000\u000b�1.05.00.05��<6�\u0010j%F�ٛscene:/passtech-live//darktales/live-1-05-00/2564d8be-2dbb-4967-b6bb-0e157aa7f63f/1?/authenticator#authenticator/0(+)[2e0956e1-943f-4a4e-a0b3-1b86d906009b]�\u0000",
+      "payload_len": 477,
+      "msgpack": [
+        [
+          "steam",
+          "76561197977870267"
+        ],
+        [
+          "4168ffb24de245f88060d27c9580685e",
+          {
+            "steam": {
+              "steamid": "76561197977870267"
+            }
+          },
+          {
+            "pseudo": "Major Hoff",
+            "options": {
+              "crossplay": {
+                "enabled": true
+              }
+            },
+            "steamid": "76561197977870267"
+          },
+          {
+            "timestamp_seconds": 1780176465,
+            "timestamp_nanoseconds": 234886000
+          },
+          {
+            "timestamp_seconds": 1780176465,
+            "timestamp_nanoseconds": 234886000
+          },
+          {},
+          "steam",
+          null
+        ],
+        {
+          "bytes_hex": "e1674705db4bb447aa5455e052adea7d",
+          "text": "�gG\u0005�K�G�TU�R��}"
+        },
+        {
+          "steam": "steam:76561197977870267"
+        },
+        {
+          "steam.appId": {
+            "bytes_hex": "f09a1f00",
+            "text": "�\u001f\u0000"
+          },
+          "gameVersion.clientVersion": {
+            "bytes_hex": "0000000baa312e30352e30302e3035",
+            "text": "\u0000\u0000\u0000\u000b�1.05.00.05"
+          }
+        },
+        {
+          "timestamp_seconds": 1780827838,
+          "timestamp_nanoseconds": 252551300
+        },
+        "scene:/passtech-live//darktales/live-1-05-00/2564d8be-2dbb-4967-b6bb-0e157aa7f63f/1?/authenticator#authenticator/0(+)[2e0956e1-943f-4a4e-a0b3-1b86d906009b]",
+        null,
+        0
+      ],
+      "fields": {
+        "login_provider": [
+          "steam",
+          "76561197977870267"
+        ],
+        "user": {
+          "user_id": "4168ffb24de245f88060d27c9580685e",
+          "platforms": {
+            "steam": {
+              "steamid": "76561197977870267"
+            }
+          },
+          "profile": {
+            "pseudo": "Major Hoff",
+            "options": {
+              "crossplay": {
+                "enabled": true
+              }
+            },
+            "steamid": "76561197977870267"
+          },
+          "created": {
+            "timestamp_seconds": 1780176465,
+            "timestamp_nanoseconds": 234886000
+          },
+          "updated": {
+            "timestamp_seconds": 1780176465,
+            "timestamp_nanoseconds": 234886000
+          },
+          "metadata": {},
+          "provider": "steam",
+          "reserved": null
+        },
+        "session_id": {
+          "bytes_hex": "e1674705db4bb447aa5455e052adea7d",
+          "text": "�gG\u0005�K�G�TU�R��}"
+        },
+        "identities": {
+          "steam": "steam:76561197977870267"
+        },
+        "metadata": {
+          "steam.appId": {
+            "bytes_hex": "f09a1f00",
+            "text": "�\u001f\u0000",
+            "u32_le": 2071280
+          },
+          "gameVersion.clientVersion": {
+            "bytes_hex": "0000000baa312e30352e30302e3035",
+            "text": "\u0000\u0000\u0000\u000b�1.05.00.05",
+            "u32be_msgpack": "1.05.00.05"
+          }
+        },
+        "expiration": {
+          "timestamp_seconds": 1780827838,
+          "timestamp_nanoseconds": 252551300
+        },
+        "authenticator_scene": "scene:/passtech-live//darktales/live-1-05-00/2564d8be-2dbb-4967-b6bb-0e157aa7f63f/1?/authenticator#authenticator/0(+)[2e0956e1-943f-4a4e-a0b3-1b86d906009b]",
+        "reserved": null,
+        "flags": 0
+      }
+    },
+    "ContentType": "stormancer/userSession",
+    "Endpoints": null,
+    "SceneId": "scene:/passtech-live/darktales/live-1-05-00/friends",
+    "Routing": null,
+    "DeploymentId": "2564d8be-2dbb-4967-b6bb-0e157aa7f63f",
+    "Version": 2
+  },
+  "token_signature_hex": "8302ace84fc38a1b4ededef2f2916d4c115d981cc53420abf44514021524839b"
+}
+extra_quoted_printable = 'ssion.UpdateUserOptions=A6Handle=0F=A8Metadata=81=B6stormancer.plugins.rpc=\n=A51.1.0=83=A4Name=B7NX.GetAdvertisedParties=A6Handle=10=A8Metadata=81=B6st=\normancer.plugins.rpc=A51.1.0=83=A4Name=B2Steam.QueryUserIds=A6Handle=11=A8M=\netadata=81=B6stormancer.plugins.rpc=A51.1.0=83=A4Name=D9!Steam.DecodePartyD=\nataBearerTokens=A6Handle=12=A8Metadata=81=B6stormancer.plugins.rpc=A51.1.0=\n=83=A4Name=BFLocator.GetSceneConnectionToken=A6Handle=13=A8Metadata=81=B6st=\normancer.plugins.rpc=A51.1.0=ADmsgpack/array=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=00=00=00X=B2=99=BC=B3=7F=00=00=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=00=00=00=00=00=00=00=00=00=00H{=20i=F0=7F=00=00x=B2=99=BC=B3=\n=7F=00=00P=B3=99=BC=B3=7F=00=00=00=00=00=00=00=00=00=00P=7F=20i=F0=7F=00=00=\n(=B4=99=BC=B3=7F=00=00=04=00=00=00=04=00=00=00=00=00=00=00=00=00=00=00=A0q=\n=07l=F0=7F=00=00=00=9C=99=BC=B3=7F=00=00=04=00=00=00=05=00=00=00=01=00=00=\n=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=C8=89=20i=F0=7F=00=00=E8=B1=99=BC=B3=7F=00=00=00=00=00=00=00=\n=00=00=00=A0=B4=99=BC=B3=7F=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=00=00=00=00=00=00'

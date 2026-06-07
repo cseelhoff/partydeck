@@ -1,0 +1,91 @@
+{
+  "endpoints": {
+    "raknet": [
+      "dt-live.passtechgames.com:30100",
+      "dt-live-2.passtechgames.com:30100"
+    ]
+  },
+  "encryption": {
+    "algorithm": "aes256",
+    "mode": "GCM",
+    "key": "FuRDCv7TgWcKeZ+r9/YJ3WBoGLITljhzYdm4NeygT6I=",
+    "token": "xBDnDQaJoyQZS435Ce47IdMpJqhOZFEiWog3+RoduhW5d3bahup8hPSGaBOlqK/gE6W0ewZraQMfHusGalPWLpskXTFCl/SAv5c="
+  },
+  "token_decoded": {
+    "signature_base64": "gwKs6E/DihtO3t7y8pFtTBFdmBzFNCCr9EUUAhUkg5s=",
+    "msgpack": {
+      "AccountId": "darktales",
+      "Application": "live-1-05-00",
+      "Issued": {
+        "timestamp_seconds": 1780827840,
+        "timestamp_nanoseconds": 899301300
+      },
+      "Expiration": {
+        "timestamp_seconds": 1780828140,
+        "timestamp_nanoseconds": 899301500
+      },
+      "UserData": {
+        "login_provider": [
+          "steam",
+          "76561197977870267"
+        ],
+        "user": {
+          "user_id": "4168ffb24de245f88060d27c9580685e",
+          "platforms": {
+            "steam": {
+              "steamid": "76561197977870267"
+            }
+          },
+          "profile": {
+            "pseudo": "Major Hoff",
+            "options": {
+              "crossplay": {
+                "enabled": true
+              }
+            },
+            "steamid": "76561197977870267"
+          },
+          "created": {
+            "timestamp_seconds": 1780176465,
+            "timestamp_nanoseconds": 234886000
+          },
+          "updated": {
+            "timestamp_seconds": 1780176465,
+            "timestamp_nanoseconds": 234886000
+          },
+          "metadata": {},
+          "provider": "steam",
+          "reserved": null
+        },
+        "session_id": {
+          "hex": "e1674705db4bb447aa5455e052adea7d"
+        },
+        "identities": {
+          "steam": "steam:76561197977870267"
+        },
+        "metadata": {
+          "steam.appId": {
+            "u32_le": 2071280
+          },
+          "gameVersion.clientVersion": {
+            "u32be_msgpack": "1.05.00.05"
+          }
+        },
+        "expiration": {
+          "timestamp_seconds": 1780827838,
+          "timestamp_nanoseconds": 252551300
+        },
+        "authenticator_scene": "scene:/passtech-live//darktales/live-1-05-00/2564d8be-2dbb-4967-b6bb-0e157aa7f63f/1?/authenticator#authenticator/0(+)[2e0956e1-943f-4a4e-a0b3-1b86d906009b]",
+        "reserved": null,
+        "flags": 0
+      },
+      "ContentType": "stormancer/userSession",
+      "Endpoints": null,
+      "SceneId": "scene:/passtech-live/darktales/live-1-05-00/friends",
+      "Routing": null,
+      "DeploymentId": "2564d8be-2dbb-4967-b6bb-0e157aa7f63f",
+      "Version": 2
+    }
+  },
+  "extra_quoted_printable" : "ssion.UpdateUserOptions=A6Handle=0F=A8Metadata=81=B6stormancer.plugins.rpc=\n=A51.1.0=83=A4Name=B7NX.GetAdvertisedParties=A6Handle=10=A8Metadata=81=B6st=\normancer.plugins.rpc=A51.1.0=83=A4Name=B2Steam.QueryUserIds=A6Handle=11=A8M=\netadata=81=B6stormancer.plugins.rpc=A51.1.0=83=A4Name=D9!Steam.DecodePartyD=\nataBearerTokens=A6Handle=12=A8Metadata=81=B6stormancer.plugins.rpc=A51.1.0=\n=83=A4Name=BFLocator.GetSceneConnectionToken=A6Handle=13=A8Metadata=81=B6st=\normancer.plugins.rpc=A51.1.0=ADmsgpack/array=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=00=00=00X=B2=99=BC=B3=7F=00=00=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=00=00=00=00=00=00=00=00=00=00H{=20i=F0=7F=00=00x=B2=99=BC=B3=\n=7F=00=00P=B3=99=BC=B3=7F=00=00=00=00=00=00=00=00=00=00P=7F=20i=F0=7F=00=00=\n(=B4=99=BC=B3=7F=00=00=04=00=00=00=04=00=00=00=00=00=00=00=00=00=00=00=A0q=\n=07l=F0=7F=00=00=00=9C=99=BC=B3=7F=00=00=04=00=00=00=05=00=00=00=01=00=00=\n=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=C8=89=20i=F0=7F=00=00=E8=B1=99=BC=B3=7F=00=00=00=00=00=00=00=\n=00=00=00=A0=B4=99=BC=B3=7F=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=00=\n=00=00=00=00=00=00=00=00=00=00"
+}

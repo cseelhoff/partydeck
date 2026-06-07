@@ -321,11 +321,13 @@ encode_gamefinder_update_body :: proc(body: Gamefinder_Update_Body, allocator :=
 	out := make([dynamic]byte, allocator)
 	append(&out, ..mpe_uint(body.status, allocator))
 	if len(body.token_json) > 0 do append(&out, ..mpe_str(body.token_json, allocator))
+	if len(body.raw_tail) > 0 do append(&out, ..body.raw_tail)
 	return out[:]
 }
 
 encode_player_update_body :: proc(body: Player_Update_Body, allocator := context.allocator) -> []byte {
-	return mpe_array(
+	out := make([dynamic]byte, allocator)
+	append(&out, ..mpe_array(
 		{
 			mpe_str(body.user_id, allocator),
 			mpe_uint(body.state, allocator),
@@ -333,7 +335,9 @@ encode_player_update_body :: proc(body: Player_Update_Body, allocator := context
 			mpe_bool(body.ready, allocator),
 		},
 		allocator,
-	)
+	))
+	if len(body.raw_tail) > 0 do append(&out, ..body.raw_tail)
+	return out[:]
 }
 
 encode_party_member_status_updated_body :: proc(
@@ -409,6 +413,7 @@ encode_party_settings_updated_body :: proc(
 	write_u16_le(&out, body.rpc_id)
 	append(&out, ..mpe_uint(body.version, allocator))
 	append(&out, ..encode_party_settings(body.settings, allocator))
+	if len(body.raw_tail) > 0 do append(&out, ..body.raw_tail)
 	return out[:]
 }
 
@@ -421,6 +426,7 @@ encode_party_member_data_updated_body :: proc(
 	append(&out, ..mpe_uint(body.version, allocator))
 	append(&out, ..encode_party_member_data(body.member, allocator))
 	for value in body.tail_values do append(&out, ..encode_party_member_data_tail_value(value, allocator))
+	if len(body.raw_tail) > 0 do append(&out, ..body.raw_tail)
 	return out[:]
 }
 
@@ -490,6 +496,7 @@ encode_party_member_connected_body :: proc(
 	write_u16_le(&out, body.rpc_id)
 	append(&out, ..mpe_uint(body.version, allocator))
 	append(&out, ..encode_party_connected_member(body.member, allocator))
+	if len(body.raw_tail) > 0 do append(&out, ..body.raw_tail)
 	return out[:]
 }
 
@@ -529,6 +536,7 @@ encode_party_state_response_body :: proc(
 			allocator,
 		),
 	)
+	if len(body.connection_metadata.raw) > 0 do append(&out, ..body.connection_metadata.raw)
 	return out[:]
 }
 
@@ -678,6 +686,7 @@ encode_stormancer_rpc_next_body :: proc(
 		)
 	case:
 	}
+	if len(body.raw_tail) > 0 do append(&out, ..body.raw_tail)
 	return out[:]
 }
 

@@ -37,6 +37,7 @@ Connection_Token :: struct {
 	expiration:    u64, // unix seconds
 	version:       u64,
 	user_data:     []byte, // UserData bin (usually empty)
+	user_session:  User_Session_Data,
 	signature_len: int, // bytes of the base64 signature segment after '-'
 	raw:           string, // the original "<b64>-<b64>" token text
 	ok:            bool,
@@ -76,6 +77,9 @@ parse_connection_token :: proc(token: string, allocator := context.allocator) ->
 	result.issued = node_timestamp_seconds(n, msgpack_map_get(n, 0, "Issued"))
 	result.expiration = node_timestamp_seconds(n, msgpack_map_get(n, 0, "Expiration"))
 	result.user_data = node_bin(n, msgpack_map_get(n, 0, "UserData"))
+	if result.content_type == "stormancer/userSession" {
+		result.user_session = parse_user_session_data(result.user_data, allocator)
+	}
 	result.ok = true
 	return result
 }

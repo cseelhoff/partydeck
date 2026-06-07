@@ -90,6 +90,12 @@ Simple_Server_State :: struct {
 	party_update_user_data2:     Party_UpdatePartyUserData2_Body,
 	party_conn_token_from_code:  PartyManagement_CreateConnectionTokenFromInvitationCode_Body,
 	party_create_session:        PartyManagement_CreateSession_Body,
+	party_scene_override:        string,
+	party_create_session_tail:   []byte,
+	pending_response_complete_req: u16,
+	pending_matchmaking_infos_complete_req: u16,
+	pending_party_scene_infos:   string,
+	user_session_data_override:  []byte,
 	party_merging_status:        PartyMerging_GetMergerStatus_Body,
 	player_update:               Player_Update_Body,
 	steam_create_lobby:          Steam_CreateLobby_Body,
@@ -109,6 +115,7 @@ Simple_Relay_Shadow :: struct {
 	log:      strings.Builder,
 	peers:    [dynamic]^Peer_State,
 	nidx:     int,
+	records:  int,
 }
 
 client_list: map[net.Endpoint]int
@@ -456,6 +463,7 @@ simple_relay_shadow_step :: proc(
 		route_registry_observe(&peer_state.reg_real, peer_state.ep_real, response_message, allocator)
 	}
 	if len(decoded_messages) > 0 || len(response_messages) > 0 {
+		shadow.records += 1
 		simple_net_write_live_record(
 			&shadow.log,
 			shadow.out_path,
@@ -468,6 +476,15 @@ simple_relay_shadow_step :: proc(
 			response_messages[:],
 			allocator,
 		)
+		if env_truthy("SIMPLE_RELAY_TRACE_COUNTS") {
+			fmt.printfln(
+				"simple relay shadow %s records=%d c2s_msgs=%d pred_msgs=%d",
+				label,
+				shadow.records,
+				len(sent_msgs),
+				len(response_messages),
+			)
+		}
 	}
 	simple_relay_shadow_flush_cross(shadow, clients, allocator)
 }
@@ -483,6 +500,7 @@ simple_relay_shadow_flush_cross :: proc(
 		if !ok do continue
 		peer_state := find_peer(&shadow.peers, label, &shadow.nidx)
 		msgs := [?]Decoded_Message{cross.msg}
+		shadow.records += 1
 		simple_net_write_live_record(
 			&shadow.log,
 			shadow.out_path,
@@ -495,6 +513,9 @@ simple_relay_shadow_flush_cross :: proc(
 			msgs[:],
 			allocator,
 		)
+		if env_truthy("SIMPLE_RELAY_TRACE_COUNTS") {
+			fmt.printfln("simple relay shadow %s records=%d cross_msgs=1", label, shadow.records)
+		}
 	}
 	clear(&g_simple_cross_messages)
 }

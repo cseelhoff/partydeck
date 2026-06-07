@@ -1,5 +1,6 @@
 package caleb_raknet
 
+import "core:encoding/hex"
 import "core:mem"
 import "core:strings"
 
@@ -68,7 +69,7 @@ simple_friend_pseudo :: proc(steam_id: string) -> string {
 
 simple_friend_metadata_stormancer :: proc(steam_id: string) -> u64 {
 	switch steam_id {
-	case "76561199572083022":
+	case "76561197977870267":
 		return 2
 	}
 	return 0
@@ -84,7 +85,27 @@ encode_friends_notification_body :: proc(
 	for friend in body.friends {
 		append(&items, simple_friend_notification_value(friend, timestamp, allocator))
 	}
-	return mpe_array(items[:], allocator)
+	out := make([dynamic]byte, allocator)
+	append(&out, ..mpe_array(items[:], allocator))
+	if len(body.raw_tail) > 0 do append(&out, ..body.raw_tail)
+	return out[:]
+}
+
+simple_friends_subscribe_tail :: proc(
+	local_steam_id: string,
+	allocator := context.allocator,
+) -> []byte {
+	tail_hex := ""
+	switch local_steam_id {
+	case "76561197977870267":
+		tail_hex = "6e646578223a5b322c342c342c312c332c342c332c322c332c342c342c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c305d7d9196a5737465616dd9203033396234313166666233663435666539653165616462623837363037393631a9616e6f6e796d6f7573b13736353631313938313139383137323039a00034353135333036a000023631313939313134383431333834a000617900"
+	case "76561199572083022":
+		tail_hex = "6c7b22496e7669746174696f6e436f6465223a22363530303339222c2247616d654d6f6465223a302c2247616d65446966666963756c7479223a302c2247616d654d6f64696669657273223a5b352c382c31322c31345d2c224d6572676572446966666963756c7479223a307dc3c2a0a066303764653533353736633939a9616e6f6e796d6f7573b13736353631313938303236393236383531a0000231313938383434323038383931a000000002027902"
+	}
+	if tail_hex == "" do return nil
+	decoded, ok := hex.decode(transmute([]byte)tail_hex, allocator)
+	if !ok do return nil
+	return decoded
 }
 
 simple_friend_notification_value :: proc(

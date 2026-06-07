@@ -7,11 +7,9 @@ package caleb_raknet
 //
 // The atomic unit is the reassembled RakNet MESSAGE (mid + body), never a UDP
 // datagram: split fragments are joined before anything is logged or compared. The
-// match verdict is SEMANTIC -- real and predicted bursts are rendered with the same
-// decoder (write_decoded_message) and the rendered strings are compared, exactly as
-// sync-raknet.py's per-record `match = real_human == pred_human`. Clock/identity
-// noise therefore shows as a mismatch here (as it does in Python); noise-tolerant
-// summarisation is a later concern.
+// match verdict is byte-level over the reassembled messages. Human renderings are
+// still written for eyeballing, but route-name cache differences must not turn an
+// otherwise identical prediction into a mismatch.
 
 import "core:encoding/hex"
 import "core:encoding/json"
@@ -353,6 +351,7 @@ render_burst :: proc(
 		route_name := ""
 		if sm, ok := decoded.(Scene_Message); ok {
 			route_name = route_registry_resolve(reg, ep, sm.scene_handle, sm.route_handle)
+			if route_name == "" do route_name = scene_message_infer_route_name(sm, allocator)
 			decoded = scene_message_with_route_body(decoded, route_name, context.temp_allocator)
 		}
 		write_decoded_message(&sb, decoded, route_name)
@@ -399,6 +398,14 @@ write_hex_array :: proc(sb: ^strings.Builder, msgs: [][]byte) {
 	strings.write_byte(sb, ']')
 }
 
+message_bursts_equal :: proc(real, pred: [][]byte) -> bool {
+	if len(real) != len(pred) do return false
+	for msg, i in real {
+		if !bytes_equal(msg, pred[i]) do return false
+	}
+	return true
+}
+
 // One pretty-printed transaction record (field order matches sync-raknet.py's
 // _finalize so the three *_human_readable lines sit together for eyeballing).
 sync_write_record :: proc(
@@ -422,11 +429,38 @@ sync_write_record :: proc(
 	write_json_str(sb, real_h)
 	strings.write_string(sb, ",\n  \"pred_human_readable\": ")
 	write_json_str(sb, pred_h)
+	write_human_diff_fields(sb, real_h, pred_h)
 	strings.write_string(sb, ",\n  \"real\": ")
 	write_hex_array(sb, real)
 	strings.write_string(sb, ",\n  \"pred\": ")
 	write_hex_array(sb, pred)
 	strings.write_string(sb, "\n}\n\n")
+}
+
+write_human_diff_fields :: proc(sb: ^strings.Builder, real_h, pred_h: string) {
+	if real_h == pred_h do return
+	real_diff, pred_diff := human_diff_strings(real_h, pred_h, context.temp_allocator)
+	strings.write_string(sb, ",\n  \"real_diff\": ")
+	write_json_str(sb, real_diff)
+	strings.write_string(sb, ",\n  \"pred_diff\": ")
+	write_json_str(sb, pred_diff)
+}
+
+human_diff_strings :: proc(
+	real_h, pred_h: string,
+	allocator := context.allocator,
+) -> (string, string) {
+	real_diff := strings.builder_make(allocator)
+	pred_diff := strings.builder_make(allocator)
+	shared := min(len(real_h), len(pred_h))
+	for i in 0 ..< shared {
+		if real_h[i] == pred_h[i] do continue
+		strings.write_byte(&real_diff, real_h[i])
+		strings.write_byte(&pred_diff, pred_h[i])
+	}
+	for i in shared ..< len(real_h) do strings.write_byte(&real_diff, real_h[i])
+	for i in shared ..< len(pred_h) do strings.write_byte(&pred_diff, pred_h[i])
+	return strings.to_string(real_diff), strings.to_string(pred_diff)
 }
 
 // Reassemble + render + write the peer's open transaction, then reset it.
@@ -438,7 +472,7 @@ finalize_txn :: proc(ps: ^Peer_State, out_sb: ^strings.Builder, stats: ^Sync_Sta
 	pred_human := render_burst(&ps.reg_pred, ps.ep_pred, pred_msgs)
 	free_all(context.temp_allocator)
 
-	match := real_human == pred_human
+	match := message_bursts_equal(real_msgs, pred_msgs)
 	sync_write_record(
 		out_sb,
 		ps.t,

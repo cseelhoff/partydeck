@@ -36,6 +36,10 @@ decode_scene_body :: proc(body: []byte, allocator := context.allocator) -> Scene
 }
 
 write_scene_body :: proc(sb: ^strings.Builder, body: Scene_Body) {
+	if scene_body_first_root_has_token(body) {
+		write_stormancer_rpc_next_body(sb, parse_stormancer_rpc_next_body(body))
+		return
+	}
 	if body.has_rpc_id do fmt.sbprintf(sb, "rpc=%d ", body.rpc_id)
 	strings.write_byte(sb, '[')
 	for root, i in body.values.roots {
@@ -50,11 +54,70 @@ write_scene_body :: proc(sb: ^strings.Builder, body: Scene_Body) {
 	}
 }
 
+scene_body_first_root_has_token :: proc(body: Scene_Body) -> bool {
+	if len(body.values.roots) == 0 do return false
+	root := body.values.roots[0]
+	if root < 0 || root >= len(body.values.nodes) do return false
+	node := body.values.nodes[root]
+	return node.kind == .Str && json_string_value(node.str, "token") != ""
+}
+
 write_raw_tail :: proc(sb: ^strings.Builder, tail: []byte) {
-	preview := min(len(tail), 16)
-	fmt.sbprintf(sb, " +%dB raw ", len(tail))
-	for k in 0 ..< preview do fmt.sbprintf(sb, "%02x", tail[k])
-	if len(tail) > preview do strings.write_string(sb, "...")
+	if len(tail) == 0 do return
+	if write_msgpack_tail(sb, tail) do return
+	fmt.sbprintf(sb, " tail={{bytes=%d", len(tail))
+	write_tail_text_fragments(sb, tail)
+	strings.write_string(sb, ", raw_bytes=")
+	write_byte_values(sb, tail)
+	strings.write_byte(sb, '}')
+}
+
+write_msgpack_tail :: proc(sb: ^strings.Builder, tail: []byte) -> bool {
+	decoded := msgpack_decode_seq(tail, allocator = context.temp_allocator)
+	if !decoded.ok || len(decoded.roots) == 0 do return false
+	fmt.sbprintf(sb, " tail={{bytes=%d, msgpack=[", len(tail))
+	for root, i in decoded.roots {
+		if i > 0 do strings.write_string(sb, ", ")
+		write_scene_value(sb, decoded.nodes, root)
+	}
+	strings.write_string(sb, "]}")
+	return true
+}
+
+write_tail_text_fragments :: proc(sb: ^strings.Builder, tail: []byte) {
+	wrote_header := false
+	written := 0
+	for i := 0; i < len(tail); {
+		for i < len(tail) && !tail_byte_is_printable(tail[i]) do i += 1
+		start := i
+		for i < len(tail) && tail_byte_is_printable(tail[i]) do i += 1
+		if i - start < 8 do continue
+		if !wrote_header {
+			strings.write_string(sb, ", text=[")
+			wrote_header = true
+		} else {
+			strings.write_string(sb, ", ")
+		}
+		fragment := string(tail[start:i])
+		if len(fragment) > 96 do fragment = fragment[:96]
+		fmt.sbprintf(sb, "%q", fragment)
+		written += 1
+		if written >= 3 do break
+	}
+	if wrote_header do strings.write_byte(sb, ']')
+}
+
+tail_byte_is_printable :: proc(c: byte) -> bool {
+	return c >= 0x20 && c <= 0x7e
+}
+
+write_byte_values :: proc(sb: ^strings.Builder, data: []byte) {
+	strings.write_byte(sb, '[')
+	for value, i in data {
+		if i > 0 do strings.write_string(sb, ", ")
+		fmt.sbprintf(sb, "%d", value)
+	}
+	strings.write_byte(sb, ']')
 }
 
 write_scene_value :: proc(b: ^strings.Builder, nodes: []Msgpack_Node, i: int) -> int {
@@ -111,7 +174,11 @@ write_scene_bin :: proc(b: ^strings.Builder, data: []byte) {
 		write_scene_string(b, string(data))
 		return
 	}
-	fmt.sbprintf(b, "bin<%d>", len(data))
+	if len(data) == 16 {
+		write_hex_bytes(b, data)
+		return
+	}
+	write_quoted_printable_bytes(b, data)
 }
 
 is_json_like :: proc(s: string) -> bool {
