@@ -212,6 +212,14 @@ simple_backup_seed_real_values :: proc(
 			}
 		case Scene_Message:
 			#partial switch body in sm.body {
+			case Party_CreateInvitationCode_Result_Body:
+				if body.invitation_code != "" do state.invitation_code_override = body.invitation_code
+			case Party_SettingsUpdated_Body:
+				if code := json_string_value(body.settings.custom_data_json, "InvitationCode"); code != "" do state.invitation_code_override = code
+			case Party_MemberConnected_Body:
+				if len(sm.raw_body) > 0 do state.party_member_connected_raw_override = sm.raw_body
+			}
+			#partial switch body in sm.body {
 			case Stormancer_Rpc_Next_Body:
 				if body.kind == .Scene_Connection_Token && body.token_scene != "" {
 					pending_token_scene = body.token_scene

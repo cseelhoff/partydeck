@@ -50,7 +50,12 @@ write_scene_body :: proc(sb: ^strings.Builder, body: Scene_Body) {
 	if len(body.raw_tail) > 0 {
 		write_raw_tail(sb, body.raw_tail)
 	} else if !body.values.ok {
-		strings.write_string(sb, " <trailing>")
+		trailing := body.values.raw[body.values.consumed:]
+		if len(trailing) > 0 {
+			write_quoted_printable_tail(sb, trailing)
+		} else {
+			strings.write_string(sb, " tail={bytes=0, quoted_printable=quoted_printable<0> \"\"}")
+		}
 	}
 }
 

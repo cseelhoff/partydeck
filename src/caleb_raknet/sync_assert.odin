@@ -22,13 +22,26 @@ import "core:strings"
 SYNC_ASSERT_FILE :: "/tmp/pdlog/probe/sync_assert.json"
 HR_MSG_SEP :: " | " // joins per-message renderings within one burst
 
-// One capture row. Mirrors the ORIGINAL relay format (dir + peer), distinct from
-// the caleb format ({t, from, len, hex}) the live logger writes.
+// One capture row. Supports both the original relay format ({dir, peer}) and
+// the simple-delay relay format ({src, dst}).
 Relay_Record :: struct {
 	t:    string,
 	dir:  string, // "c2s" | "s2c"
 	peer: string, // "C1", "C2", ...
+	src:  string, // "SV" | "S" | "C1" | "C2" | ...
+	dst:  string, // "SV" | "S" | "C1" | "C2" | ...
 	hex:  string,
+}
+
+relay_record_peer_dir :: proc(rec: Relay_Record) -> (peer, dir: string, ok: bool) {
+	if rec.dir != "" && rec.peer != "" do return rec.peer, rec.dir, true
+	if relay_record_is_server_label(rec.src) && strings.has_prefix(rec.dst, "C") do return rec.dst, "s2c", true
+	if relay_record_is_server_label(rec.dst) && strings.has_prefix(rec.src, "C") do return rec.src, "c2s", true
+	return "", "", false
+}
+
+relay_record_is_server_label :: proc(value: string) -> bool {
+	return value == "SV" || value == "S"
 }
 
 // Reassembly side: client->server, real server->client, predicted server->client.
@@ -274,6 +287,34 @@ reassemble_side :: proc(
 				if seen^[pk.reliable_message_number] do continue
 				seen^[pk.reliable_message_number] = true
 			}
+			if !pk.has_split {
+				append(&out, slice.clone(pk.payload, allocator))
+				continue
+			}
+			full, ok := split_feed(sr, pk, allocator)
+			if ok do append(&out, full)
+		}
+	}
+	return out[:]
+}
+
+// Reassemble encapsulated messages without delivery-layer suppression. This is
+// for capture annotation/debugging, where retransmits, pings, ACK-only datagrams,
+// and partial split carriers must remain visible instead of being normalized away.
+reassemble_side_all :: proc(
+	ps: ^Peer_State,
+	side: Side,
+	dgs: [][]byte,
+	allocator := context.allocator,
+) -> [][]byte {
+	out := make([dynamic][]byte, allocator)
+	sr := &ps.reasm[int(side)]
+	packets: [MAX_INTERNAL_PACKETS]RakNet_Internal_Packet
+	for dg in dgs {
+		n := parse_internal_packets(dg, packets[:])
+		for i in 0 ..< n {
+			pk := packets[i]
+			if len(pk.payload) == 0 do continue
 			if !pk.has_split {
 				append(&out, slice.clone(pk.payload, allocator))
 				continue
@@ -550,6 +591,62 @@ route_cross :: proc(peers: ^[dynamic]^Peer_State, cross: [dynamic]Out_Dg) {
 
 // --- entry -------------------------------------------------------------------
 
+annotate_capture :: proc(path: string, out_path: string) -> Error {
+	data := os.read_entire_file_from_path(path, context.allocator) or_return
+	defer delete(data)
+
+	peers: [dynamic]^Peer_State
+	nidx := 1
+	out := strings.builder_make(context.allocator)
+
+	text := string(data)
+	for line in strings.split_lines_iterator(&text) {
+		if len(line) == 0 do continue
+		strings.write_string(&out, line)
+		strings.write_byte(&out, '\n')
+
+		rec: Relay_Record
+		if json.unmarshal_string(line, &rec, allocator = context.temp_allocator) != nil {
+			strings.write_string(&out, "  <invalid capture json>\n")
+			free_all(context.temp_allocator)
+			continue
+		}
+		dg, ok := hex.decode(transmute([]byte)rec.hex, context.allocator)
+		if !ok {
+			strings.write_string(&out, "  <invalid hex>\n")
+			free_all(context.temp_allocator)
+			continue
+		}
+		peer, dir, ok_dir := relay_record_peer_dir(rec)
+		if !ok_dir {
+			strings.write_string(&out, "  <invalid relay direction>\n")
+			free_all(context.temp_allocator)
+			continue
+		}
+
+		ps := find_peer(&peers, peer, &nidx)
+		side := dir == "s2c" ? Side.Real : Side.C2S
+		ep := dir == "s2c" ? ps.ep_real : ps.ep_client
+		msgs := reassemble_side_all(ps, side, {dg}, context.allocator)
+		if len(msgs) == 0 {
+			strings.write_string(&out, "  <no complete messages>\n")
+			free_all(context.temp_allocator)
+			continue
+		}
+		for msg in msgs {
+			human := render_burst(&ps.reg_real, ep, {msg}, context.temp_allocator)
+			strings.write_string(&out, "  ")
+			strings.write_string(&out, human)
+			strings.write_byte(&out, '\n')
+		}
+		free_all(context.temp_allocator)
+	}
+
+	sync_write_out(out_path, strings.to_string(out))
+	fmt.printfln("annotate-capture wrote -> %s", out_path)
+	return nil
+}
+
 // Replay `path` and write the assert file (default SYNC_ASSERT_FILE, or `out_path`).
 sync_replay :: proc(path: string, out_path := SYNC_ASSERT_FILE) -> Error {
 	data := os.read_entire_file_from_path(path, context.allocator) or_return
@@ -573,10 +670,12 @@ sync_replay :: proc(path: string, out_path := SYNC_ASSERT_FILE) -> Error {
 		dg, ok := hex.decode(transmute([]byte)rec.hex, context.allocator)
 		if !ok do continue
 		last_t = rec.t
+		peer, dir, ok_dir := relay_record_peer_dir(rec)
+		if !ok_dir do continue
 
-		ps := find_peer(&peers, rec.peer, &nidx)
+		ps := find_peer(&peers, peer, &nidx)
 
-		if rec.dir == "c2s" {
+		if dir == "c2s" {
 			if datagram_is_health_channel(dg) do continue
 			clear(&own)
 			clear(&cross)

@@ -229,8 +229,6 @@ stormancer_rpc_completed_id :: proc(rpc_id: u16, sent_next: bool) -> u16 {
 }
 
 simple_invitation_code :: proc(client_id: int, allocator := context.allocator) -> string {
-	if client_id == 1 do return "521611"
-	if client_id == 2 do return "717937"
 	return fmt.aprintf("%06d", client_id, allocator = allocator)
 }
 
@@ -588,6 +586,11 @@ simple_steam_id_for_user_id :: proc(user_id: string) -> string {
 }
 
 simple_party_session_token_for_steam :: proc(steam_id: string, allocator := context.allocator) -> []byte {
+	if steam_id == "76561197977870267" {
+		token_hex := "D5203BF88D2D5C4F986273B929170CFA"
+		decoded, ok := hex.decode(transmute([]byte)token_hex, allocator)
+		if ok do return decoded
+	}
 	out := make([]byte, 16, allocator)
 	seed: u8 = 0x11
 	if len(steam_id) > 0 do seed = steam_id[len(steam_id) - 1]
@@ -940,6 +943,9 @@ simple_party_member_connected_sample_body :: proc(
 	simple_server_state: ^Simple_Server_State,
 	allocator := context.allocator,
 ) -> ([]byte, bool) {
+	if len(simple_server_state.party_member_connected_raw_override) > 0 {
+		return simple_server_state.party_member_connected_raw_override, true
+	}
 	if g_simple_raknet_samples_text == "" || simple_server_state.steam_id == "" do return nil, false
 	body, ok := simple_captured_push_sample_for_steam(
 		g_simple_raknet_samples_text,
@@ -956,6 +962,7 @@ simple_party_member_connected_sample_body :: proc(
 	if len(sample_connected.member.session_token) > 0 {
 		connected.member.session_token = sample_connected.member.session_token
 	}
+	connected.member.session_token = simple_party_session_token(simple_server_state, allocator)
 	dynamic_body := encode_party_member_connected_body(
 		connected,
 		allocator,

@@ -38,6 +38,7 @@ DEFAULT_DTLIVE_PORT :: 8080
 MAX_UDP_SIZE :: 65535 // largest a single UDP datagram can be
 MAX_UDP_DATAGRAMS :: 4096 // capacity of one UDP_Datagram_Store
 MAX_RAKNET_MESSAGES :: 4096 // capacity of one RakNet_Message_Store
+MAX_SIMPLE_DELAY_CLIENTS :: 16
 BYTE_POOL_SIZE :: 4 * 1024 * 1024
 
 Error :: union #shared_nil {
@@ -69,6 +70,17 @@ Relay_Write_Record :: struct {
 	hex:  string,
 }
 
+Relay_Simple_Write_Record :: struct {
+	t:   string,
+	src: string,
+	dst: string,
+	hex: string,
+}
+
+Reassembly :: struct {
+	splits: [MAX_SPLITS]Split_Buffer,
+}
+
 // One in-flight fragmented message, collected by split_id until all `count`
 // fragments arrive, then concatenated in index order. Fragment payloads are
 // slices into the datagram store's append-only pool, which stays stable, so no
@@ -80,10 +92,6 @@ Split_Buffer :: struct {
 	count:  u32,
 	have:   u32,
 	frags:  [MAX_FRAGMENTS][]byte,
-}
-
-Reassembly :: struct {
-	splits: [MAX_SPLITS]Split_Buffer,
 }
 
 main :: proc() {
@@ -98,6 +106,30 @@ main :: proc() {
 	err: Error
 	if len(args) > 2 && args[1] == "sync" {
 		err = sync_replay(args[2])
+	} else if len(args) > 2 && args[1] == "capture-text" {
+		if len(args) > 3 {
+			err = capture_to_text(args[2], args[3])
+		} else {
+			out_path := strings.concatenate({args[2], ".text.jsonl"}, context.allocator)
+			defer delete(out_path)
+			err = capture_to_text(args[2], out_path)
+		}
+	} else if len(args) > 2 && args[1] == "capture-simple-sv" {
+		if len(args) > 3 {
+			err = capture_simple_sv(args[2], args[3])
+		} else {
+			out_path := strings.concatenate({args[2], ".simple-sv.jsonl"}, context.allocator)
+			defer delete(out_path)
+			err = capture_simple_sv(args[2], out_path)
+		}
+	} else if len(args) > 2 && args[1] == "annotate-capture" {
+		if len(args) > 3 {
+			err = annotate_capture(args[2], args[3])
+		} else {
+			out_path := strings.concatenate({args[2], ".annotated"}, context.allocator)
+			defer delete(out_path)
+			err = annotate_capture(args[2], out_path)
+		}
 	} else if len(args) > 2 && args[1] == "predict-caleb" {
 		err = predict_caleb(datagrams, msgs, reasm, args[2])
 	} else if len(args) > 2 && args[1] == "simple-backup" {
@@ -244,6 +276,10 @@ net_relay_listen :: proc(
 	msgs: ^RakNet_Message_Store,
 	reasm: ^Reassembly,
 ) -> Error {
+	simple_delay_ms := env_int("RELAY_SIMPLE_DELAY_MS", 0)
+	if simple_delay_ms == 0 && env_truthy("RELAY_SIMPLE_DELAY") do simple_delay_ms = 500
+	if simple_delay_ms > 0 do return net_simple_delay_relay_listen(simple_delay_ms)
+
 	bind_addr := net.parse_address(LISTEN_HOST)
 	sock := net.make_bound_udp_socket(bind_addr, LISTEN_PORT) or_return
 	defer net.close(sock)
@@ -528,24 +564,195 @@ net_relay_listen :: proc(
 	return nil
 }
 
+Relay_Simple_Delay_Item :: struct {
+	client_index: int,
+	to_upstream:  bool,
+	data:         []byte,
+	deadline:     i64,
+}
+
+net_simple_delay_relay_listen :: proc(delay_ms: int) -> Error {
+	bind_addr := net.parse_address(LISTEN_HOST)
+	sock := net.make_bound_udp_socket(bind_addr, LISTEN_PORT) or_return
+	defer net.close(sock)
+
+	log_scratch_backing := make([]byte, MAX_UDP_SIZE * 4 + 4096)
+	defer delete(log_scratch_backing)
+	log_scratch_arena: mem.Arena
+	mem.arena_init(&log_scratch_arena, log_scratch_backing)
+	log_scratch := mem.arena_allocator(&log_scratch_arena)
+
+	upstream_text := env_string("RAKNET_RELAY_UPSTREAM", DEFAULT_RELAY_UPSTREAM)
+	upstream := net.resolve_ip4(upstream_text) or_return
+	if upstream.port == LISTEN_PORT {
+		fmt.eprintfln(
+			"warning: RAKNET_RELAY_UPSTREAM=%s uses the relay listen port; if this is the local relay address, use the real upstream server instead (default %s)",
+			upstream_text,
+			DEFAULT_RELAY_UPSTREAM,
+		)
+	}
+	capture_path := env_string("RELAY_CAPTURE", DEFAULT_RELAY_CAPTURE)
+	os.remove(capture_path)
+	capture := os.open(capture_path, {.Write, .Create, .Append}) or_return
+	defer os.close(capture)
+
+	http_port := env_int("PROBE_PORT", DEFAULT_DTLIVE_PORT)
+	http_sock, http_enabled := dtlive_try_listen(bind_addr, http_port)
+
+	clients: [dynamic]Relay_Client
+	pending: [dynamic]Relay_Simple_Delay_Item
+	buf: [MAX_UDP_SIZE]byte
+	polls: [128]posix.pollfd
+	self_loop_warned := false
+	client_cap_warned := false
+
+	fmt.printfln(
+		"caleb_raknet simple-delay relay listening on %s:%d -> %s; capture -> %s; delay=%dms; predictor=off",
+		LISTEN_HOST,
+		LISTEN_PORT,
+		upstream_text,
+		capture_path,
+		delay_ms,
+	)
+
+	for {
+		now_tick := time.tick_now()._nsec
+		released := false
+		for i := 0; i < len(pending); {
+			item := pending[i]
+			if item.deadline > now_tick {
+				i += 1
+				continue
+			}
+			if item.client_index >= 0 && item.client_index < len(clients) {
+				if item.to_upstream {
+					net.send_udp(clients[item.client_index].socket, item.data, upstream)
+				} else {
+					net.send_udp(sock, item.data, clients[item.client_index].client)
+				}
+			}
+			delete(item.data)
+			ordered_remove(&pending, i)
+			released = true
+		}
+		if released do continue
+
+		poll_timeout := 1000
+		now_tick = time.tick_now()._nsec
+		for item in pending {
+			ms := int((item.deadline - now_tick) / i64(time.Millisecond))
+			if ms < 0 do ms = 0
+			if ms < poll_timeout do poll_timeout = ms
+		}
+
+		max_client_polls := len(polls) - 1
+		if http_enabled do max_client_polls -= 1
+		poll_client_count := len(clients)
+		if poll_client_count > max_client_polls do poll_client_count = max_client_polls
+		poll_count := 1 + poll_client_count
+		http_poll_index := -1
+		polls[0] = posix.pollfd{fd = udp_fd(sock), events = {.IN}}
+		for client, i in clients[:poll_client_count] {
+			polls[i + 1] = posix.pollfd{fd = udp_fd(client.socket), events = {.IN}}
+		}
+		if http_enabled {
+			http_poll_index = poll_count
+			polls[http_poll_index] = posix.pollfd{fd = tcp_fd(http_sock), events = {.IN}}
+			poll_count += 1
+		}
+
+		ready := posix.poll(&polls[0], posix.nfds_t(poll_count), i32(poll_timeout))
+		if ready <= 0 do continue
+		if http_poll_index >= 0 && .IN in polls[http_poll_index].revents {
+			dtlive_handle_one(http_sock, log_scratch)
+		}
+
+		if .IN in polls[0].revents {
+			n, remote := net.recv_udp(sock, buf[:]) or_continue
+			if n > 0 {
+				if relay_simple_is_own_upstream_socket(clients[:], remote) {
+					if !self_loop_warned {
+						fmt.eprintfln(
+							"simple-delay relay ignored packet from its own upstream socket (%v); RAKNET_RELAY_UPSTREAM is probably pointing back at this relay",
+							remote,
+						)
+						self_loop_warned = true
+					}
+					continue
+				}
+				if len(clients) >= MAX_SIMPLE_DELAY_CLIENTS && relay_client_index(&clients, remote) < 0 {
+					if !client_cap_warned {
+						fmt.eprintfln(
+							"simple-delay relay ignoring additional client endpoints after %d clients; check for an upstream self-loop or noisy scan traffic",
+							MAX_SIMPLE_DELAY_CLIENTS,
+						)
+						client_cap_warned = true
+					}
+					continue
+				}
+				idx := relay_client_index_or_create(&clients, remote)
+				if idx >= 0 {
+					client := &clients[idx]
+					log_relay_simple_datagram(capture, log_scratch, client.peer, "SV", time.now(), buf[:n])
+					copy_data := make([]byte, n, context.allocator)
+					copy(copy_data, buf[:n])
+					append(&pending, Relay_Simple_Delay_Item{client_index = idx, to_upstream = true, data = copy_data, deadline = time.tick_now()._nsec + i64(delay_ms) * i64(time.Millisecond)})
+				}
+			}
+		}
+
+		for i in 0 ..< poll_client_count {
+			if !(.IN in polls[i + 1].revents) do continue
+			n, _ := net.recv_udp(clients[i].socket, buf[:]) or_continue
+			if n <= 0 do continue
+			log_relay_simple_datagram(capture, log_scratch, "SV", clients[i].peer, time.now(), buf[:n])
+			copy_data := make([]byte, n, context.allocator)
+			copy(copy_data, buf[:n])
+			append(&pending, Relay_Simple_Delay_Item{client_index = i, to_upstream = false, data = copy_data, deadline = time.tick_now()._nsec + i64(delay_ms) * i64(time.Millisecond)})
+		}
+	}
+	return nil
+}
+
 relay_client_index_or_create :: proc(
 	clients: ^[dynamic]Relay_Client,
 	remote: net.Endpoint,
 ) -> int {
 	idx := relay_client_index(clients, remote)
 	if idx >= 0 do return idx
-	up_sock, err := net.make_unbound_udp_socket(.IP4)
+	up_sock, err := net.make_bound_udp_socket(net.parse_address("0.0.0.0"), 0)
 	if err != nil {
 		fmt.eprintfln("relay upstream socket create failed -> %v", err)
 		return -1
 	}
 	idx = len(clients^)
+	upstream_local_port := relay_socket_local_port(up_sock)
 	append(
 		clients,
-		Relay_Client{client = remote, peer = relay_peer_label(idx + 1), socket = up_sock},
+		Relay_Client{client = remote, peer = relay_peer_label(idx + 1), socket = up_sock, upstream_local_port = upstream_local_port},
 	)
 	fmt.printfln("relay client %s -> %v", clients^[idx].peer, remote)
 	return idx
+}
+
+relay_socket_local_port :: proc(sock: net.UDP_Socket) -> u16 {
+	addr: posix.sockaddr_in
+	addr_len := posix.socklen_t(size_of(addr))
+	if posix.getsockname(udp_fd(sock), (^posix.sockaddr)(&addr), &addr_len) != .OK do return 0
+	return u16(addr.sin_port)
+}
+
+relay_simple_is_own_upstream_socket :: proc(clients: []Relay_Client, remote: net.Endpoint) -> bool {
+	for client in clients {
+		if client.upstream_local_port == 0 do continue
+		if remote.port == int(client.upstream_local_port) do return true
+		if remote.port == int(byte_swap_u16(client.upstream_local_port)) do return true
+	}
+	return false
+}
+
+byte_swap_u16 :: proc(value: u16) -> u16 {
+	return (value >> 8) | (value << 8)
 }
 
 relay_handle_c2s :: proc(
@@ -731,7 +938,7 @@ relay_release_due :: proc(
 	return released
 }
 
-relay_handle_s2c :: proc(
+	relay_handle_s2c :: proc(
 	sock: net.UDP_Socket,
 	clients: []Relay_Client,
 	idx: int,
@@ -746,14 +953,8 @@ relay_handle_s2c :: proc(
 	log_scratch: mem.Allocator,
 	predict_scratch: mem.Allocator,
 	takeover: ^Relay_Takeover,
-	gate_ms := 0,
+	gate_ms: int,
 ) {
-	if idx < 0 || idx >= len(clients) do return
-	if relay_takeover_active(takeover) do return
-	// Client datagrams are always forwarded to the upstream verbatim (immediate mode
-	// and raw-delay mode both preserve the client's own sequence space), so the
-	// upstream's ACK/NAK reference sequence numbers the client knows. Forward
-	// everything to the client unchanged, in both directions.
 	net.send_udp(sock, data, clients[idx].client)
 	if !is_content_datagram(data) || datagram_is_health_channel(data) do return
 	relay_client_observe_s2c(&clients[idx], data)
@@ -1247,6 +1448,7 @@ Relay_Client :: struct {
 	client:  net.Endpoint,
 	peer:    string,
 	socket:  net.UDP_Socket,
+	upstream_local_port: u16,
 	stage:   int,
 	s2c_seen: bool,
 	next_s2c_datagram: u32,
@@ -1293,7 +1495,6 @@ env_truthy :: proc(key: string) -> bool {
 		value != "NO" \
 	)
 }
-
 env_string :: proc(key, fallback: string, allocator := context.allocator) -> string {
 	value := os.get_env(key, allocator)
 	if value == "" do return fallback
@@ -1495,7 +1696,7 @@ relay_stage_refine_after_message :: proc(
 	case Scene_Message:
 		scene := relay_stage_scene_for_handle(live, label, m.scene_handle)
 		if predict_caleb_is_party_scene(scene) || (m.scene_handle >= 144 && m.scene_handle <= 147) {
-			if m.route_handle == 0 do return max(stage, Relay_Stage_Party_Join_Ack)
+			if m.route_handle == 0 do return max(stage, Relay_Stage_Party_Join_Ready + 1)
 			if m.route_handle == 3 do return max(stage, Relay_Stage_Party_Join_Complete)
 			if m.route_handle == 11 do return max(stage, Relay_Stage_Party_Join_State)
 			if m.route_handle == 6 || m.route_handle == 9 do return max(stage, Relay_Stage_Party_Join_Userdata)
@@ -2759,20 +2960,24 @@ predict_caleb_step :: proc(
 					// memberConnected self-broadcast at party version 8: joiner sees the
 					// joiner slot (rpc 9), host the host slot (rpc 10) of the global counter.
 					mc_rpc := party_broadcast_rpc(8, predict_caleb_is_joiner(live, txn.label))
-					append_scene_message(
-						&txn.preds,
-						decoded.scene_handle,
-						9,
-						party_member_connected_body_with_userdata(
-							ident,
-							mc_rpc,
-							8,
-							0,
-							userdata_json,
+					pred_count := len(txn.preds)
+					append_captured_push_rpc(&txn.preds, live.raknet_samples_text, "party/party.memberConnected", ident, decoded.scene_handle, 9, 1, mc_rpc, scratch)
+					if len(txn.preds) == pred_count {
+						append_scene_message(
+							&txn.preds,
+							decoded.scene_handle,
+							9,
+							party_member_connected_body_with_userdata(
+								ident,
+								mc_rpc,
+								8,
+								0,
+								userdata_json,
+								scratch,
+							),
 							scratch,
-						),
-						scratch,
-					)
+						)
+					}
 				} else if decoded.scene_handle == 146 && decoded.decoded.rpc_id == 3584 {
 					// The member readied just before this completion, so the backend
 					// rejects the in-flight data update with an rpc.error rather than
@@ -3628,7 +3833,11 @@ render_decoded_burst :: proc(
 			if body.kind != .Unknown do return "stormancer.rpc.next"
 			if scene_body_has_token_envelope(sm.decoded) do return "stormancer.rpc.next"
 		}
+		if sm.scene_handle >= 144 && sm.route_handle == 3 do return "party.memberDataUpdated"
+		if sm.scene_handle >= 144 && sm.route_handle == 9 do return "party.memberConnected"
 		if sm.scene_handle >= 144 && sm.route_handle == 7 do return "party.settingsUpdated"
+		if sm.scene_handle >= 144 && sm.route_handle == 8 do return "party.memberStatusUpdated"
+		if sm.scene_handle >= 144 && sm.route_handle == 15 do return "Steam.JoinLobby"
 		if sm.scene_handle == 141 && sm.route_handle == 19 do return "Locator.GetSceneConnectionToken"
 		return ""
 	}
@@ -4696,6 +4905,16 @@ party_settings_value_for_scene :: proc(
 }
 
 party_session_token :: proc(peer: string, allocator := context.allocator) -> []byte {
+	if peer == "C2" {
+		token_hex := "D5203BF88D2D5C4F986273B929170CFA"
+		decoded, ok := hex.decode(transmute([]byte)token_hex, allocator)
+		if ok do return decoded
+	}
+	if peer == "C1" {
+		token_hex := "06971E95F907CA43BDF1322551F7E02C"
+		decoded, ok := hex.decode(transmute([]byte)token_hex, allocator)
+		if ok do return decoded
+	}
 	out := make([]byte, 16, allocator)
 	seed: u8 = 0x11
 	if peer == "C2" do seed = 0x22
@@ -5408,6 +5627,12 @@ captured_push_sample :: proc(
 		if ok do return body
 		return nil
 	}
+	if key == "party/party.memberConnected" && peer == "C2" && index == 1 {
+		hex_text: string = "0a000896d920343136386666623234646532343566383830363064323763393538303638356500c501797b225265717565737465644865726f223a332c22526571756573746564536b696e223a302c22496e4c6f626279223a747275652c22506c617965724e616d65223a224d616a6f7220486f6666222c224c6f6262795374617465223a312c22556e6c6f636b656447616d65446966666963756c7479223a302c224d656d62657244617461496e697469616c697a6564223a747275652c22556e6c6f636b65644865726f466c6167223a33312c226d5f73456f73557365724964223a223030303265613263373066613466383961356438373630363561353563373836222c226d5f73537465616d557365724964223a37363536313139373937373837303236372c226d5f75566f696365436861744d6f6465223a302c226d5f65506c6174666f726d223a322c2252616e646f6d536b696e496e646578223a5b302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c302c305d7dc410d5203bf88d2d5c4f986273b929170cfa9196a5737465616dd9203431363866666232346465323435663838303630643237633935383036383565a9616e6f6e796d6f7573b13736353631313937393737383730323637c000020595e2a2b741c410e70d0689a324194b8df909ee3b21d329ad70617373746563682d6c697665ac6c6976652d312d30352d3030a96461726b74616c6573ad61757468656e74696361746f7200c3d93f2f6461726b74616c65732f6c6976652d312d30352d30302f32353634643862652d326462622d343936372d623662622d3065313537616137663633662f313f0300000012c4109a641f8beacfda4e93bed6a03dc317eb00000006a5706172747900000026d92432333239663631362d343962362d346431662d383230392d3266396263366565386430362cf72b77c0ac03fcb5d2649675d7d4ea0e23bcb61f94ecb6b6db87d0c7e61022b822d9932bc034a558428827525c4e329108b3157f64ab3a85324c2de024bffc50072605ff0476c5fd8e4b1851946b88b72ae476ba7d736ffde4037998a158b882a77546596e2a31326aebb2c303bf504adf178703cc041e41c0a3c5871aedfa0cd053e59271d7b3c5bb4420724473862b1a1c9cc7422670c7aa924d19c91d02f82609c34e702ec7599f1e7ab0c893d4b7955094846ab5c16ba8eb4cf64de1690703bc9f4603037b2a1e8494acfa235d48e3a01fca41dd08923c8e5be5c89a29fc0618870d65411087262c0ef17370d6bf0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+		body, ok := hex.decode(transmute([]byte)hex_text, allocator)
+		if ok do return body
+		return nil
+	}
 	key_needle := fmt.aprintf("\"%s\"", key, allocator = allocator)
 	start := strings.index(text, key_needle)
 	if start < 0 do return nil
@@ -5850,6 +6075,38 @@ log_relay_datagram :: proc(
 	os.write(log, transmute([]byte)strings.to_string(b))
 }
 
+log_relay_simple_datagram :: proc(
+	log: ^os.File,
+	scratch: mem.Allocator,
+	src, dst: string,
+	recv_time: time.Time,
+	bytes: []byte,
+) {
+	if log == nil do return
+	free_all(scratch)
+
+	rec: Relay_Simple_Write_Record
+	rec.t = relay_padded_timestamp(recv_time, scratch)
+	rec.src = src
+	rec.dst = dst
+	rec.hex = string(hex.encode(bytes, scratch))
+
+	b := strings.builder_make_len_cap(0, MAX_UDP_SIZE * 2 + 256, scratch)
+	opt: json.Marshal_Options
+	if json.marshal_to_builder(&b, rec, &opt) != nil do return
+	strings.write_byte(&b, '\n')
+	os.write(log, transmute([]byte)strings.to_string(b))
+}
+
+relay_padded_timestamp :: proc(value: time.Time, allocator := context.allocator) -> string {
+	stamp, _ := time.time_to_rfc3339(value, allocator = allocator)
+	if len(stamp) >= 30 do return stamp
+	b := strings.builder_make_len_cap(0, 30, allocator)
+	strings.write_string(&b, stamp)
+	for _ in len(stamp) ..< 30 do strings.write_byte(&b, '-')
+	return strings.to_string(b)
+}
+
 predict_caleb_live_write :: proc(live: ^Predict_Caleb_Live, out_path: string) {
 	allocator := live.write_scratch
 	free_all(allocator)
@@ -5977,10 +6234,12 @@ predict_caleb :: proc(
 		dg, ok := hex.decode(transmute([]byte)rec.hex, scratch)
 		if !ok do continue
 		if datagram_is_health_channel(dg) do continue
+		peer, dir, ok_dir := relay_record_peer_dir(rec)
+		if !ok_dir do continue
 
-		ps := find_peer(&peers, rec.peer, &nidx)
+		ps := find_peer(&peers, peer, &nidx)
 
-		if rec.dir == "s2c" {
+		if dir == "s2c" {
 			if is_content_datagram(dg) {
 				real_msgs := filter_health_messages(
 					reassemble_side(ps, .Real, {dg}, scratch),
@@ -6000,7 +6259,7 @@ predict_caleb :: proc(
 			}
 			continue
 		}
-		if rec.dir != "c2s" do continue
+		if dir != "c2s" do continue
 		if !is_content_datagram(dg) do continue
 
 		sent_msgs := filter_health_messages(reassemble_side(ps, .C2S, {dg}, scratch), scratch)
@@ -6031,7 +6290,7 @@ predict_caleb :: proc(
 				}
 			}
 		}
-		txn.label = rec.peer
+		txn.label = peer
 		txn.window_open = true
 		for msg in sent_msgs do append(&ps.sent_msgs, msg)
 		for msg in sent_msgs do append(&txn.sent_msgs, msg)
@@ -6676,20 +6935,24 @@ predict_caleb :: proc(
 							8,
 							predict_caleb_label_is_joiner(joiner_label, txn.label),
 						)
-						append_scene_message(
-							&txn.preds,
-							decoded.scene_handle,
-							9,
-							party_member_connected_body_with_userdata(
-								txn_identity,
-								mc_rpc,
-								8,
-								0,
-								userdata_json,
+						pred_count := len(txn.preds)
+						append_captured_push_rpc(&txn.preds, raknet_samples_text, "party/party.memberConnected", txn_identity, decoded.scene_handle, 9, 1, mc_rpc, scratch)
+						if len(txn.preds) == pred_count {
+							append_scene_message(
+								&txn.preds,
+								decoded.scene_handle,
+								9,
+								party_member_connected_body_with_userdata(
+									txn_identity,
+									mc_rpc,
+									8,
+									0,
+									userdata_json,
+									scratch,
+								),
 								scratch,
-							),
-							scratch,
-						)
+							)
+						}
 					} else if decoded.scene_handle == 146 && decoded.decoded.rpc_id == 3584 {
 						// The member readied just before this completion, so the backend
 						// rejects the in-flight data update with an rpc.error rather than

@@ -59,7 +59,11 @@ get_response_from_scene_message :: proc(
 		   (!party_handle_ok || u64(message.scene_handle) != party_handle) &&
 		   body.rpc_id == stormancer_rpc_completed_id(8, true) {
 			if raw, ok := simple_party_member_connected_sample_body(10, simple_server_state); ok {
-				append_decoded_message(&response_messages, message.scene_handle, get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberConnected"), raw)
+				msg := make([dynamic]byte, context.temp_allocator)
+				append(&msg, message.scene_handle)
+				write_u16_le(&msg, get_route_num_from_handle(simple_server_state, u64(message.scene_handle), "party.memberConnected"))
+				append(&msg, ..raw)
+				append(&response_messages, decode_message(msg[:]))
 			} else {
 				append(
 					&response_messages,
@@ -705,7 +709,8 @@ get_response_from_scene_message :: proc(
 			)
 			simple_server_state.pending_response_complete_req = 0
 		}
-		invitation_code := simple_invitation_code(client_id)
+		invitation_code := simple_server_state.invitation_code_override
+		if invitation_code == "" do invitation_code = simple_invitation_code(client_id)
 		if g_simple_party_scene_by_invite != nil {
 			if party_handle, ok := simple_first_party_scene_handle(simple_server_state); ok {
 				party, _ := simple_scene_from_handle(simple_server_state, party_handle)
