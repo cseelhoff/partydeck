@@ -361,7 +361,11 @@ pub fn launch_cmds(
         if !h.env.is_empty() {
             for env_var in h.env.split_whitespace() {
                 if let Some((key, value)) = env_var.split_once('=') {
-                    cmd.env(key, value);
+                    if value.contains("$INSTANCENUM") {
+                        cmd.env(key, value.replace("$INSTANCENUM", &i.to_string()));
+                    } else {
+                        cmd.env(key, value);
+                    }
                 }
             }
         }
