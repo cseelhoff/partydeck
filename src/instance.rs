@@ -20,7 +20,7 @@ pub fn set_instance_resolutions(
     let (basewidth, baseheight) = (primary_monitor.width(), primary_monitor.height());
     let playercount = instances.len();
 
-    for instance in instances {
+    for (player_index, instance) in instances.iter_mut().enumerate() {
         let (mut w, mut h) = match playercount {
             1 => (basewidth, baseheight),
             2 => {
@@ -28,6 +28,13 @@ pub fn set_instance_resolutions(
                     (basewidth / 2, baseheight)
                 } else {
                     (basewidth, baseheight / 2)
+                }
+            }
+            5 if !cfg.vertical_two_player => {
+                if player_index < 3 {
+                    (basewidth / 3, baseheight / 2)
+                } else {
+                    (basewidth / 2, baseheight / 2)
                 }
             }
             _ => (basewidth / 2, baseheight / 2),
@@ -53,7 +60,10 @@ pub fn set_instance_resolutions_multimonitor(
         mon_playercounts[mon] += 1;
     }
 
+    let mut mon_playerindices: Vec<usize> = vec![0; monitors.len()];
     for instance in instances.iter_mut() {
+        let player_index = mon_playerindices[instance.monitor];
+        mon_playerindices[instance.monitor] += 1;
         let playercount = mon_playercounts[instance.monitor];
         let (basewidth, baseheight) = (
             monitors[instance.monitor].width(),
@@ -67,6 +77,13 @@ pub fn set_instance_resolutions_multimonitor(
                     (basewidth / 2, baseheight)
                 } else {
                     (basewidth, baseheight / 2)
+                }
+            }
+            5 if !cfg.vertical_two_player => {
+                if player_index < 3 {
+                    (basewidth / 3, baseheight / 2)
+                } else {
+                    (basewidth / 2, baseheight / 2)
                 }
             }
             _ => (basewidth / 2, baseheight / 2),
@@ -109,6 +126,13 @@ pub fn normalized_layout(player_count: usize, vertical: bool) -> Vec<(f32, f32, 
             (0.0, 0.5, 0.5, 0.5),
             (0.5, 0.5, 0.5, 0.5),
         ],
+        5 if !vertical => vec![
+            (0.0, 0.0, 1.0 / 3.0, 0.5),
+            (1.0 / 3.0, 0.0, 1.0 / 3.0, 0.5),
+            (2.0 / 3.0, 0.0, 1.0 / 3.0, 0.5),
+            (0.0, 0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5, 0.5),
+        ],
         n => {
             // Beyond what the KWin scripts handle; fall back to an even grid so
             // the preview still communicates relative placement.
@@ -136,5 +160,20 @@ pub fn set_instance_names(instances: &mut Vec<Instance>, profiles: &[String]) {
         } else {
             instance.profname = profiles[instance.profselection].to_owned();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_layout;
+
+    #[test]
+    fn horizontal_five_player_layout_fills_both_rows() {
+        let layout = normalized_layout(5, false);
+
+        assert_eq!(layout[0], (0.0, 0.0, 1.0 / 3.0, 0.5));
+        assert_eq!(layout[2], (2.0 / 3.0, 0.0, 1.0 / 3.0, 0.5));
+        assert_eq!(layout[3], (0.0, 0.5, 0.5, 0.5));
+        assert_eq!(layout[4], (0.5, 0.5, 0.5, 0.5));
     }
 }
