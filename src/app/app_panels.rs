@@ -80,7 +80,7 @@ impl PartyApp {
                     },
                     false => format!("(Frozen) v{}", env!("CARGO_PKG_VERSION")),
                 };
-                ui.hyperlink_to(version_label, "https://github.com/wunnr/partydeck/releases");
+                ui.hyperlink_to(version_label, "https://github.com/partydeck/partydeck/releases");
                 ui.add(egui::Separator::default().vertical());
                 ui.hyperlink_to("⮋", "https://drive.proton.me/urls/D9HBKM18YR#zG8XC8yVy9WL")
                     .on_hover_text("Download Game Handlers");
@@ -88,10 +88,10 @@ impl PartyApp {
                     .on_hover_text("Support PartyDeck Development");
                 ui.hyperlink_to(
                     "🖹",
-                    "https://github.com/wunnr/partydeck/tree/main?tab=License-2-ov-file",
+                    "https://github.com/partydeck/partydeck/tree/main?tab=License-2-ov-file",
                 )
                 .on_hover_text("Third-Party Licenses");
-                ui.hyperlink_to("", "https://github.com/wunnr/partydeck")
+                ui.hyperlink_to("", "https://github.com/partydeck/partydeck")
                     .on_hover_text("GitHub");
             });
         });
@@ -102,19 +102,16 @@ impl PartyApp {
         ui.horizontal(|ui| {
             ui.heading("Games");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("➕").clicked() {
+                if ui.button("➕ New").clicked() {
                     self.handler_edit = Some(Handler::default());
                     self.cur_page = MenuPage::EditHandler;
                 }
-                if ui.button("⬇").clicked() {
+                if ui.button("⬇ Import").clicked() {
                     if let Err(e) = import_pd2() {
                         msg("Error", &format!("Error importing PD2: {}", e));
                     } else {
                         self.handlers = scan_handlers();
                     }
-                }
-                if ui.button("🔄").clicked() {
-                    self.handlers = scan_handlers();
                 }
             });
         });
@@ -126,7 +123,7 @@ impl PartyApp {
 
     pub fn display_panel_bottom(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("info_panel")
-            .exact_height(100.0)
+            .exact_height(80.0)
             .show(ctx, |ui| {
                 if self.task.is_some() {
                     ui.disable();

@@ -26,13 +26,14 @@ pub enum MenuPage {
 #[derive(Eq, PartialEq)]
 pub enum SettingsPage {
     General,
-    Proton,
     Gamescope,
+    Handler,
 }
 
 pub struct PartyApp {
     pub installed_steamapps: Vec<Option<steamlocate::App>>,
     pub needs_update: Arc<AtomicBool>,
+    pub running_in_plasma: bool,
     pub options: PartyConfig,
     pub cur_page: MenuPage,
     pub settings_page: SettingsPage,
@@ -49,7 +50,8 @@ pub struct PartyApp {
     pub handler_edit: Option<Handler>,
     pub handler_lite: Option<Handler>,
 
-    pub loading_msg: Option<String>,
+    pub loading_msg: Option<String>, // Base message + elapsed time appended if needed
+    pub loading_base_msg: Option<String>, // The message a task started with
     pub loading_since: Option<std::time::Instant>,
     #[allow(dead_code)]
     pub task: Option<std::thread::JoinHandle<()>>,
@@ -77,6 +79,9 @@ impl PartyApp {
         let mut app = Self {
             installed_steamapps: get_installed_steamapps(),
             needs_update: Arc::new(AtomicBool::new(false)),
+            running_in_plasma: std::env::var("XDG_CURRENT_DESKTOP")
+                .map(|d| d == "KDE")
+                .unwrap_or(false),
             options,
             cur_page,
             settings_page: SettingsPage::General,
@@ -91,9 +96,22 @@ impl PartyApp {
             handler_lite,
             profiles: scan_profiles(false),
             loading_msg: None,
+            loading_base_msg: None,
             loading_since: None,
             task: None,
         };
+
+        // SteamOS gaming mode nested kwin will have XDG_CURRENT_DESKTOP=gamescope
+        // but HOMETEST_DESKTOP_SESSION=plasma
+        if std::env::var("HOMETEST_DESKTOP_SESSION")
+            .map(|d| d == "plasma")
+            .unwrap_or(false) {
+            app.running_in_plasma = true;
+        }
+
+        if !app.running_in_plasma {
+            app.options.enable_kwin_script = false;
+        }
 
         if app.options.check_for_updates {
             let needs_update = app.needs_update.clone();
@@ -172,14 +190,18 @@ impl eframe::App for PartyApp {
                 let _ = handle.join();
                 self.loading_since = None;
                 self.loading_msg = None;
+                self.loading_base_msg = None;
             } else {
                 self.task = Some(handle);
             }
         }
         if let Some(start) = self.loading_since {
-            if start.elapsed() > std::time::Duration::from_secs(60) {
-                // Give up waiting after one minute
-                self.loading_msg = Some("Operation timed out".to_string());
+            // Display how long the task has been running for
+            let secs = start.elapsed().as_secs();
+            if secs > 20 {
+                if let Some(base) = &self.loading_base_msg {
+                    self.loading_msg = Some(format!("{base} ({secs}s)"));
+                }
             }
         }
         if let Some(msg) = &self.loading_msg {
@@ -212,6 +234,7 @@ impl PartyApp {
         F: FnOnce() + Send + 'static,
     {
         self.loading_msg = Some(msg.to_string());
+        self.loading_base_msg = Some(msg.to_string());
         self.loading_since = Some(std::time::Instant::now());
         self.task = Some(std::thread::spawn(f));
     }
@@ -340,14 +363,29 @@ impl PartyApp {
                         self.prepare_game_launch();
                     }
                 }
+                // Left/Right cycle the player's profile (remembered per controller).
+                // Up/Down move the player to another monitor when the SDL backend is
+                // on, otherwise they reorder the players.
                 Some(PadButton::Left) => {
                     self.cycle_instance_profile(i, -1);
                 }
                 Some(PadButton::Right) => {
                     self.cycle_instance_profile(i, 1);
                 }
-                Some(PadButton::Up) => self.move_device_instance(i, -1),
-                Some(PadButton::Down) => self.move_device_instance(i, 1),
+                Some(PadButton::Down) => {
+                    if self.options.gamescope_sdl_backend {
+                        self.cycle_instance_monitor(i, 1);
+                    } else {
+                        self.move_device_instance(i, 1);
+                    }
+                }
+                Some(PadButton::Up) => {
+                    if self.options.gamescope_sdl_backend {
+                        self.cycle_instance_monitor(i, -1);
+                    } else {
+                        self.move_device_instance(i, -1);
+                    }
+                }
                 _ => {}
             }
             i += 1;
@@ -371,6 +409,24 @@ impl PartyApp {
         let count = self.profiles.len() as i32;
         let cur = self.instances[inst].profselection as i32;
         self.instances[inst].profselection = (cur + dir).rem_euclid(count) as usize;
+    }
+
+    // Move the player owning `dev` to the next (+1) or previous (-1) monitor,
+    // wrapping around. No-op while inviting a device or if `dev` isn't a player.
+    fn cycle_instance_monitor(&mut self, dev: usize, dir: i32) {
+        if self.instance_add_dev.is_some() || self.monitors.is_empty() {
+            return;
+        }
+        let Some(inst) = self
+            .instances
+            .iter()
+            .position(|ins| ins.devices.contains(&dev))
+        else {
+            return;
+        };
+        let count = self.monitors.len() as i32;
+        let cur = self.instances[inst].monitor as i32;
+        self.instances[inst].monitor = (cur + dir).rem_euclid(count) as usize;
     }
 
     // Candidate profile keys for a device, ordered most specific (per-unit) to
@@ -521,30 +577,28 @@ impl PartyApp {
     }
 
     pub fn prepare_game_launch(&mut self) {
-        if self.options.gamescope_sdl_backend {
-            set_instance_resolutions_multimonitor(
-                &mut self.instances,
-                &self.monitors,
-                &self.options,
-            );
-        } else {
-            set_instance_resolutions(&mut self.instances, &self.monitors[0], &self.options);
-        }
-        set_instance_names(&mut self.instances, &self.profiles);
-
-        self.remember_instance_profiles();
-
         let handler = if let Some(h) = self.handler_lite.clone() {
             h
         } else {
             cur_handler!(self).to_owned()
         };
 
+        // Before save_cfg, so each controller's chosen profile is persisted.
+        self.remember_instance_profiles();
+        let _ = save_cfg(&self.options);
+
+        // Apply config overrides from handler settings to active config
+        let cfg = self.options.with_overrides(&handler.overrides);
+
+        if self.options.gamescope_sdl_backend {
+            set_instance_resolutions_multimonitor(&mut self.instances, &self.monitors, &cfg);
+        } else {
+            set_instance_resolutions(&mut self.instances, &self.monitors[0], &cfg);
+        }
+        set_instance_names(&mut self.instances, &self.profiles);
+
         let instances = self.instances.clone();
         let dev_infos: Vec<DeviceInfo> = self.input_devices.iter().map(|p| p.info()).collect();
-
-        let cfg = self.options.clone();
-        let _ = save_cfg(&cfg);
 
         self.cur_page = MenuPage::Home;
         self.spawn_task(

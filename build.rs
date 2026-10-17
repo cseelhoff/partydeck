@@ -1,5 +1,5 @@
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
+
 #[cfg(feature = "build_gamescope")]
 use std::path::PathBuf;
 
@@ -30,8 +30,8 @@ const DEPS: &[Dep] = &[
         asset_contains: "emu-linux-release.tar.bz2",
         archive_name: "emu-linux-release.tar.bz2",
         format: ArchFmt::TarBz2,
-        static_url: "https://github.com/Detanup01/gbe_fork/releases/download/release-2026_03_10/emu-linux-release.tar.bz2",
-        static_hash: "032500ca100b72fd2daa94eec3263cf7c6fe63487623f9e28d70eee41a58bb01",
+        static_url: "https://github.com/Detanup01/gbe_fork/releases/download/release-2026_08_23/emu-linux-release.tar.bz2",
+        static_hash: "ae1a950c650464e3efa533ab8ba446d575962b8f1045d4f289f7a54393e55282",
         marker: "gbe-linux/regular/x64/steamclient.so",
         rename_from: Some("gbe-linux"),
     },
@@ -40,8 +40,8 @@ const DEPS: &[Dep] = &[
         asset_contains: "emu-win-release.7z",
         archive_name: "emu-win-release.7z",
         format: ArchFmt::SevenZ,
-        static_url: "https://github.com/Detanup01/gbe_fork/releases/download/release-2026_03_10/emu-win-release.7z",
-        static_hash: "0f67a4212aa4e6a71f84879a3a00f675cb2a8c43e13e38e0b27ab5c9e6a5e65f",
+        static_url: "https://github.com/Detanup01/gbe_fork/releases/download/release-2026_08_23/emu-win-release.7z",
+        static_hash: "812dd5f6edd3f175219cc9836e55c1ef4154854a00fb0a6ff197254b85579baf",
         marker: "gbe-win/steamclient_experimental/steamclient.dll",
         rename_from: Some("gbe-win"),
     },
@@ -50,8 +50,8 @@ const DEPS: &[Dep] = &[
         asset_contains: "umu-launcher-",
         archive_name: "umu-launcher-latest-zipapp.tar",
         format: ArchFmt::Tar,
-        static_url: "https://github.com/Open-Wine-Components/umu-launcher/releases/download/1.3.0/umu-launcher-1.3.0-zipapp.tar",
-        static_hash: "36502de766f3cc549ff85196a04fb5afdb4eb2a72c023f22fd25895df91fda2f",
+        static_url: "https://github.com/Open-Wine-Components/umu-launcher/releases/download/1.4.4/umu-launcher-1.4.4-zipapp.tar",
+        static_hash: "eb590691841f7fad3fc3ad8fd5db4ccb87849fe7948e62b28ece7a4ee48cc851",
         marker: "umu/umu-run",
         rename_from: None,
     },
@@ -61,7 +61,7 @@ const DEPS: &[Dep] = &[
 const BUNDLE: &[(&str, &str)] = &[
     // goldberg linux
     ("deps/releases/gbe-linux/regular/x64/steamclient.so", "res/goldberg/linux64/steamclient.so"),
-    ("deps/releases/gbe-linux/regular/x32/steamclient.so", "res/goldberg/linux32/steamclient.so"),
+    ("deps/releases/gbe-linux/regular/x86/steamclient.so", "res/goldberg/linux32/steamclient.so"),
     // goldberg windows
     ("deps/releases/gbe-win/steamclient_experimental/steamclient.dll", "res/goldberg/win/steamclient.dll"),
     ("deps/releases/gbe-win/steamclient_experimental/steamclient64.dll", "res/goldberg/win/steamclient64.dll"),
@@ -85,13 +85,8 @@ macro_rules! build_println {
     };
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, unused)]
 fn apply_patches(deps_dir: &std::path::Path) {
-    let mut git_apply = std::process::Command::new("git");
-    git_apply.args(["apply", &deps_dir.join("deps.patch").to_string_lossy()]);
-    let _ = git_apply.spawn().map_err(|e| {
-        build_println!("Failed to git apply the patches we have for our deps, this is most likely not a real error: {:?} - {:?}", git_apply.get_program().to_string_lossy(), e);
-    });
 }
 
 fn main() {
@@ -135,7 +130,7 @@ fn main() {
 #[cfg(feature = "build_gamescope")]
 fn build_gamescope(deps_dir: &Path, target_dir: &PathBuf) {
     apply_patches(deps_dir); // Apply our own custom fixes for gamescope compilation
-    
+
     use std::process::Command;
 
     let gamescope_dir = deps_dir.join("gamescope");
@@ -148,6 +143,7 @@ fn build_gamescope(deps_dir: &Path, target_dir: &PathBuf) {
             .arg(&build_dir)
             .arg("-Dinput_emulation=disabled")
             .arg("-Dbenchmark=disabled")
+            .arg("-Denable_tests=false")
             .arg("--auto-features=enabled")
             .env("CC", "gcc")
             .env("CXX", "g++")
@@ -201,7 +197,7 @@ fn get_file_hash(file_path: &Path) -> String {
 
     let hash = h.finalize();
     let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
-    
+
     hex
 }
 
@@ -251,7 +247,7 @@ fn fetch_dep(releases_dir: &Path, dep: &Dep) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-#[cfg(feature = "download_deps_latest")] 
+#[cfg(feature = "download_deps_latest")]
 fn find_release_asset(repo: &str, name_contains: &str) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::new();
     build_println!("Downloading latest release URL for {repo}...");

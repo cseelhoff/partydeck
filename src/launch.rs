@@ -9,6 +9,31 @@ use crate::paths::*;
 use crate::profiles::{create_profile, create_profile_gamesave};
 use crate::util::*;
 
+/// Legacy /dev/input/jsN nodes belonging to the same physical device as an evdev node.
+fn js_siblings(evdev_path: &str) -> Vec<String> {
+    let Some(name) = Path::new(evdev_path).file_name().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    std::fs::read_dir(format!("/sys/class/input/{name}/device"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| n.starts_with("js"))
+        .map(|n| format!("/dev/input/{n}"))
+        .collect()
+}
+
+/// First bwrap in PATH that isn't inside the AppImage, if present.
+fn host_bwrap() -> Option<PathBuf> {
+    // $APPDIR from within AppImage, None otherwise.
+    let appdir: Option<PathBuf> = std::env::var_os("APPDIR").map(PathBuf::from);
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter(|d| appdir.as_ref().is_none_or(|a| !d.starts_with(a)))
+        .map(|d| d.join("bwrap"))
+        .find(|p| p.is_file())
+}
+
 pub fn setup_profiles(
     h: &Handler,
     instances: &Vec<Instance>,
@@ -344,19 +369,39 @@ pub fn launch_cmds(
         // be appended to the command directly or, for the cold client loader,
         // written into ColdClientLoader.ini's ExeCommandLine (the loader does not
         // forward CLI args to the game and would treat them as its target exe).
+        let vars = [
+            ("$PROFILE", instance.profname.clone()),
+            ("$WIDTH", instance.width.to_string()),
+            ("$HEIGHT", instance.height.to_string()),
+            ("$RESOLUTION", format!("{}x{}", instance.width, instance.height)),
+            ("$INSTANCECOUNT", instances.len().to_string()),
+            ("$INSTANCENUM", i.to_string()),
+            ("$GAMEDIR", gamedir.os_fmt(win)),
+            ("$HANDLERDIR", h.path_handler.os_fmt(win)),
+        ];
+
+        // Substitute variables anywhere in an arg.
+        // Non-variable text is sanitized, including $s that aren't part of known variable names
         let game_args: Vec<String> = h
             .args
             .split_whitespace()
-            .map(|arg| match arg {
-                "$PROFILE" => instance.profname.clone(),
-                "$WIDTH" => instance.width.to_string(),
-                "$HEIGHT" => instance.height.to_string(),
-                "$RESOLUTION" => format!("{}x{}", instance.width, instance.height),
-                "$INSTANCECOUNT" => instances.len().to_string(),
-                "$INSTANCENUM" => i.to_string(),
-                "$GAMEDIR" => gamedir.os_fmt(win),
-                "$HANDLERDIR" => h.path_handler.os_fmt(win),
-                _ => String::from(arg).sanitize_path(),
+            .map(|arg| {
+                let mut processed_arg = String::new();
+                let mut rest = arg;
+                // Scan for $ marker, then try to replace with a known variable
+                while let Some(pos) = rest.find('$') {
+                    processed_arg.push_str(&rest[..pos].to_string().sanitize_path());
+                    rest = &rest[pos..];
+                    match vars.iter().find(|(name, _)| rest.starts_with(name)) {
+                        Some((name, val)) => {
+                            processed_arg.push_str(val);
+                            rest = &rest[name.len()..];
+                        }
+                        None => rest = &rest[1..],
+                    }
+                }
+                processed_arg.push_str(&rest.to_string().sanitize_path());
+                processed_arg
             })
             .collect();
 
@@ -395,9 +440,8 @@ pub fn launch_cmds(
             None => cwd,
         });
 
-        if !win || !h.enable_hidraw {
-            cmd.env("SDL_JOYSTICK_HIDAPI", "0");
-        }
+        cmd.env("SDL_VIDEODRIVER", "x11");
+        cmd.env("SDL_JOYSTICK_HIDAPI", "0");
         cmd.env("ENABLE_GAMESCOPE_WSI", "0");
         if h.sdl2_override != SDL2Override::No {
             let path_sdl = match h.sdl2_override {
@@ -418,10 +462,9 @@ pub fn launch_cmds(
             cmd.env("WINEPREFIX", &path_pfx);
             cmd.env("PROTON_VERB", "run");
             cmd.env("PROTONPATH", protonpath);
-            if h.enable_hidraw {
-                cmd.env("PROTON_ENABLE_HIDRAW", "1");
-            } else {
-                cmd.env("PROTON_DISABLE_HIDRAW", "1");
+            cmd.env("PROTON_ENABLE_HIDRAW", "1");
+            if h.ps_xinput {
+                cmd.env("PROTON_SONY_HIDRAW_XINPUT", "1");
             }
             if cfg.proton_wow64 {
                 cmd.env("PROTON_USE_WOW64", "1");
@@ -492,8 +535,20 @@ pub fn launch_cmds(
         }
         cmd.arg("--");
 
+        // The AppImage's bundled bwrap is a wrapper that un-isolates /tmp by re-binding the host /tmp
+        // so we need to explicitly use the host's bwrap when there is one.
+        let is_appimage = std::env::var("APPIMAGE").is_ok();
+        let (bwrap, appdir) = if !is_appimage {
+            (PathBuf::from("bwrap"), None)
+        } else if let Some(host) = host_bwrap() {
+            (host, std::env::var_os("APPDIR"))
+        } else {
+            println!("[partydeck] WARNING: no bwrap found in host PATH; instances will share /tmp");
+            (PathBuf::from("bwrap"), None)
+        };
+
         // Bwrap args
-        cmd.arg("bwrap");
+        cmd.arg(&bwrap);
         // Cold-loader path: omit --die-with-parent. The ColdClientLoader runs
         // with [Persistence] Mode=0, so steamclient_loader exits immediately
         // after spawning the game; Proton then keeps the container alive and
@@ -506,6 +561,11 @@ pub fn launch_cmds(
         }
         cmd.args(["--dev-bind", "/", "/"]);
         cmd.args(["--tmpfs", "/tmp"]);
+
+        // Bind AppImage mount from /tmp to keep it visible for bundled binaries like umu-run
+        if let Some(appdir) = &appdir {
+            cmd.arg("--bind").args([appdir, appdir]);
+        }
 
         // Pin hostnames to specific IPs inside the sandbox by binding a custom
         // /etc/hosts. Needed for games whose backend has a dead IPv6 (AAAA)
@@ -571,20 +631,24 @@ pub fn launch_cmds(
             ]);
         }
 
-        // Mask out any gamepads that aren't this player's
+        // Only expose this instance to the input devices specifically associated with it
+        cmd.args(["--tmpfs", "/dev/input"]);
         for (d, dev) in input_devices.iter().enumerate() {
             if !dev.enabled
                 || (!instance.devices.contains(&d) && dev.device_type == DeviceType::Gamepad)
             {
-                cmd.args(["--bind", "/dev/null", &dev.path]);
-                // Wine's winebus reads controllers via /dev/hidraw* when
-                // hidraw is exposed, so masking only the evdev node leaks
-                // input to every instance.
-                if h.enable_hidraw {
-                    for hp in &dev.hidraw_paths {
-                        cmd.args(["--bind", "/dev/null", hp]);
-                    }
+                // hidraw is not under /dev/input, so it still has to be masked rather than omitted.
+                for hp in &dev.hidraw_paths {
+                    cmd.args(["--bind", "/dev/null", hp]);
                 }
+                continue;
+            }
+            if Path::new(&dev.path).exists() {
+                cmd.args(["--dev-bind", &dev.path, &dev.path]);
+            }
+            // Also expose the device's js sibling for games that use the legacy Joystick API
+            for js in js_siblings(&dev.path) {
+                cmd.args(["--dev-bind", &js, &js]);
             }
         }
 
@@ -620,7 +684,6 @@ pub fn launch_cmds(
             }
         }
 
-        let is_appimage = std::env::var("APPIMAGE").is_ok();
         if is_appimage {
             // Because we are faking temp directory, this makes the system use the real vulkan directory for games
             // Used here because the env var is set durring bwrap and gamescope process starting so env cant be cleared at this stage.
@@ -637,6 +700,7 @@ pub fn launch_cmds(
             if let Some(appid) = h.steam_appid {
                 cmd.env("SteamAppId", &appid.to_string());
                 cmd.env("SteamGameId", &appid.to_string());
+                cmd.env("SteamOverlayGameId", &appid.to_string());
             }
 
             // The cold client loader provides its own steamclient + emu config,
@@ -660,6 +724,9 @@ pub fn launch_cmds(
                 sdk64_link,
             ]);
 
+            if win {
+                cmd.env("UMU_USE_STEAM", "1");
+            }
             // When using the cold client loader, it force-injects steamclient
             // from its own directory, so we don't bind goldberg/win over the
             // prefix's Steam dir.
@@ -1115,6 +1182,15 @@ pub fn fuse_overlayfs_mount_gamedirs(
 #[cfg(test)]
 mod companion_tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    // free_port() releases its port, so a sibling test could grab it before the
+    // helper binds. Tests that use ports run one at a time.
+    static PORT_LOCK: Mutex<()> = Mutex::new(());
+
+    fn port_lock() -> MutexGuard<'static, ()> {
+        PORT_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn handler(companion: &str, port: u16) -> Handler {
         Handler { companion: companion.into(), companion_port: port, ..Handler::default() }
@@ -1159,6 +1235,7 @@ mod companion_tests {
 
     #[test]
     fn open_port_means_user_already_runs_it() {
+        let _lock = port_lock();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let dir = scratch("open");
@@ -1169,6 +1246,7 @@ mod companion_tests {
 
     #[test]
     fn waits_for_port_and_kills_on_drop() {
+        let _lock = port_lock();
         let dir = scratch("listen");
         let port = free_port();
         let command = format!("python3 {} {port}", listener_script(&dir));
@@ -1180,6 +1258,7 @@ mod companion_tests {
 
     #[test]
     fn early_exit_is_an_error() {
+        let _lock = port_lock();
         let dir = scratch("exit");
         let error = start_companion(&handler("true", free_port()), &dir.join("log")).err().unwrap();
         assert!(error.to_string().contains("exited early"), "{error}");

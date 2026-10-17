@@ -1,6 +1,6 @@
 [package]
 name = "partydeck"
-version = "0.8.5"
+version = "0.8.7-e"
 edition = "2024"
 
 [features]

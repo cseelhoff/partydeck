@@ -1,3 +1,4 @@
+use crate::app::ConfigOverrides;
 use crate::paths::*;
 use crate::util::*;
 
@@ -10,6 +11,10 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 pub const HANDLER_SPEC_CURRENT_VERSION: u16 = 3;
+
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum SDL2Override {
@@ -49,8 +54,8 @@ pub struct Handler {
     pub use_goldberg: bool,
     #[serde(default)]
     pub use_drm_loader: bool,
-    #[serde(default)]
-    pub enable_hidraw: bool,
+    #[serde(default = "default_true")]
+    pub ps_xinput: bool,
     pub steam_appid: Option<u32>,
 
     pub game_null_paths: Vec<String>,
@@ -84,6 +89,9 @@ pub struct Handler {
     // start a second companion if something already listens there.
     #[serde(default)]
     pub companion_port: u16,
+
+    #[serde(default)]
+    pub overrides: ConfigOverrides,
 }
 
 impl Default for Handler {
@@ -110,7 +118,7 @@ impl Default for Handler {
             use_mangohud: false,
             use_goldberg: false,
             use_drm_loader: false,
-            enable_hidraw: false,
+            ps_xinput: true,
             steam_appid: None,
 
             game_null_paths: Vec::new(),
@@ -118,6 +126,8 @@ impl Default for Handler {
             dns_filter_aaaa: Vec::new(),
             companion: String::new(),
             companion_port: 0,
+
+            overrides: ConfigOverrides::default(),
         }
     }
 }
@@ -269,6 +279,12 @@ impl Handler {
                     return Err("Name cannot be empty".into());
                 }
             }
+            if self.steam_appid.is_none() && self.path_gameroot.is_empty() {
+                return Err("Game root folder isn't set! Locate the game's install folder or set its Steam App.".into());
+            }
+            if self.exec.is_empty() {
+                return Err("Executable isn't set! Locate the executable for the game.".into());
+            }
             if !PATH_PARTY.join("handlers").join(&self.name).exists() {
                 self.path_handler = PATH_PARTY.join("handlers").join(&self.name);
             } else {
@@ -300,7 +316,13 @@ impl Handler {
         if self.name.is_empty() {
             return Err("Name cannot be empty".into());
         }
-
+        if self.steam_appid.is_none() && self.path_gameroot.is_empty() {
+            return Err("Game root folder isn't set! Locate the game's install folder or set its Steam App.".into());
+        }
+        if self.exec.is_empty() {
+            return Err("Executable isn't set! Locate the executable for the game.".into());
+        }
+        
         let mut file = FileDialog::new()
             .set_title("Save file to:")
             .set_directory(&*PATH_HOME)
@@ -344,9 +366,9 @@ pub fn scan_handlers() -> Vec<Handler> {
     };
 
     for entry_result in entries {
+        // Path::is_dir follows symlinks, so symlinked handler dirs are picked up
         if let Ok(entry) = entry_result
-            && let Ok(file_type) = entry.file_type()
-            && file_type.is_dir()
+            && entry.path().is_dir()
         {
             let json_path = entry.path().join("handler.json");
             if json_path.exists()

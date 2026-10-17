@@ -1,0 +1,62 @@
+name: Build AppImage
+description: >
+  Builds an Anylinux AppImage using a current Arch Linux base.
+  Assumes the job already declared an archlinux container and checked out the
+  repo with submodules. Caches cargo + pacman.
+
+inputs:
+  version:
+    description: Version string embedded in the artifact filename (e.g. v1.2.3 or UNOFFICIAL).
+    required: true
+
+outputs:
+  appimage:
+    description: Path to the produced AppImage.
+    value: partydeck-${{ inputs.version }}-anylinux-x86_64.AppImage
+
+runs:
+  using: composite
+  steps:
+    - name: Cache pacman packages
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: /var/cache/pacman/pkg
+        key: pacman-arch-appimage
+        restore-keys: pacman-arch-appimage
+
+    - name: Install build + runtime dependencies
+      shell: bash
+      run: |
+        pacman-key --init
+        pacman -Syu --noconfirm
+        pacman -S --noconfirm --needed \
+            git meson clang glslang libcap wlroots0.20 sdl2 vulkan-headers \
+            libx11 libxmu libxcomposite libxrender libxres libxtst libxkbcommon \
+            libdrm libinput wayland-protocols benchmark xorg-xwayland pipewire \
+            lcms2 hwdata seatd xcb-util-wm xcb-util-errors libdisplay-info \
+            cmake libavif libheif aom rav1e libdecor libxdamage luajit libva \
+            libxss wget curl xorg-server-xvfb fuse-overlayfs bubblewrap zsync \
+            pulseaudio pipewire-audio alsa-plugins libxkbcommon-x11 libvdpau \
+            libvdpau-va-gl sudo pkgconf openssl zip base-devel patchelf \
+            rustup
+        rustup install stable
+        rustup default stable
+
+    # Default cargo locations so rust-cache can pick up the registry + target.
+    - name: Cache cargo + build artifacts
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # 2.9.1
+      with:
+        workspaces: . -> target
+
+    - name: Build skeleton + AppImage
+      shell: bash
+      env:
+        BUILD_NAME: arch
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      run: ./dist/scripts/build_all.sh
+
+    - name: Rename AppImage
+      shell: bash
+      run: |
+        cp dist/appimage_generated/partydeck-anylinux-x86_64.AppImage \
+            "partydeck-${{ inputs.version }}-anylinux-x86_64.AppImage"
