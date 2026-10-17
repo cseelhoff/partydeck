@@ -173,9 +173,9 @@ const ShimConfig& shim_config() {
         std::wstring mode = lower_w(env_w("WINHTTP_SHIM_MODE", L"redirect"));
         c.mode = (mode == L"capture") ? ShimMode::Capture : ShimMode::Redirect;
         c.target_host = env_w("WINHTTP_SHIM_TARGET_HOST", L"127.0.0.1");
-        std::wstring portw = env_w("WINHTTP_SHIM_TARGET_PORT", L"8080");
+        std::wstring portw = env_w("WINHTTP_SHIM_TARGET_PORT", L"18080");
         c.target_port = _wtoi(portw.c_str());
-        if (c.target_port <= 0) c.target_port = 8080;
+        if (c.target_port <= 0) c.target_port = 18080;
         std::wstring hosts = env_w(
             "WINHTTP_SHIM_REDIRECT_HOSTS",
             L"dt-live.passtechgames.com,dt-live-2.passtechgames.com,"

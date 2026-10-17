@@ -60,7 +60,7 @@ enum class ShimMode { Redirect, Capture };
 struct ShimConfig {
     ShimMode     mode;                   // WINHTTP_SHIM_MODE (redirect|capture)
     std::wstring target_host;            // default L"127.0.0.1"
-    int          target_port;           // default 8080 (plain HTTP)
+    int          target_port;           // default 18080 (rakstorm-odin)
     // lowercase host suffixes to redirect (default dt-live*.passtechgames.com)
     // matched case-insensitively against the WinHttpConnect server name.
     std::vector<std::wstring> redirect_hosts;

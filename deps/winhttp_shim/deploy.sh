@@ -2,6 +2,7 @@
 # Deploy / remove the winhttp proxy shim for a game directory.
 #
 #   deploy.sh install <gamedir> [protondir]   install shim + renamed builtin
+#                                             (protondir defaults to the Proton PartyDeck uses)
 #   deploy.sh uninstall <gamedir>             remove shim, restore original
 #
 # The shim works by Wine's native-DLL override: our winhttp.dll sits next to the
@@ -32,13 +33,28 @@ find_builtin_winhttp() {
             [[ -f "$p" ]] && { echo "$p"; return 0; }
         done
     fi
-    # 2) newest GE-Proton in the Steam compat tools dir. MUST match the Proton
+    # 2) the Proton PartyDeck itself will launch: settings.json "proton_version"
+    #    is either a directory or the name of a Steam compat tool. Empty means
+    #    "let umu choose", handled by step 3.
+    local settings="${XDG_DATA_HOME:-$HOME/.local/share}/partydeck/settings.json"
+    local base="$HOME/.local/share/Steam/compatibilitytools.d"
+    local steamapps="$HOME/.local/share/Steam/steamapps/common"
+    if [[ -f "$settings" ]]; then
+        local configured p
+        configured="$(grep -oP '"proton_version"\s*:\s*"\K[^"]*' "$settings" || true)"
+        if [[ -n "$configured" ]]; then
+            for p in "$configured" "$base/$configured"; do
+                [[ -f "$p/files/lib/wine/x86_64-windows/winhttp.dll" ]] && { echo "$p/files/lib/wine/x86_64-windows/winhttp.dll"; return 0; }
+                [[ -f "$p/files/lib64/wine/x86_64-windows/winhttp.dll" ]] && { echo "$p/files/lib64/wine/x86_64-windows/winhttp.dll"; return 0; }
+            done
+            echo "[winhttp_shim] settings.json proton_version '$configured' not found; falling back" >&2
+        fi
+    fi
+    # 3) newest GE-Proton in the Steam compat tools dir. MUST match the Proton
     #    partydeck launches with: an empty proton_version makes umu resolve the
     #    bare name "GE-Proton" to the NEWEST GE-Proton*, so prefer the highest
     #    GE-Proton version here (the winhttp builtin differs between point
     #    releases). Only fall back to other Proton flavours if no GE-Proton.
-    local base="$HOME/.local/share/Steam/compatibilitytools.d"
-    local steamapps="$HOME/.local/share/Steam/steamapps/common"
     local d p
     for d in $(ls -d "$base"/GE-Proton*/ 2>/dev/null | sort -rV); do
         for p in "$d"files/lib/wine/x86_64-windows/winhttp.dll \
