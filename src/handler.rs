@@ -71,6 +71,19 @@ pub struct Handler {
     // "passtechgames.com".
     #[serde(default)]
     pub dns_filter_aaaa: Vec<String>,
+
+    // Background helper (e.g. a local backend emulator) started before the first
+    // instance and stopped after the last one exits. Whitespace-separated command
+    // line; the first word is the program. Empty means none. Output goes to
+    // companion.log in the PartyDeck data directory.
+    #[serde(default)]
+    pub companion: String,
+
+    // 127.0.0.1 TCP port the companion listens on. When non-zero, launch waits
+    // for the port to accept connections before starting the games, and does not
+    // start a second companion if something already listens there.
+    #[serde(default)]
+    pub companion_port: u16,
 }
 
 impl Default for Handler {
@@ -103,6 +116,8 @@ impl Default for Handler {
             game_null_paths: Vec::new(),
             host_aliases: Vec::new(),
             dns_filter_aaaa: Vec::new(),
+            companion: String::new(),
+            companion_port: 0,
         }
     }
 }
