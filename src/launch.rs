@@ -1224,6 +1224,17 @@ mod companion_tests {
         std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
     }
 
+    // Roughly one run in a few hundred, a port from free_port() is already answering
+    // by the time start_companion probes it. Retry with a fresh port instead of failing.
+    fn with_free_port<T>(mut attempt: impl FnMut(u16) -> Option<T>) -> T {
+        for _ in 0..5 {
+            if let Some(result) = attempt(free_port()) {
+                return result;
+            }
+        }
+        panic!("no free port after 5 tries");
+    }
+
     fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
         for _ in 0..100 {
             if condition() {
@@ -1234,14 +1245,29 @@ mod companion_tests {
         false
     }
 
-    fn listener_script(dir: &Path) -> String {
-        let script = dir.join("listen.py");
-        std::fs::write(
-            &script,
-            "import socket, sys, time\ns = socket.socket()\ns.bind(('127.0.0.1', int(sys.argv[1])))\ns.listen()\ntime.sleep(60)\n",
-        )
-        .unwrap();
-        script.to_string_lossy().into_owned()
+    // The companion used by waits_for_port_and_kills_on_drop is this test binary
+    // running listener_helper below, so the test needs no external program. The
+    // helper learns its port from a file named after its parent (the test process).
+    fn helper_port_file(parent: u32) -> PathBuf {
+        std::env::temp_dir().join(format!("partydeck-companion-port-{parent}"))
+    }
+
+    fn listener_command(port: u16) -> String {
+        std::fs::write(helper_port_file(std::process::id()), port.to_string()).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        format!("{} --ignored --exact launch::companion_tests::listener_helper", exe.display())
+    }
+
+    // Not a test: only meaningful as the companion process started above.
+    #[test]
+    #[ignore]
+    fn listener_helper() {
+        let parent = std::os::unix::process::parent_id();
+        let Ok(text) = std::fs::read_to_string(helper_port_file(parent)) else {
+            return;
+        };
+        let _listener = std::net::TcpListener::bind(("127.0.0.1", text.trim().parse::<u16>().unwrap())).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(60));
     }
 
     #[test]
@@ -1266,9 +1292,10 @@ mod companion_tests {
     fn waits_for_port_and_kills_on_drop() {
         let _lock = port_lock();
         let dir = scratch("listen");
-        let port = free_port();
-        let command = format!("python3 {} {port}", listener_script(&dir));
-        let companion = start_companion(&handler(&command, port), &dir.join("log")).unwrap();
+        let (port, companion) = with_free_port(|port| {
+            let companion = start_companion(&handler(&listener_command(port), port), &dir.join("log")).unwrap();
+            companion.0.is_some().then_some((port, companion))
+        });
         assert!(local_port_open(port));
         drop(companion);
         assert!(wait_until(|| !local_port_open(port)), "companion survived drop");
@@ -1278,7 +1305,7 @@ mod companion_tests {
     fn early_exit_is_an_error() {
         let _lock = port_lock();
         let dir = scratch("exit");
-        let error = start_companion(&handler("true", free_port()), &dir.join("log")).err().unwrap();
+        let error = with_free_port(|port| start_companion(&handler("true", port), &dir.join("log")).err());
         assert!(error.to_string().contains("exited early"), "{error}");
     }
 
