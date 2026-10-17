@@ -1,0 +1,10 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Name=PartyDeck
+Comment=Split-screen game launcher for Linux
+Exec=partydeck
+Icon=partydeck
+Terminal=false
+Type=Application
+Categories=Game;
+Keywords=splitscreen;split-screen;couch;coop;lan;multiplayer;gamescope;

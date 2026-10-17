@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> ### NixOS Fork
+> This is a NixOS-compatible fork of [PartyDeck](https://github.com/partydeck).
+> It includes a Nix flake that builds PartyDeck and all its dependencies (gamescope-kbm, Goldberg Steam Emu) from source — no manual setup required.
+>
+> For the upstream project, see: https://github.com/partydeck
 
 <img src=".github/assets/icon.png" align="left" width="100" height="100">
 
@@ -27,6 +33,89 @@ A split-screen game launcher for Linux/SteamOS
 
 > [!NOTE]
 > PartyDeck is in early development, and may contain violations of software best practices and security flaws; use at your own discretion! If you are experienced in software any advice and contributions are greatly appreciated.
+
+## NixOS Installation
+
+### Flake-based NixOS config (recommended)
+
+Add this fork as a flake input and install the package:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
+    partydeck = {
+      url = "github:cseelhoff/partydeck";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { nixpkgs, partydeck, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [ ./configuration.nix ];
+      specialArgs = { inherit partydeck; };
+    };
+  };
+}
+```
+
+Then in your NixOS module:
+
+```nix
+# configuration.nix (or a gaming module)
+{ pkgs, partydeck, ... }:
+{
+  environment.systemPackages = [
+    partydeck.packages.x86_64-linux.default
+  ];
+
+  # Required dependencies
+  services.desktopManager.plasma6.enable = true;  # KWin tiling script
+  networking.firewall.allowedUDPPorts = [ 47584 ]; # Goldberg LAN multiplayer
+  networking.firewall.allowedTCPPorts = [ 47584 ];
+}
+```
+
+Run `sudo nixos-rebuild switch` and `partydeck` will be on your PATH.
+
+### Try without installing
+
+```sh
+nix run github:cseelhoff/partydeck
+```
+
+### What the flake provides
+
+| Package | Description |
+|---------|-------------|
+| `partydeck` (default) | The launcher, wrapped with all runtime deps |
+| `gamescope-kbm` | Gamescope fork with keyboard/mouse support |
+| `goldberg-emu` | Goldberg Steam Emu binaries for LAN multiplayer |
+
+All three are built automatically — `gamescope-kbm` and `goldberg-emu` are bundled into the `partydeck` package via `PATH` and symlinks.
+
+### Requirements
+
+- **NixOS 25.11** (or compatible nixpkgs)
+- **KDE Plasma 6** — required for the KWin splitscreen tiling script
+- **Steam** — with Proton-GE for Windows game support
+- **Game controllers** — most work without extra setup
+
+## Fork additions
+
+Beyond upstream, this fork adds (all optional; handlers without them behave as before):
+
+- **`use_drm_loader`** (handler): launch SteamStub-DRM games through the gbe_fork cold client loader.
+- **`host_aliases`**, **`dns_filter_aaaa`** (handler): force IPv4 for backends with a dead IPv6 record.
+- **`companion`**, **`companion_port`** (handler): a helper command (for example a local backend emulator)
+  that PartyDeck starts before the first game and stops after the last one exits. With `companion_port` set,
+  launch waits up to 10 s for `127.0.0.1:<port>` to accept connections, aborts if the helper exits early, and
+  starts nothing if the port is already open. Output goes to `companion.log` in the PartyDeck data directory.
+- Remembered profile per controller, live layout preview, reordering players with the D-pad (when the SDL
+  backend is off; with it on, Up/Down switch monitor as upstream), and 5- and 6-player layouts.
+- `deps/winhttp_shim`: a `winhttp.dll` proxy that redirects a game's HTTPS service hosts to a local server
+  (see its `deploy.sh`), and `deps/eos_shim`, `deps/steam_api_shim`.
 
 ## Features
 
@@ -98,6 +187,16 @@ cargo build --release -F build_gamescope
 cargo build --release -F download_deps
 ```
 
+
+## Building from source (dev shell)
+
+```sh
+git clone --recurse-submodules https://github.com/cseelhoff/partydeck.git
+cd partydeck
+nix develop   # enters a shell with all build deps
+sh build.sh   # cargo build + assemble
+cd build && ./partydeck
+```
 
 ## How it Works
 

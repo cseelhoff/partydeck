@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -122,6 +123,17 @@ pub fn launch_game(
 
     let mut i = 0;
     for mut cmd in new_cmds {
+        // Ask the kernel to deliver SIGTERM to this child when partydeck
+        // exits, so gamescope (and its bwrap/wine subtree) shuts down
+        // promptly. Without this, children survive partydeck's exit
+        // until something else (systemd cgroup, user) reaps them.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
+                Ok(())
+            });
+        }
+
         let handle = cmd.spawn().map_err(|e| {
             format!("Failed to start '{}': {}", cmd.get_program().to_string_lossy(), e)
         })?;
@@ -227,10 +239,16 @@ fn start_companion(h: &Handler, log_path: &Path) -> Result<Companion, Box<dyn st
     }
 
     let log = std::fs::File::create(log_path)?;
-    let child = Command::new(program)
-        .args(words)
-        .stdout(log.try_clone()?)
-        .stderr(log)
+    let mut command = Command::new(program);
+    command.args(words).stdout(log.try_clone()?).stderr(log);
+    // Like the games: if PartyDeck dies without running Drop, the helper still stops.
+    unsafe {
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
+            Ok(())
+        });
+    }
+    let child = command
         .spawn()
         .map_err(|e| format!("Failed to start companion '{program}': {e}"))?;
     let mut companion = Companion(Some(child));
