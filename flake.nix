@@ -14,14 +14,14 @@
       # ---------------------------------------------------------------
       # Goldberg Steam Emu – pre-built binaries for LAN multiplayer
       # ---------------------------------------------------------------
-      gbeVersion = "release-2026_03_10";
+      gbeVersion = "release-2026_08_23";
       gbe-linux-src = pkgs.fetchurl {
         url = "https://github.com/Detanup01/gbe_fork/releases/download/${gbeVersion}/emu-linux-release.tar.bz2";
-        hash = "sha256-AyUAyhALcv0tqpTuwyY898b+Y0h2I/nijXDu5BpYuwE=";
+        hash = "sha256-rhqVDGUEZOPvpTOri6RG1XWWK48QRdTyifelQ5PlUoI=";
       };
       gbe-win-src = pkgs.fetchurl {
         url = "https://github.com/Detanup01/gbe_fork/releases/download/${gbeVersion}/emu-win-release.7z";
-        hash = "sha256-D2ekISqk5qcfhIeaOgD2dcsqjEPhPjjgsnq1yeal5l8=";
+        hash = "sha256-gS3V9u3T8XUhnMmDblXB70FUhUoA+wpv8ZclS4VXm68=";
       };
 
       goldberg-emu = pkgs.stdenv.mkDerivation {
@@ -37,13 +37,18 @@
         '';
         installPhase = ''
           mkdir -p $out/share/goldberg/{linux32,linux64,win}
-          cp linux/release/regular/x32/steamclient.so  $out/share/goldberg/linux32/
+          cp linux/release/regular/x86/steamclient.so  $out/share/goldberg/linux32/
           cp linux/release/regular/x64/steamclient.so  $out/share/goldberg/linux64/
           cp win/release/steamclient_experimental/steamclient.dll        \
              win/release/steamclient_experimental/steamclient64.dll      \
              win/release/steamclient_experimental/GameOverlayRenderer.dll   \
              win/release/steamclient_experimental/GameOverlayRenderer64.dll \
              $out/share/goldberg/win/
+          # Cold client loader, used by handlers with use_drm_loader
+          mkdir -p $out/share/goldberg/win/extra_dlls
+          cp win/release/steamclient_experimental/steamclient_loader_x64.exe $out/share/goldberg/win/
+          cp win/release/steamclient_experimental/extra_dlls/steamclient_extra_x64.dll \
+             $out/share/goldberg/win/extra_dlls/
         '';
       };
 
@@ -168,6 +173,10 @@
         ];
         mesonInstallFlags = [ "--skip-subprojects" ];
 
+        # NixOS 26.05's libinput adds LIBINPUT_SWITCH_KEYPAD_SLIDE, which the bundled
+        # wlroots 0.18 does not handle in a switch; its -Werror=switch then fails the build.
+        env.NIX_CFLAGS_COMPILE = "-Wno-error";
+
         postInstall = ''
           mv $out/bin/gamescope $out/bin/gamescope-kbm
           patchelf --add-rpath ${lib.makeLibraryPath [
@@ -181,10 +190,10 @@
       # ---------------------------------------------------------------
       partydeck = pkgs.rustPlatform.buildRustPackage {
         pname = "partydeck";
-        version = "0.8.5";
+        version = "0.8.7-e";
         src = lib.cleanSource self;
 
-        cargoHash = "sha256-DKqkwoTfrFdEVgEucw9+PfEXADHA2V11AiSCbcuMTAI=";
+        cargoHash = "sha256-LngDmEQOCaFD+bv7IOQqUao/ZSpE4+0zZPoU9OX1ZGU=";
 
         nativeBuildInputs = with pkgs; [ pkg-config makeBinaryWrapper ];
         buildInputs = with pkgs; [
@@ -197,6 +206,7 @@
           cp res/splitscreen_kwin.js $out/share/partydeck/
           cp res/splitscreen_kwin_vertical.js $out/share/partydeck/
           cp res/GamingModeLauncher.sh $out/share/partydeck/
+          cp res/dns_aaaa_filter.py $out/share/partydeck/
 
           ln -s ${goldberg-emu}/share/goldberg/linux32 $out/share/partydeck/goldberg/linux32
           ln -s ${goldberg-emu}/share/goldberg/linux64 $out/share/partydeck/goldberg/linux64
@@ -214,7 +224,7 @@
           cp res/icon.png $out/share/icons/hicolor/64x64/apps/partydeck.png
 
           wrapProgram $out/bin/partydeck \
-            --prefix PATH : ${lib.makeBinPath [ gamescope-kbm pkgs.umu-launcher ]} \
+            --prefix PATH : ${lib.makeBinPath [ gamescope-kbm pkgs.umu-launcher pkgs.python3 ]} \
             --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
               pkgs.libGL pkgs.vulkan-loader pkgs.wayland pkgs.libxkbcommon
               pkgs.xorg.libX11 pkgs.xorg.libXcursor pkgs.xorg.libXrandr pkgs.xorg.libXi
