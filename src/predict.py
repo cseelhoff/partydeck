@@ -768,13 +768,13 @@ def _push_member_connected(target_conn, about_conn, binding, party):
     if route is None:
         return
     ver = _next_version(party)
-    body = mp_uint(ver) + b"\x00" + mp_uint(ver) + _party_member(about_conn)
+    body = struct.pack("<H", ver & 0xFFFF) + mp_uint(ver) + _party_member(about_conn)
     _send_scene_msg(target_conn, binding["routes"]["handle"], route, body)
 
 
 def _broadcast_settings_updated(party):
     ver = _next_version(party)
-    body = mp_uint(ver) + b"\x00" + mp_uint(ver) + _settings_array(party)
+    body = struct.pack("<H", ver & 0xFFFF) + mp_uint(ver) + _settings_array(party)
     for m in party["members"]:
         b = _binding_for(m, "party", party["guid"])
         if b is None:
@@ -786,7 +786,7 @@ def _broadcast_settings_updated(party):
 
 def _broadcast_member_data(party, about_conn):
     ver = _next_version(party)
-    body = mp_uint(ver) + b"\x00" + mp_uint(ver) + _memberdata_member(about_conn)
+    body = struct.pack("<H", ver & 0xFFFF) + mp_uint(ver) + _memberdata_member(about_conn)
     for m in party["members"]:
         b = _binding_for(m, "party", party["guid"])
         if b is None:
@@ -799,7 +799,7 @@ def _broadcast_member_data(party, about_conn):
 def _broadcast_member_status(party, about_conn, status=1):
     ver = _next_version(party)
     party["status_seq"] += 1
-    prefix = mp_uint(ver) + b"\x00" + mp_uint(party["status_seq"])
+    prefix = struct.pack("<H", ver & 0xFFFF) + mp_uint(party["status_seq"])
     entry = mp_array([mp_array([mp_array([
         mp_str(about_conn["user_id"]), mp_uint(status)])])])
     body = prefix + entry
@@ -814,7 +814,7 @@ def _broadcast_member_status(party, about_conn, status=1):
 
 def _broadcast_member_disconnected(party, about_conn):
     ver = _next_version(party)
-    body = mp_uint(ver) + b"\x00" + mp_uint(ver) + mp_array([
+    body = struct.pack("<H", ver & 0xFFFF) + mp_uint(ver) + mp_array([
         mp_str(about_conn["user_id"]), mp_uint(0)])
     for m in party["members"]:
         b = _binding_for(m, "party", party["guid"])
@@ -826,8 +826,8 @@ def _broadcast_member_disconnected(party, about_conn):
 
 
 def _broadcast_player_update(gs, about_conn, status):
-    member = mp_array([mp_array([
-        mp_str(about_conn["user_id"]), mp_uint(status), mp_str(""), MP_FALSE])])
+    member = mp_array([
+        mp_str(about_conn["user_id"]), mp_uint(status), mp_str(""), MP_FALSE])
     for m in gs["members"]:
         b = _binding_for(m, "gamesession", gs["guid"])
         if b is None:

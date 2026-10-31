@@ -926,7 +926,7 @@ def send_member_connected(sock, target_conn, about_conn, binding, party):
         log("  !! party.memberConnected route not found in party scene")
         return
     ver = party.next_version()
-    body = mp_uint(ver) + b"\x00" + mp_uint(ver) + build_party_member(about_conn)
+    body = struct.pack("<H", ver & 0xFFFF) + mp_uint(ver) + build_party_member(about_conn)
     send_scene_msg(sock, target_conn, binding.sr.handle, route, body)
     log(f"  <- party.memberConnected v{ver} to {target_conn.user_id[:8]} "
         f"about {about_conn.user_id[:8]} route={route} ({len(body)}B)")
@@ -938,7 +938,7 @@ def broadcast_settings_updated(sock, party):
     reducer requires this versioned notification (and memberDataUpdated) to mark
     the party synchronized; without it the join-by-code coroutine never arms."""
     ver = party.next_version()
-    prefix = mp_uint(ver) + b"\x00" + mp_uint(ver)
+    prefix = struct.pack("<H", ver & 0xFFFF) + mp_uint(ver)
     body = prefix + build_settings_array(party)
     for m in party.members:
         b = m.binding_for("party", party.guid)
@@ -956,7 +956,7 @@ def broadcast_member_data(sock, party, about_conn):
     """Push party.memberDataUpdated (about about_conn) to every member. Body
     byte-exact from capture = [ver,0,ver] prefix + the 4-element slim member."""
     ver = party.next_version()
-    prefix = mp_uint(ver) + b"\x00" + mp_uint(ver)
+    prefix = struct.pack("<H", ver & 0xFFFF) + mp_uint(ver)
     body = prefix + build_memberdata_member(about_conn)
     for m in party.members:
         b = m.binding_for("party", party.guid)
@@ -976,7 +976,7 @@ def broadcast_member_status(sock, party, about_conn, status=1):
     a member updates its gamefinder/ready status (party.updategamefinderplayerstatus)."""
     ver = party.next_version()
     party.status_seq += 1
-    prefix = mp_uint(ver) + b"\x00" + mp_uint(party.status_seq)
+    prefix = struct.pack("<H", ver & 0xFFFF) + mp_uint(party.status_seq)
     entry = mp_array([mp_array([mp_array([
         mp_str(about_conn.user_id), mp_uint(status)])])])
     body = prefix + entry
@@ -1002,7 +1002,7 @@ def broadcast_member_disconnected(sock, party, about_conn):
     (SR_DISCONNECT_FROM_SCENE) -- e.g. the joiner departing the survivor party at
     the tail of a DtPartyMergerAlgorithm merge."""
     ver = party.next_version()
-    prefix = mp_uint(ver) + b"\x00" + mp_uint(ver)
+    prefix = struct.pack("<H", ver & 0xFFFF) + mp_uint(ver)
     body = prefix + mp_array([mp_str(about_conn.user_id), mp_uint(0)])
     for m in party.members:
         b = m.binding_for("party", party.guid)
@@ -1486,11 +1486,11 @@ def handle_scene_message(sock, conn, payload):
 
 
 def broadcast_player_update(sock, gs, about_conn, status):
-    """Send player.update([[userId, status, '', False]]) about about_conn to every
+    """Send player.update([userId, status, '', False]) about about_conn to every
     member connected to this GameSession scene (each on their own gs handle)."""
-    member = mp_array([mp_array([
+    member = mp_array([
         mp_str(about_conn.user_id), mp_uint(status), mp_str(""), MP_FALSE,
-    ])])
+    ])
     for m in gs.members:
         b = m.binding_for("gamesession", gs.guid)
         if b is None:
